@@ -350,11 +350,17 @@ using Raw = std::uint64_t(STDMETHODCALLTYPE *)(void *, std::uint64_t, std::uint6
                                                std::uint64_t, std::uint64_t, std::uint64_t,
                                                std::uint64_t, std::uint64_t, std::uint64_t,
                                                std::uint64_t);
+// Code that calls as the title's own does, besides the title's: the tests' (see call_as_title)
+std::atomic<const std::uint8_t *> test_code{nullptr}, test_code_end{nullptr};
+bool title_code(const void *address) {
+    const auto *const at = static_cast<const std::uint8_t *>(address);
+    return detail::in_title(address) || (at >= test_code.load() && at < test_code_end.load());
+}
 // Whether the call that returns to `address` is the title's own call of this slot: the
 // instruction before it is `call [reg + Index * 8]`. The host's runtime also gets here with
 // the title's return address, when one of its methods jumps on to another slot.
 bool title_called_slot(const void *address, std::size_t index) {
-    if (!detail::in_title(address))
+    if (!title_code(address))
         return false;
     const auto *code = static_cast<const std::uint8_t *>(address);
     const auto offset = static_cast<std::uint32_t>(index * 8);
@@ -400,7 +406,7 @@ bool title_called_slot(const void *address, std::size_t index) {
         return false;
     std::int32_t relative;
     std::memcpy(&relative, code - 4, 4);
-    return code[-5] == 0xe8 && detail::in_title(code + relative);
+    return code[-5] == 0xe8 && title_code(code + relative);
 }
 template <Family Kind, std::size_t Index>
 std::uint64_t STDMETHODCALLTYPE by_caller(void *first, std::uint64_t a, std::uint64_t b,
@@ -855,6 +861,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_view(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
 }
 // a constant buffer view of nothing, as the device's inline CreateConstantBufferView writes it
 bool null_buffer(const std::uint32_t *words) { return words[2] == 1 && words[3] == 0x0002403c; }
+std::uint64_t gpu_address(std::uint64_t address);
 // A descriptor the title wrote: made on the host from what the hardware descriptor says.
 // Buffers (V#: 48-bit address, stride in bits 48-61, record count in the third dword) become
 // constant buffer views.
@@ -887,8 +894,12 @@ void decode_written(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     const std::uint64_t address = first & 0xffff'ffff'ffffull;
     const std::uint32_t stride = (words[1] >> 16) & 0x3fff;
     const std::uint64_t size = std::uint64_t{words[2]} * (stride ? stride : 1);
-    const D3D12_CONSTANT_BUFFER_VIEW_DESC view{
-        address, static_cast<UINT>(std::min<std::uint64_t>((size + 255) & ~255ull, 65536))};
+    D3D12_CONSTANT_BUFFER_VIEW_DESC view{
+        gpu_address(address),
+        static_cast<UINT>(std::min<std::uint64_t>((size + 255) & ~255ull, 65536))};
+    // memory the host's GPU cannot see: a view of nothing
+    if (!view.BufferLocation)
+        view = {};
     using Create = void(STDMETHODCALLTYPE *)(void *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *,
                                              D3D12_CPU_DESCRIPTOR_HANDLE);
     original<Create>(heap->device, 17)(heap->device, &view, host_handle(handle));
@@ -1123,13 +1134,26 @@ bool mapped_address(const void *resource, std::uint64_t &address) {
     address = found->second;
     return true;
 }
-std::uint64_t host_address(std::uint64_t address) {
-    const std::lock_guard lock(buffer_mutex);
-    auto found = mapped_at.upper_bound(address);
-    if (found == mapped_at.begin())
-        return address;
-    --found;
-    return address < found->second.end ? found->second.gpu + (address - found->first) : address;
+// The host's GPU address for one the title gives: in a buffer here, the host's address there.
+// Memory of the title's that no buffer here holds is 0, which callers turn into a view of
+// nothing: the host's GPU cannot see that memory, and given its CPU address it removes the
+// device. Any other address goes on as it is.
+std::uint64_t gpu_address(std::uint64_t address) {
+    if (!address)
+        return 0;
+    {
+        const std::lock_guard lock(buffer_mutex);
+        if (const auto found = mapped_at.upper_bound(address);
+            found != mapped_at.begin() && address < std::prev(found)->second.end)
+            return std::prev(found)->second.gpu + (address - std::prev(found)->first);
+        if (const auto found = buffers_at.upper_bound(address);
+            found != buffers_at.begin() && address < std::prev(found)->second.end)
+            return address;
+    }
+    MEMORY_BASIC_INFORMATION info{};
+    const bool title_memory = VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) &&
+                              info.State == MEM_COMMIT;
+    return title_memory ? 0 : address;
 }
 void track_buffer(ID3D12Resource *resource, bool mapped = false) {
     const auto desc = resource->GetDesc();
@@ -1170,7 +1194,8 @@ bool buffer_at(std::uint64_t address, ID3D12Resource *&resource, std::uint64_t &
 }
 
 // An address the title gives for a vertex or index buffer that no buffer here answers for:
-// worth a line, since the host's GPU faults on it
+// worth a line, since the host's GPU reads nothing of the title's memory (see gpu_address)
+// and may fault on any other address
 void check_address(const char *what, std::uint64_t address, std::uint64_t bytes) {
     if (!address)
         return;
@@ -1332,63 +1357,70 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
         set_mark(heap, at);
         return;
     }
-    // a descriptor the title cleared is a null one, whose reads give 0: the host's slot may
-    // hold anything until it is made so
-    if ((first == 0 && words[2] == 0 && words[3] == 0) || null_buffer(words)) {
-        const auto host = host_slot(heap, at);
-        auto *const device = heap.device;
+    const auto host = host_slot(heap, at);
+    auto *const device = heap.device;
+    // a view of nothing, of a buffer or a texture
+    const auto view_nothing = [&](bool buffer) {
         if (type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
             const D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
             original<void(STDMETHODCALLTYPE *)(void *, const void *, D3D12_CPU_DESCRIPTOR_HANDLE)>(
                 device, 17)(device, &view, host);
         } else if (type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) {
             D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-            view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Format = buffer ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+            view.ViewDimension =
+                buffer ? D3D12_SRV_DIMENSION_BUFFER : D3D12_SRV_DIMENSION_TEXTURE2D;
             view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            view.Texture2D.MipLevels = 1;
+            if (!buffer)
+                view.Texture2D.MipLevels = 1;
             original<void(STDMETHODCALLTYPE *)(void *, void *, const void *,
                                                D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 18)(
                 device, nullptr, &view, host);
-        } else if (type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
+        } else {
             D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
             view.Format = DXGI_FORMAT_R32_UINT;
-            view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            view.ViewDimension =
+                buffer ? D3D12_UAV_DIMENSION_BUFFER : D3D12_UAV_DIMENSION_TEXTURE2D;
             original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *,
                                                D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 19)(
                 device, nullptr, nullptr, &view, host);
-        } else {
-            return;
         }
+    };
+    // a descriptor the title cleared is a null one, whose reads give 0: the host's slot may
+    // hold anything until it is made so
+    if ((first == 0 && words[2] == 0 && words[3] == 0) || null_buffer(words)) {
+        view_nothing(false);
         set_mark(heap, at);
         return;
     }
     const std::uint64_t address = first & 0xffff'ffff'ffffull;
     const UINT stride = (words[1] >> 16) & 0x3fff;
     const std::uint64_t bytes = std::uint64_t{words[2]} * (stride ? stride : 1);
-    const auto host = host_slot(heap, at);
-    auto *const device = heap.device;
+    // a buffer descriptor (type 0 in the last dword's top bits) of memory no buffer here
+    // holds views nothing (see gpu_address)
+    ID3D12Resource *resource = nullptr;
+    std::uint64_t offset = 0, room = 0;
+    if (!buffer_at(address, resource, offset, room)) {
+        if (type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV && words[3] >> 28 != 0)
+            return;
+        view_nothing(true);
+        set_mark(heap, at);
+        return;
+    }
     if (type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
         // the address is the one the title has for the buffer, which on Series is where
         // its memory is: the host is given its own for it, and no more than the buffer has
-        ID3D12Resource *resource = nullptr;
-        std::uint64_t offset = 0, room = 0;
-        if (!buffer_at(address, resource, offset, room))
-            return;
         const auto wanted = std::max<std::uint64_t>((bytes + 255) & ~255ull, 256);
         const D3D12_CONSTANT_BUFFER_VIEW_DESC view{
-            host_address(address),
+            gpu_address(address),
             static_cast<UINT>(std::min<std::uint64_t>({wanted, 65536, room & ~255ull}))};
         if (!view.SizeInBytes)
-            return;
-        original<void(STDMETHODCALLTYPE *)(void *, const void *, D3D12_CPU_DESCRIPTOR_HANDLE)>(
-            device, 17)(device, &view, host);
-    } else if (type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV || type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) {
-        ID3D12Resource *resource = nullptr;
-        std::uint64_t offset = 0, size = 0;
-        if (!buffer_at(address, resource, offset, size))
-            return;
-        size = std::min(size, bytes ? bytes : size);
+            view_nothing(true);
+        else
+            original<void(STDMETHODCALLTYPE *)(void *, const void *, D3D12_CPU_DESCRIPTOR_HANDLE)>(
+                device, 17)(device, &view, host);
+    } else {
+        const auto size = std::min(room, bytes ? bytes : room);
         // structured when the descriptor has a stride that is not a format's, raw otherwise
         const bool structured = stride > 4 && offset % stride == 0;
         const UINT element = structured ? stride : 4;
@@ -1414,8 +1446,6 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
                                                D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 19)(
                 device, resource, nullptr, &view, host);
         }
-    } else {
-        return;
     }
     set_mark(heap, at);
 }
@@ -1489,6 +1519,7 @@ const D3D12_CLEAR_VALUE *host_clear(const D3D12_CLEAR_VALUE *clear, D3D12_CLEAR_
     return &host;
 }
 std::uint64_t root_address(std::uint64_t address);
+std::uint64_t root_uav_address(std::uint64_t address);
 std::uint64_t root_constants(std::uint64_t address);
 std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
                         std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
@@ -1516,7 +1547,7 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
         // image+0x4da8f5c).
         const auto given = host.BufferLocation;
         host.BufferLocation =
-            console == Target::scarlett ? root_address(given) : host_address(given);
+            console == Target::scarlett ? root_address(given) : gpu_address(given);
         MEMORY_BASIC_INFORMATION info{};
         // root_address has copied what is memory of the title's and in no buffer
         copied = console == Target::scarlett && host.BufferLocation != given &&
@@ -1551,6 +1582,10 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
                          words[14], words[15], 10);
             std::fflush(stderr);
         }
+        // memory the host's GPU cannot see and has no copy of: a view of nothing, whose
+        // reads give 0
+        if (!host.BufferLocation)
+            host = {};
     }
     original<void(STDMETHODCALLTYPE *)(void *, const void *, Handle)>(self, 17)(
         self, desc ? &host : nullptr, host_handle(handle));
@@ -2391,6 +2426,17 @@ ID3D12Resource *texture_at(ID3D12Device *self, std::uint64_t address,
     memory_textures[address] = {resource, *of};
     return resource;
 }
+// A view of nothing, whose reads give 0, for memory no resource here holds (see gpu_address):
+// the host wants a format for it unless it is of structures
+template <class View> const View *null_view(View &view, const D3D12_RESOURCE_DESC *of) {
+    // D3D12_SRV_DIMENSION_BUFFER and D3D12_UAV_DIMENSION_BUFFER
+    const bool buffer = static_cast<int>(view.ViewDimension) == 1;
+    if (view.Format == DXGI_FORMAT_UNKNOWN && !(buffer && view.Buffer.StructureByteStride)) {
+        const auto format = of && !buffer ? typed_format(of->Format) : DXGI_FORMAT_UNKNOWN;
+        view.Format = format != DXGI_FORMAT_UNKNOWN ? format : DXGI_FORMAT_R32_UINT;
+    }
+    return &view;
+}
 void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DESC *of,
                                      const void *desc, Handle handle) {
     if (!desc)
@@ -2403,8 +2449,8 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
     ID3D12Resource *resource = nullptr;
     std::uint64_t offset = 0, size = 0;
     if (view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
-        if (auto *const texture = texture_at(self, address, of))
-            create_srv(self, texture, &view, handle);
+        auto *const texture = texture_at(self, address, of);
+        create_srv(self, texture, texture ? &view : null_view(view, of), handle);
         return;
     }
     const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
@@ -2441,8 +2487,11 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
             info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
             reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - address < bytes ||
             !ring_copy(reinterpret_cast<const void *>(address), bytes, bytes,
-                       256 % element ? element : 256, &resource, &offset))
+                       256 % element ? element : 256, &resource, &offset)) {
+            // nothing the host can have a view of: a view of nothing, whose reads give 0
+            create_srv(self, nullptr, null_view(view, of), handle);
             return;
+        }
     }
     if (element)
         view.Buffer.FirstElement += offset / element;
@@ -2538,8 +2587,10 @@ void STDMETHODCALLTYPE create_uav_at(ID3D12Device *self, const D3D12_RESOURCE_DE
     ID3D12Resource *resource = nullptr;
     std::uint64_t offset = 0, size = 0;
     if (view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER ||
-        !buffer_at(address, resource, offset, size))
+        !buffer_at(address, resource, offset, size)) {
+        create_uav(self, nullptr, nullptr, null_view(view, of), handle);
         return;
+    }
     const UINT element = view.Buffer.StructureByteStride ? view.Buffer.StructureByteStride
                          : view.Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW
                              ? 4
@@ -4492,7 +4543,7 @@ void prepare_draw(ListProxy *list) {
             } else if (entry.kind == 2 && argument->kind == 2) {
                 list->host->SetGraphicsRootConstantBufferView(3, root_constants(argument->value));
             } else if (entry.kind == 2 && argument->kind == 4) {
-                list->host->SetGraphicsRootUnorderedAccessView(4, host_address(argument->value));
+                list->host->SetGraphicsRootUnorderedAccessView(4, root_uav_address(argument->value));
             }
         }
         for (const auto &use : stage.uses)
@@ -4876,7 +4927,7 @@ void trace_address(const char *method, std::uint64_t address) {
 std::uint64_t geometry_address(const char *what, std::uint64_t address, std::uint64_t bytes) {
     if (!address || console != Target::scarlett) {
         check_address(what, address, bytes);
-        return host_address(address);
+        return gpu_address(address);
     }
     {
         const std::lock_guard lock(buffer_mutex);
@@ -4901,7 +4952,8 @@ std::uint64_t geometry_address(const char *what, std::uint64_t address, std::uin
         readable ? ring_copy(reinterpret_cast<const void *>(address), readable, readable) : 0;
     if (!copy)
         check_address(what, address, bytes);
-    return copy ? copy : address;
+    // memory the host's GPU cannot see and has no copy of is 0: no buffer, whose reads give 0
+    return copy ? copy : gpu_address(address);
 }
 void STDMETHODCALLTYPE set_vertex_buffers(void *self, UINT start, UINT count,
                                           const D3D12_VERTEX_BUFFER_VIEW *views) {
@@ -4913,9 +4965,12 @@ void STDMETHODCALLTYPE set_vertex_buffers(void *self, UINT start, UINT count,
     ++static_cast<ListProxy *>(self)->vertex_calls;
     if (views) {
         host.assign(views, views + count);
-        for (auto &view : host)
+        for (auto &view : host) {
             view.BufferLocation =
                 geometry_address("a vertex buffer", view.BufferLocation, view.SizeInBytes);
+            if (!view.BufferLocation)
+                view.SizeInBytes = 0;
+        }
     }
     host_of(self)->IASetVertexBuffers(start, count, views ? host.data() : nullptr);
 }
@@ -4925,6 +4980,8 @@ void STDMETHODCALLTYPE set_index_buffer(void *self, const D3D12_INDEX_BUFFER_VIE
     auto host = view ? *view : D3D12_INDEX_BUFFER_VIEW{};
     host.BufferLocation =
         geometry_address("an index buffer", host.BufferLocation, host.SizeInBytes);
+    if (!host.BufferLocation)
+        host.SizeInBytes = 0;
     static_cast<ListProxy *>(self)->indices = host;
     host_of(self)->IASetIndexBuffer(view ? &host : nullptr);
 }
@@ -4980,25 +5037,51 @@ std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t m
         *offset = at;
     return ring->GetGPUVirtualAddress() + at;
 }
-std::uint64_t root_address(std::uint64_t address) {
-    if (!address)
-        return 0;
-    {
-        const std::lock_guard lock(buffer_mutex);
-        auto found = mapped_at.upper_bound(address);
-        if (found != mapped_at.begin() && address < std::prev(found)->second.end)
-            return std::prev(found)->second.gpu + (address - std::prev(found)->first);
-        auto buffer = buffers_at.upper_bound(address);
-        if (buffer != buffers_at.begin() && address < std::prev(buffer)->second.end)
-            return address;
+// Buffers of ours for a root descriptor of memory the host's GPU cannot see and cannot have a
+// copy of (see gpu_address): one of zeros to read, and one to write that nothing reads. A
+// root descriptor has no null form, and the GPU faults at address 0.
+std::uint64_t unseen_root_address(bool written) {
+    static std::mutex mutex;
+    static ID3D12Resource *buffers[2]{};
+    const std::lock_guard lock(mutex);
+    auto *&buffer = buffers[written ? 1 : 0];
+    if (auto *const device = d3d12_device.load(); !buffer && device) {
+        const D3D12_HEAP_PROPERTIES heap{written ? D3D12_HEAP_TYPE_DEFAULT
+                                                 : D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = most_copied;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        desc.Flags =
+            written ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+        // the one to write starts common, which a list takes it out of for its writes itself
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                   written ? D3D12_RESOURCE_STATE_COMMON
+                                                           : D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                   nullptr, IID_PPV_ARGS(&buffer))))
+            buffer = nullptr;
     }
+    return buffer ? buffer->GetGPUVirtualAddress() : 0;
+}
+std::uint64_t root_address(std::uint64_t address) {
+    if (const auto host = gpu_address(address); host || !address)
+        return host;
     MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
-        info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-        return address;
-    const auto region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
-    const auto copy = ring_copy(reinterpret_cast<const void *>(address), region_end - address);
-    return copy ? copy : address;
+    if (VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) &&
+        info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        const auto region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+        if (const auto copy =
+                ring_copy(reinterpret_cast<const void *>(address), region_end - address))
+            return copy;
+    }
+    return unseen_root_address(false);
+}
+// A root UAV of memory the host's GPU cannot see writes where nothing reads
+std::uint64_t root_uav_address(std::uint64_t address) {
+    const auto host = gpu_address(address);
+    return host || !address ? host : unseen_root_address(true);
 }
 // A constant buffer starts anywhere on the console and on a multiple of 256 bytes on the
 // host, which turns the whole list down for one that does not. What a buffer the CPU can
@@ -5071,22 +5154,26 @@ void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64
     host_of(self)->SetGraphicsRootShaderResourceView(index, host);
 }
 void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootUnorderedAccessView(index, host_address(address));
+    host_of(self)->SetComputeRootUnorderedAccessView(index, root_uav_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address) {
     static_cast<ListProxy *>(self)->argument(index) = {4, address, {}};
     if (static_cast<ListProxy *>(self)->ours_bound)
         return;
-    host_of(self)->SetGraphicsRootUnorderedAccessView(index, host_address(address));
+    host_of(self)->SetGraphicsRootUnorderedAccessView(index, root_uav_address(address));
 }
 void STDMETHODCALLTYPE so_set_targets(void *self, UINT start, UINT count,
                                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
     std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> host;
     if (views) {
         host.assign(views, views + count);
+        // a target in memory the host's GPU cannot see is none: what goes there is lost
         for (auto &view : host) {
-            view.BufferLocation = host_address(view.BufferLocation);
-            view.BufferFilledSizeLocation = host_address(view.BufferFilledSizeLocation);
+            const auto location = gpu_address(view.BufferLocation),
+                       filled = gpu_address(view.BufferFilledSizeLocation);
+            view = (location || !view.BufferLocation) && (filled || !view.BufferFilledSizeLocation)
+                       ? D3D12_STREAM_OUTPUT_BUFFER_VIEW{location, view.SizeInBytes, filled}
+                       : D3D12_STREAM_OUTPUT_BUFFER_VIEW{};
         }
     }
     host_of(self)->SOSetTargets(start, count, views ? host.data() : nullptr);
@@ -5396,6 +5483,30 @@ void STDMETHODCALLTYPE fill_memory_128(void *, std::uint64_t destination, std::u
     if (value)
         fill_memory(destination, size, value, 4 * sizeof *value);
 }
+// ID3D12GraphicsCommandList2::WriteBufferImmediate (Xbox One's list slot 110, the Series
+// console's 111). A destination the host's GPU cannot see is the title's own memory, which the
+// CPU writes when the list is recorded, as for the console's write methods above.
+void STDMETHODCALLTYPE write_buffer_immediate(
+    void *self, UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters,
+    const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) {
+    std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> host;
+    std::vector<D3D12_WRITEBUFFERIMMEDIATE_MODE> host_modes;
+    for (UINT i = 0; parameters && i < count; ++i) {
+        if (const auto address = gpu_address(parameters[i].Dest)) {
+            host.push_back({address, parameters[i].Value});
+            if (modes)
+                host_modes.push_back(modes[i]);
+        } else {
+            write_value(parameters[i].Dest, parameters[i].Value);
+        }
+    }
+    ID3D12GraphicsCommandList2 *list = nullptr;
+    if (host.empty() || FAILED(host_of(self)->QueryInterface(IID_PPV_ARGS(&list))))
+        return;
+    list->WriteBufferImmediate(static_cast<UINT>(host.size()), host.data(),
+                               modes ? host_modes.data() : nullptr);
+    list->Release();
+}
 // the slots where the two consoles' lists differ
 void configure_lists() {
     map_list_slots();
@@ -5413,6 +5524,8 @@ void configure_lists() {
         for (const auto slot : slots)
             list_vtable[slot] = reinterpret_cast<Slot>(&ignored_list_method);
     };
+    list_vtable[console == Target::durango ? 110 : 111] =
+        reinterpret_cast<Slot>(&write_buffer_immediate);
     if (console == Target::durango) {
         // PrefetchMemoryX and PrefetchPipelineStateX
         ignore({98, 99});
@@ -5931,8 +6044,11 @@ HRESULT STDMETHODCALLTYPE create_reserved_resource(ID3D12Device *self,
     D3D12_RESOURCE_DESC host{};
     if (desc)
         host = host_resource_desc(*desc);
-    return original<Create>(self, 30)(self, desc ? &host : nullptr, host_state(state), clear, iid,
-                                      resource);
+    const auto result = original<Create>(self, 30)(self, desc ? &host : nullptr, host_state(state),
+                                                   clear, iid, resource);
+    if (SUCCEEDED(result) && resource && *resource)
+        track_buffer(static_cast<ID3D12Resource *>(*resource));
+    return result;
 }
 // slot 60: CreateGraphicsPipelineStateX, the pipeline and the console's extensions of it
 HRESULT STDMETHODCALLTYPE create_graphics_pipeline_x(ID3D12Device *self,
@@ -6382,8 +6498,10 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_2(
     clear = host_clear(clear, cleared);
     const auto result = original<Create>(self, 69)(self, heap, flags, desc ? &host_desc : nullptr,
                                                    state, clear, session, iid, resource);
-    if (SUCCEEDED(result) && resource && *resource)
+    if (SUCCEEDED(result) && resource && *resource) {
         console_resource(*resource);
+        track_buffer(static_cast<ID3D12Resource *>(*resource));
+    }
     if (FAILED(result) && desc) {
         std::fprintf(stderr,
                      "[Runtime] CreateCommittedResource2 dimension %d %llux%ux%u mips %u format "
@@ -6958,6 +7076,10 @@ void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barrie
     auto *const list = static_cast<ListProxy *>(make_list_proxy(host));
     list->legacy_barriers = !enhanced_barriers;
     return list;
+}
+void call_as_title(const void *code, std::size_t size) {
+    test_code_end = static_cast<const std::uint8_t *>(code) + size;
+    test_code = static_cast<const std::uint8_t *>(code);
 }
 void report_failure() {
     auto *const device = d3d12_device.load();

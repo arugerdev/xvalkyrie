@@ -1,5 +1,6 @@
 #pragma once
 #include "core/target.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <d3d12.h>
 #include <dxgi.h>
@@ -25,6 +26,9 @@ void console_d3d12_resource(void *resource);
 // reference of its own to the host's. Without `enhanced_barriers` its Barrier is as on a host
 // that has none. Exposed for the tests.
 void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barriers = true);
+// Code at [code, code + size) calls the console's Direct3D 12 objects as the title's own code
+// does. Exposed for the tests, which have no title.
+void call_as_title(const void *code, std::size_t size);
 // why the host's device stopped, and what its debug layer said, to the log
 void report_failure();
 // a texture's first subresource, copied to the CPU through the title's direct queue

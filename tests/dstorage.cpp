@@ -1,5 +1,6 @@
 #include "runtime/modules/dstorage.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/bcpack.hpp"
 #include "runtime/modules/memory.hpp"
 #include <algorithm>
 #include <catch2/catch.hpp>
@@ -70,6 +71,7 @@ struct Request {
 };
 constexpr UINT64 zlib_decompress = 1, destination_is_physical_pages = 1ull << 21,
                  source_memory = 1ull << 22, source_is_physical_pages = 1ull << 23;
+constexpr UINT64 bcpack_mode(unsigned bc) { return UINT64{bc} << 1; }
 struct ErrorRecord {
     UINT32 failures;
     HRESULT first;
@@ -172,6 +174,97 @@ std::vector<std::uint8_t> stored_zlib(const std::vector<std::uint8_t> &data) {
     for (int shift = 24; shift >= 0; shift -= 8)
         stream.push_back(static_cast<std::uint8_t>(adler >> shift));
     return stream;
+}
+
+// BCPack tables of our own: uniform models, identity ranks, a BC7 control code for mode 6,
+// empty dictionaries
+std::vector<std::uint8_t> uniform_tables() {
+    std::vector<std::uint8_t> t;
+    const auto u16 = [&](unsigned v) {
+        t.push_back(static_cast<std::uint8_t>(v));
+        t.push_back(static_cast<std::uint8_t>(v >> 8));
+    };
+    for (unsigned m = 0; m < 128; ++m)
+        for (unsigned b = 0; b < 9; ++b)
+            u16(b < m / 16 + 2 ? 1u << (15 - m / 16) : 0);
+    for (unsigned v = 0; v < 256; ++v)
+        t.push_back(static_cast<std::uint8_t>(v & 0x77)); // BC1
+    for (unsigned v = 0; v < 64; ++v)
+        t.push_back(static_cast<std::uint8_t>(v)); // BC3 alpha
+    for (unsigned v = 0; v < 256; ++v)
+        t.push_back(static_cast<std::uint8_t>(v)); // BC3 colour
+    for (unsigned v = 0; v < 64; ++v)
+        t.push_back(static_cast<std::uint8_t>((v & 7) | (v >> 3) << 4)); // BC4
+    for (unsigned v = 0; v < 64; ++v)
+        t.push_back(static_cast<std::uint8_t>(v)); // BC5
+    for (unsigned code = 0; code < 512; ++code)
+        u16(code == 0 ? 0x46 : 0);
+    t.resize(modules::bcpack::tables_size);
+    return t;
+}
+// one lane's symbols as one fragment of the uniform model of its width, rANS from 2^24
+std::vector<std::uint8_t> fragment(unsigned width, const std::vector<std::uint8_t> &symbols) {
+    const std::uint32_t f = 1u << (15 - width);
+    std::uint32_t x = 1u << 24;
+    std::vector<std::uint8_t> bytes;
+    for (auto symbol = symbols.rbegin(); symbol != symbols.rend(); ++symbol) {
+        const auto freq = *symbol ? f : f - 1, start = *symbol ? *symbol * f : 1;
+        while (x >= freq << 16) {
+            bytes.push_back(static_cast<std::uint8_t>(x));
+            x >>= 8;
+        }
+        x = ((x / freq) << 16) + x % freq + start;
+    }
+    for (int k = 0; k < 4; ++k)
+        bytes.push_back(static_cast<std::uint8_t>(x >> 8 * k));
+    std::reverse(bytes.begin(), bytes.end());
+    std::vector<std::uint8_t> out{0};
+    if (bytes.size() > 256) {
+        out[0] |= 0x20;
+        const auto n = bytes.size() - 257;
+        out.push_back(static_cast<std::uint8_t>(n));
+        out.push_back(static_cast<std::uint8_t>(n >> 8));
+    } else {
+        out.push_back(static_cast<std::uint8_t>(bytes.size() - 1));
+    }
+    out.insert(out.end(), bytes.begin(), bytes.end());
+    return out;
+}
+// a stream of blocks given as their records (`per` symbols per lane), each lane ending with a
+// fragment that parks it
+std::vector<std::uint8_t> bcpack_stream(const modules::bcpack::Tables &tables, unsigned bc,
+                                        const std::vector<unsigned> &widths, std::size_t per,
+                                        const std::vector<std::vector<std::uint8_t>> &records) {
+    std::vector<std::vector<std::uint8_t>> lanes;
+    for (std::size_t j = 0; j < widths.size(); ++j) {
+        std::vector<std::uint8_t> symbols;
+        for (const auto &record : records)
+            symbols.insert(symbols.end(), record.begin() + j * per, record.begin() + j * per + per);
+        auto bytes = fragment(widths[j], symbols);
+        bytes.insert(bytes.end(), {0, 1, 0, 0});
+        lanes.push_back(std::move(bytes));
+    }
+    return modules::bcpack::interleave_lanes(tables, bc, records.size(), lanes);
+}
+std::uint8_t zigzag(int v) { return static_cast<std::uint8_t>(v >= 0 ? 2 * v : -2 * v - 1); }
+const std::vector<unsigned> bc4_lanes{7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5};
+// two BC4 blocks: the first with endpoints 10 and -3 (stored +128) and indices p -> p & 7, the
+// second refers to the first for both, with residuals +1
+std::vector<std::vector<std::uint8_t>> bc4_records() {
+    std::vector<std::uint8_t> first{0, 0, zigzag(10), zigzag(-3)},
+        second{0, 1, zigzag(1), zigzag(1)};
+    for (unsigned k = 0; k < 8; ++k) {
+        first.push_back(static_cast<std::uint8_t>(((2 * k) & 7) | ((2 * k + 1) & 7) << 3));
+        second.push_back(1 | 1 << 3);
+    }
+    return {first, second};
+}
+std::uint64_t bc4_block(unsigned e0, unsigned e1, unsigned add) {
+    constexpr std::uint64_t code[8] = {0, 2, 3, 4, 5, 6, 7, 1};
+    std::uint64_t bits = e0 | e1 << 8;
+    for (unsigned p = 0; p < 16; ++p)
+        bits |= code[(p + add) & 7] << (16 + 3 * p);
+    return bits;
 }
 } // namespace
 
@@ -324,4 +417,106 @@ TEST_CASE("a page the title does not hold fails the request, and nothing is writ
     request.destination = nullptr;
     record = queue.run(request);
     CHECK(record.failures == 1);
+}
+
+TEST_CASE("BCPack tables are the format's size and tile each model") {
+    using namespace modules::bcpack;
+    std::string why;
+    auto bytes = uniform_tables();
+    CHECK(parse_tables(bytes, &why));
+    CHECK_FALSE(parse_tables(std::span(bytes).first(bytes.size() - 1), &why));
+    CHECK_FALSE(why.empty());
+    bytes[0] ^= 1; // model 0 no longer adds up to 65536
+    CHECK_FALSE(parse_tables(bytes, &why));
+}
+
+TEST_CASE("BCPack unpacks BC4 blocks, with and without a reference to an earlier one") {
+    using namespace modules::bcpack;
+    const auto tables = parse_tables(uniform_tables(), nullptr);
+    REQUIRE(tables);
+    const auto stream = bcpack_stream(*tables, 4, bc4_lanes, 1, bc4_records());
+    REQUIRE_FALSE(stream.empty());
+    std::uint64_t blocks[2]{};
+    REQUIRE(decode(*tables, 4, stream, std::span(reinterpret_cast<std::uint8_t *>(blocks), 16),
+                   nullptr));
+    CHECK(blocks[0] == bc4_block(138, 125, 0));
+    CHECK(blocks[1] == bc4_block(139, 126, 1));
+    // a stream that ends early, or a destination that is not whole blocks, does not decode
+    std::string why;
+    CHECK_FALSE(decode(*tables, 4, std::span(stream).first(stream.size() / 2),
+                       std::span(reinterpret_cast<std::uint8_t *>(blocks), 16), &why));
+    CHECK_FALSE(
+        decode(*tables, 4, stream, std::span(reinterpret_cast<std::uint8_t *>(blocks), 12), &why));
+    CHECK_FALSE(
+        decode(*tables, 2, stream, std::span(reinterpret_cast<std::uint8_t *>(blocks), 16), &why));
+}
+
+TEST_CASE("BCPack unpacks a BC7 block of mode 6") {
+    using namespace modules::bcpack;
+    const auto tables = parse_tables(uniform_tables(), nullptr);
+    REQUIRE(tables);
+    // control code 0 is mode 6; endpoints R in 8 bits (the p-bit the low one), G B A in 7
+    std::vector<std::uint8_t> record(32);
+    record[4] = zigzag(0x55); // R0 0x55: field 0x2a, p-bit 1
+    record[5] = zigzag(-1);   // R1 0xff
+    record[6] = zigzag(3);
+    record[10] = zigzag(0x7f >> 1);
+    const auto stream =
+        bcpack_stream(*tables, 7, {3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4}, 2, {record});
+    REQUIRE_FALSE(stream.empty());
+    std::uint64_t block[2]{};
+    REQUIRE(decode(*tables, 7, stream, std::span(reinterpret_cast<std::uint8_t *>(block), 16),
+                   nullptr));
+    // mode 6, then R0 R1 G0 G1 B0 B1 A0 A1 in 7 bits each, then the two p-bits
+    std::uint64_t expected[2]{1 << 6, 0};
+    unsigned at = 7;
+    for (const unsigned field : {0x2au, 0x7fu, 3u, 0u, 0u, 0u, 0x3fu, 0u, 1u, 1u}) {
+        const unsigned n = at < 63 ? 7 : 1;
+        if (at < 64)
+            expected[0] |= std::uint64_t{field} << at;
+        else
+            expected[1] |= std::uint64_t{field} << (at - 64);
+        at += n;
+    }
+    CHECK(block[0] == expected[0]);
+    CHECK(block[1] == expected[1]);
+}
+
+TEST_CASE("a request inflates, then unpacks BCPack, into the title's memory") {
+    REQUIRE(modules::use_bcpack_tables(uniform_tables()));
+    const auto tables = modules::bcpack::parse_tables(uniform_tables(), nullptr);
+    const auto stream = bcpack_stream(*tables, 4, bc4_lanes, 1, bc4_records());
+    const auto packed = stored_zlib(stream);
+    std::uint64_t blocks[2]{};
+    MemoryQueue queue;
+    Request request{source_memory | zlib_decompress | bcpack_mode(4),
+                    blocks,
+                    0,
+                    16,
+                    const_cast<std::uint8_t *>(packed.data()),
+                    0,
+                    static_cast<UINT32>(packed.size()),
+                    static_cast<UINT32>(stream.size())};
+    CHECK(queue.run(request).failures == 0);
+    CHECK(blocks[0] == bc4_block(138, 125, 0));
+    CHECK(blocks[1] == bc4_block(139, 126, 1));
+
+    // BCPack alone, from the stream as it is
+    blocks[0] = blocks[1] = 0;
+    request = {source_memory | bcpack_mode(4),
+               blocks,
+               0,
+               16,
+               const_cast<std::uint8_t *>(stream.data()),
+               0,
+               static_cast<UINT32>(stream.size())};
+    CHECK(queue.run(request).failures == 0);
+    CHECK(blocks[1] == bc4_block(139, 126, 1));
+
+    // BC2, whose packing is not known, and tables that are not tables
+    request.options = source_memory | bcpack_mode(2);
+    CHECK(queue.run(request).first == E_NOTIMPL);
+    CHECK_FALSE(modules::use_bcpack_tables(std::span(stream)));
+    request.options = source_memory | bcpack_mode(4);
+    CHECK(queue.run(request).first == E_NOTIMPL);
 }

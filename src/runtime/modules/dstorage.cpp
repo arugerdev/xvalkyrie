@@ -1,5 +1,7 @@
 #include "runtime/modules/dstorage.hpp"
+#include "host/files.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/bcpack.hpp"
 #include "runtime/modules/inflate.hpp"
 #include "runtime/modules/kernel.hpp"
 #include "runtime/modules/memory.hpp"
@@ -10,8 +12,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <intrin.h>
+#include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <variant>
@@ -24,9 +30,9 @@
 // DirectStorage as the Series console has it (dstorage_xs.dll, and XCRDAPI.dll for the
 // factory): queues of read requests, with marks in between that set a status or signal a
 // fence once everything before them is done. Here a queue does its work when it is
-// submitted, on the thread that submits it, in order. Reads may be inflated (zlib); the
-// console's texture compression (BCPack) is not known here, and such a request fails.
-// Sources and destinations may be the title's memory or its physical pages.
+// submitted, on the thread that submits it, in order. Reads may be inflated (zlib), then
+// unpacked (the console's texture compression, BCPack). Sources and destinations may be the
+// title's memory or its physical pages.
 namespace xv::runtime::modules {
 namespace {
 constexpr GUID file_iid{
@@ -262,24 +268,54 @@ HRESULT write_destination(const Request &request, const std::uint8_t *data, std:
     return S_OK;
 }
 
+// BCPack's tables are the format's constants, which are not this project's to give: they
+// are read from bcpack-tables.bin beside the executable, a file the user provides. Without it
+// a BCPack request fails, as one did before there was a decoder.
+struct BcpackTables {
+    std::mutex mutex;
+    bool looked = false;
+    std::shared_ptr<const bcpack::Tables> tables;
+};
+BcpackTables &bcpack_state() {
+    static BcpackTables state;
+    return state;
+}
+std::shared_ptr<const bcpack::Tables> bcpack_tables() {
+    auto &state = bcpack_state();
+    const std::lock_guard lock(state.mutex);
+    if (!state.looked) {
+        state.looked = true;
+        const auto path = host::executable_directory() / "bcpack-tables.bin";
+        std::ifstream file(path, std::ios::binary);
+        const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file),
+                                              std::istreambuf_iterator<char>()};
+        std::string why = "there is no such file";
+        if (file.is_open())
+            state.tables = bcpack::parse_tables(bytes, &why);
+        if (!state.tables)
+            std::fprintf(stderr,
+                         "[Runtime] DirectStorage: BCPack requests fail until the format's "
+                         "tables (%zu bytes) are at %s: %s\n",
+                         bcpack::tables_size, path.string().c_str(), why.c_str());
+    }
+    return state.tables;
+}
+
 // The swizzle mode is not done here: the data is written as it was read.
 HRESULT read(const Request &request) {
     const auto &options = request.options;
-    if (options.bcpack_mode) {
-        if (static std::atomic<bool> shown{false}; !shown.exchange(true))
-            std::fprintf(stderr,
-                         "[Runtime] DirectStorage: a request with BCPack (BC%u), which is not "
-                         "done\n",
-                         static_cast<unsigned>(options.bcpack_mode));
+    const auto bc = static_cast<unsigned>(options.bcpack_mode);
+    std::shared_ptr<const bcpack::Tables> tables;
+    if (bc && (bc == 2 || !(tables = bcpack_tables())))
         return E_NOTIMPL;
-    }
     if (!request.destination || !request.source)
         return E_INVALIDARG;
     // without decompression the sizes are the same; with it the result is larger
-    if (!options.zlib_decompress && request.source_size > request.destination_size)
+    const bool decompress = options.zlib_decompress || bc;
+    if (!decompress && request.source_size > request.destination_size)
         return E_INVALIDARG;
     // a file read straight to the title's memory, when nothing comes in between
-    if (!options.zlib_decompress && options.source_type != source_memory &&
+    if (!decompress && options.source_type != source_memory &&
         !options.destination_is_physical_pages) {
         prepare_title_write(request.destination, request.source_size);
         return read_file(request, request.destination);
@@ -288,15 +324,33 @@ HRESULT read(const Request &request) {
     const std::uint8_t *data = nullptr;
     if (const auto result = read_source(request, packed, data); FAILED(result))
         return result;
-    if (!options.zlib_decompress)
-        return write_destination(request, data, request.source_size);
-    // A stream that goes on past DestinationSize fills it: the console's decompression stops
-    // where its output ends, and a title asks for the start of a longer stream that way.
+    std::size_t size = request.source_size;
+    // zlib first, to IntermediateSize when BCPack follows, else to DestinationSize. A stream
+    // that goes on past that fills it: the console's decompression stops where its output
+    // ends, and a title asks for the start of a longer stream that way.
     std::vector<std::uint8_t> plain;
-    if (!inflate_zlib({data, request.source_size}, plain))
-        return E_FAIL;
-    return write_destination(request, plain.data(),
-                             std::min<std::size_t>(plain.size(), request.destination_size));
+    if (options.zlib_decompress) {
+        const std::size_t room =
+            bc && request.intermediate_size ? request.intermediate_size : request.destination_size;
+        if (!inflate_zlib({data, size}, plain))
+            return E_FAIL;
+        data = plain.data();
+        size = std::min(plain.size(), room);
+    }
+    // then BCPack, to the destination's blocks
+    std::vector<std::uint8_t> blocks;
+    if (bc) {
+        blocks.resize(request.destination_size);
+        if (std::string why; !bcpack::decode(*tables, bc, {data, size}, blocks, &why)) {
+            if (static std::atomic<int> shown{0}; shown++ < 4)
+                std::fprintf(stderr, "[Runtime] DirectStorage: BCPack (BC%u) of %zu bytes: %s\n",
+                             bc, size, why.c_str());
+            return E_FAIL;
+        }
+        data = blocks.data();
+        size = blocks.size();
+    }
+    return write_destination(request, data, size);
 }
 
 class Queue final : public Object<QueueInterface> {
@@ -558,6 +612,15 @@ HRESULT WINAPI get_factory(const GUID *iid, void **factory) {
     return one->QueryInterface(*iid, factory);
 }
 } // namespace
+
+bool use_bcpack_tables(std::span<const std::uint8_t> bytes) {
+    auto tables = bcpack::parse_tables(bytes, nullptr);
+    auto &state = bcpack_state();
+    const std::lock_guard lock(state.mutex);
+    state.looked = true;
+    state.tables = std::move(tables);
+    return state.tables != nullptr;
+}
 
 void install_dstorage(Registry &registry) {
     for (const auto *module : {"dstorage_xs.dll", "xcrdapi.dll"})

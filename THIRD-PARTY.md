@@ -89,3 +89,9 @@ in the release archives; the package's `LICENSE.txt` has its terms.
 `crates/victory-formats/src/texture.rs` of
 [Marvisak/VIctory](https://github.com/Marvisak/VIctory), under the same license as this
 project. That code follows AMD's addrlib (MIT), credited in `texture_layout.hpp`.
+
+`src/runtime/modules/bcpack.cpp` and `bcpack.hpp` are a port to C++ of
+`crates/victory-formats/src/bcpack.rs` of the same project (commit
+`ffe310eb2098e52169f4c44db5ffdabf43a72622`). BCPack's constant tables (77,982 bytes) are not
+part of it, nor of this repository. A user who has them puts them beside the executable as
+`bcpack-tables.bin`; without them DirectStorage requests with BCPack fail.

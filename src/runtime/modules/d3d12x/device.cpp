@@ -346,7 +346,7 @@ template <class Method> Method original(void *object, std::size_t index) {
 // differently runs the console's method only when the title calls it, and the host's
 // otherwise (its callers pass the object first; the title's, for methods that return a
 // structure, second). The console's methods are one table per kind of object.
-enum class Family { device, list, heap, queue, resource };
+enum class Family { device, list, heap, queue, resource, allocator };
 constexpr std::size_t max_slots = 160;
 template <Family Kind> std::array<Slot, max_slots> console_table{};
 using Raw = std::uint64_t(STDMETHODCALLTYPE *)(void *, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -6278,13 +6278,26 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
         CloseHandle(event);
     }
 }
+// ID3D12CommandAllocator as the console has it: the desktop's methods to Reset (8), then
+// SetAllocatorCallbackX (9) and two more of its own. The host's class has methods of its own
+// at those slots, which a title's call must not reach: the debug layer's at 9 takes the
+// title's arguments for data of its own.
+// SetAllocatorCallbackX(callback, context): the console's runtime asks the title's callback for
+// the memory the allocator's commands go in. The host's allocator keeps its commands in memory
+// of its own, which is all the host's GPU reads, so the callback is never called.
+HRESULT STDMETHODCALLTYPE set_allocator_callback_x(void *, void *, void *) { return S_OK; }
+// the other two: no title has been seen calling them, and nothing here needs what they set
+HRESULT STDMETHODCALLTYPE ignored_allocator_method(void *) { return S_OK; }
 // CreateCommandAllocator (9): the console's copy engine has a list type of its own (16),
 // which is a direct list here, as its queue is
 HRESULT STDMETHODCALLTYPE create_command_allocator(ID3D12Device *self, UINT type, REFIID iid,
                                                    void **allocator) {
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, REFIID, void **);
-    return original<Create>(self, 9)(self, type == 16 ? D3D12_COMMAND_LIST_TYPE_DIRECT : type, iid,
-                                     allocator);
+    const auto result = original<Create>(self, 9)(
+        self, type == 16 ? D3D12_COMMAND_LIST_TYPE_DIRECT : type, iid, allocator);
+    if (SUCCEEDED(result) && allocator && *allocator)
+        console_command_allocator(*allocator);
+    return result;
 }
 // CreateCommandList (12), the desktop's way: a proxy as well
 HRESULT STDMETHODCALLTYPE create_command_list_desktop(ID3D12Device *self, UINT node,
@@ -7420,6 +7433,12 @@ void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barrie
     auto *const list = static_cast<ListProxy *>(make_list_proxy(host));
     list->legacy_barriers = !enhanced_barriers;
     return list;
+}
+void console_command_allocator(void *allocator) {
+    console_vtable<Family::allocator>(allocator, 9, 12,
+                                      {{9, reinterpret_cast<Slot>(&set_allocator_callback_x)},
+                                       {10, reinterpret_cast<Slot>(&ignored_allocator_method)},
+                                       {11, reinterpret_cast<Slot>(&ignored_allocator_method)}});
 }
 void call_as_title(const void *code, std::size_t size) {
     test_code_end = static_cast<const std::uint8_t *>(code) + size;

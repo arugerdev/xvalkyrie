@@ -906,9 +906,9 @@ struct ShadowHeap {
     bool shader_visible;
     std::uint64_t gpu; // the host's GPU handle of the start, for a shader-visible heap
     UINT host_stride;
-    void *owner;           // the heap the title holds
-    bool borrowed = false; // the memory is the title's own, from its allocation hooks
-    UINT host_count = ~0u; // the host's descriptors, where it has fewer than the title
+    void *owner;                // the heap the title holds
+    bool borrowed = false;      // the memory is the title's own, from its allocation hooks
+    UINT host_count = ~0u;      // the host's descriptors, where it has fewer than the title
     std::shared_ptr<Twin> twin; // for a heap shaders see: where `host` is
 };
 // The console's descriptor sizes, which titles also have compiled in: the device's inline
@@ -2107,8 +2107,8 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
     if (desc) {
         std::memcpy(&view, desc, sizeof view);
-        if (const auto format = view_format(
-                resource, host_format(self, view.Format, FormatUse::target_view));
+        if (const auto format =
+                view_format(resource, host_format(self, view.Format, FormatUse::target_view));
             format != view.Format) {
             view.Format = format;
             desc = &view;
@@ -2854,8 +2854,7 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
                              ? 4
                              : element_bytes(view.Format);
     const bool known = buffer_at(address, resource, offset, size);
-    if (static std::atomic<int> shown{0};
-        std::getenv("XV_D3D_LOST") && shown++ < 6) {
+    if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_LOST") && shown++ < 6) {
         float first[16]{};
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) &&
@@ -2863,13 +2862,15 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
             std::memcpy(first, reinterpret_cast<const void *>(address), sizeof first);
         std::fprintf(stderr,
                      "[Lost] a view of a buffer of memory at %llx (%s): first %llu, %u of %u "
-                     "bytes, flags %u, format %d, of %llu bytes: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g%c",
+                     "bytes, flags %u, format %d, of %llu bytes: %g %g %g %g | %g %g %g %g | %g %g "
+                     "%g %g | %g %g %g %g%c",
                      static_cast<unsigned long long>(address), known ? "a buffer" : "no buffer",
                      static_cast<unsigned long long>(view.Buffer.FirstElement),
-                     view.Buffer.NumElements, view.Buffer.StructureByteStride, view.Buffer.Flags, view.Format, static_cast<unsigned long long>(of ? of->Width : 0),
-                     first[0], first[1], first[2], first[3], first[4], first[5], first[6], first[7],
-                     first[8], first[9], first[10], first[11], first[12], first[13], first[14],
-                     first[15], 10);
+                     view.Buffer.NumElements, view.Buffer.StructureByteStride, view.Buffer.Flags,
+                     view.Format, static_cast<unsigned long long>(of ? of->Width : 0), first[0],
+                     first[1], first[2], first[3], first[4], first[5], first[6], first[7], first[8],
+                     first[9], first[10], first[11], first[12], first[13], first[14], first[15],
+                     10);
     }
     if (!known) {
         // Memory of the title's that is in no buffer here: what the view is of is copied,
@@ -2909,11 +2910,10 @@ void structured_view(ID3D12Device *device, std::uint64_t slot, std::uint32_t str
             return;
         view = found->second;
     }
-    const std::uint64_t element = view.desc.Buffer.StructureByteStride
-                                      ? view.desc.Buffer.StructureByteStride
-                                  : view.desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW
-                                      ? 4
-                                      : element_bytes(view.desc.Format);
+    const std::uint64_t element =
+        view.desc.Buffer.StructureByteStride                 ? view.desc.Buffer.StructureByteStride
+        : view.desc.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW ? 4
+                                                             : element_bytes(view.desc.Format);
     const auto start = view.desc.Buffer.FirstElement * element;
     const auto bytes = view.desc.Buffer.NumElements * element;
     if (!element || element == stride || start % stride || bytes < stride)
@@ -3164,14 +3164,17 @@ HeapUses::Stage heap_stage(const D3D12_SHADER_BYTECODE &code) {
     const auto layout = modules::shader_heap_layout(
         {static_cast<const std::uint8_t *>(code.pShaderBytecode), code.BytecodeLength});
     for (const auto &entry : layout.entries)
-        stage.entries.push_back(
-            {entry.type == 3 ? 1 : entry.type == 1 ? 2 : 5, entry.reg, entry.count, entry.slot});
+        stage.entries.push_back({entry.type == 3   ? 1
+                                 : entry.type == 1 ? 2
+                                                   : 5,
+                                 entry.reg, entry.count, entry.slot});
     for (const auto &read : layout.reads)
         if (read.type == 3)
             stage.samplers.push_back(read.reg);
         else
             stage.uses.push_back({read.reg, read.place,
-                                  static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(read.type), read.stride});
+                                  static_cast<D3D12_DESCRIPTOR_RANGE_TYPE>(read.type),
+                                  read.stride});
     return stage;
 }
 std::map<const void *, std::shared_ptr<const HeapUses>> heap_pipelines; // under kept_mutex
@@ -4984,7 +4987,8 @@ void prepare_draw(ListProxy *list) {
             } else if (entry.kind == 2 && argument->kind == 2) {
                 list->host->SetGraphicsRootConstantBufferView(3, root_constants(argument->value));
             } else if (entry.kind == 2 && argument->kind == 4) {
-                list->host->SetGraphicsRootUnorderedAccessView(4, root_uav_address(argument->value));
+                list->host->SetGraphicsRootUnorderedAccessView(4,
+                                                               root_uav_address(argument->value));
             }
         }
         for (const auto &use : stage.uses)
@@ -4999,8 +5003,7 @@ void prepare_draw(ListProxy *list) {
                     refresh_memory_view(words[1]);
                 decode_as(heaps[at], where, use.type);
                 if (use.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && use.stride > 4)
-                    structured_view(heaps[at].device, host_slot(heaps[at], where).ptr,
-                                    use.stride);
+                    structured_view(heaps[at].device, host_slot(heaps[at], where).ptr, use.stride);
             }
         if (!stage.samplers.empty()) {
             ShadowHeap samplers{};
@@ -5073,7 +5076,8 @@ void prepare_draw(ListProxy *list) {
             for (const auto &entry : stage.entries) {
                 const auto *const argument =
                     entry.slot < arguments.size() ? &arguments[entry.slot] : nullptr;
-                std::fprintf(stderr, "[Lost]   %s s%u: kind %d x%u of parameter %u, given %d/%llx%c",
+                std::fprintf(stderr,
+                             "[Lost]   %s s%u: kind %d x%u of parameter %u, given %d/%llx%c",
                              index ? "pixel" : "vertex", entry.reg, entry.kind, entry.count,
                              entry.slot, argument ? argument->kind : 0,
                              static_cast<unsigned long long>(argument ? argument->value : 0), 10);
@@ -5093,29 +5097,29 @@ void prepare_draw(ListProxy *list) {
                 if (!table)
                     continue;
                 std::uint64_t words[4]{};
-                std::memcpy(words,
-                            reinterpret_cast<const void *>(table + std::uintptr_t{use.place} *
-                                                                       heap.stride),
-                            std::min<std::size_t>(sizeof words, heap.stride));
+                std::memcpy(
+                    words,
+                    reinterpret_cast<const void *>(table + std::uintptr_t{use.place} * heap.stride),
+                    std::min<std::size_t>(sizeof words, heap.stride));
                 ID3D12Resource *resource = nullptr;
                 std::uint64_t offset = 0, room = 0;
                 const bool marked = words[0] == host_mark;
                 const bool buffer =
                     !marked && buffer_at(words[0] & 0xffff'ffff'ffffull, resource, offset, room);
-                std::fprintf(stderr,
-                             "[Lost]   %s s%u place %u type %d (heap slot %llu): %016llx %016llx "
-                             "%016llx %016llx, %s%c",
-                             index ? "pixel" : "vertex", use.reg, use.place, use.type,
-                             static_cast<unsigned long long>((table - heap.base) / heap.stride +
-                                                             use.place),
-                             static_cast<unsigned long long>(words[0]),
-                             static_cast<unsigned long long>(words[1]),
-                             static_cast<unsigned long long>(words[2]),
-                             static_cast<unsigned long long>(words[3]),
-                             marked   ? "the host's"
-                             : buffer ? "the title's, of a buffer known here"
-                                      : "the title's, of NO buffer known here",
-                             10);
+                std::fprintf(
+                    stderr,
+                    "[Lost]   %s s%u place %u type %d (heap slot %llu): %016llx %016llx "
+                    "%016llx %016llx, %s%c",
+                    index ? "pixel" : "vertex", use.reg, use.place, use.type,
+                    static_cast<unsigned long long>((table - heap.base) / heap.stride + use.place),
+                    static_cast<unsigned long long>(words[0]),
+                    static_cast<unsigned long long>(words[1]),
+                    static_cast<unsigned long long>(words[2]),
+                    static_cast<unsigned long long>(words[3]),
+                    marked   ? "the host's"
+                    : buffer ? "the title's, of a buffer known here"
+                             : "the title's, of NO buffer known here",
+                    10);
                 // the memory a view of the title's memory is of, as it is now
                 MemoryView view;
                 bool kept = false;

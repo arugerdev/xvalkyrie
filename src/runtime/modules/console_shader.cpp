@@ -1057,8 +1057,8 @@ HeapLayout shader_heap_layout(Bytes container) {
                           : kind == 2     ? 3u
                                           : ~0u;
         if (type != ~0u)
-            layout.reads.push_back(
-                {type, file[entry + 17], at32(entry + 4) / 8, file[entry + 16] == 4 ? at32(entry + 12) : 0});
+            layout.reads.push_back({type, file[entry + 17], at32(entry + 4) / 8,
+                                    file[entry + 16] == 4 ? at32(entry + 12) : 0});
     }
     return layout;
 }

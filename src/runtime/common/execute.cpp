@@ -765,11 +765,15 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
             continue;
         if (point.hits++ < break_limit) {
             std::uint64_t at_rcx[4]{}, at_rdx[4]{}, at_r8[5]{};
+            // no further than the region the address is in: past it may be no memory
             const auto read = [](std::uint64_t address, void *into, std::size_t size) {
                 MEMORY_BASIC_INFORMATION memory{};
                 if (VirtualQuery(reinterpret_cast<void *>(address), &memory, sizeof memory) &&
                     memory.State == MEM_COMMIT && !(memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-                    std::memcpy(into, reinterpret_cast<void *>(address), size);
+                    std::memcpy(into, reinterpret_cast<void *>(address),
+                                std::min<std::uint64_t>(
+                                    size, reinterpret_cast<std::uint64_t>(memory.BaseAddress) +
+                                              memory.RegionSize - address));
             };
             read(context.Rcx, at_rcx, sizeof at_rcx);
             read(context.Rdx, at_rdx, sizeof at_rdx);

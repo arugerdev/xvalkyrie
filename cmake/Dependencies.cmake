@@ -24,6 +24,19 @@ xv_dependency(imgui ocornut/imgui v1.91.9b 8e1bbc76c71d74fef2fb85db7e7ca8eba13d6
 set(NFD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(NFD_INSTALL OFF CACHE BOOL "" FORCE)
 xv_dependency(nfd btzy/nativefiledialog-extended v1.2.1 443697a857c4efacbe08cdaf5182724fa9d9b9a79b8feff2a1601bde1df46b07)
+# libopus, a static library: the Series console's audio decoder (xapu.dll) takes Opus packets.
+# A tag's archive has neither git nor the package_version file, so its version is given here.
+# Its tests follow BUILD_TESTING, which stays on for the emulator's own.
+block()
+  set(BUILD_TESTING OFF)
+  set(OPUS_BUILD_SHARED_LIBRARY OFF)
+  set(OPUS_BUILD_TESTING OFF)
+  set(OPUS_BUILD_PROGRAMS OFF)
+  set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF)
+  set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF)
+  set(OPUS_PACKAGE_VERSION 1.5.2)
+  xv_dependency(opus xiph/opus v1.5.2 9480e329e989f70d69886ded470c7f8cfe6c0667cc4196d4837ac9e668fb7404)
+endblock()
 add_library(xv_imgui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp ${imgui_SOURCE_DIR}/imgui_widgets.cpp

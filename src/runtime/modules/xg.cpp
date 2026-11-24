@@ -1,9 +1,11 @@
 #include "runtime/modules/xg.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/texture_layout.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 namespace xv::runtime::modules {
 FormatSize format_size(std::uint32_t format) {
@@ -302,6 +304,327 @@ std::int32_t create_texture_computer(const ResourceDescription *description, Com
     *computer = new Computer{resource_computer_vtable, 1, texture};
     return 0;
 }
+// The Series console's own layouts (texture_layout.hpp), for a description whose layout names a
+// swizzle mode (0x100 | mode). The methods are those of the Xbox One computer in the same
+// order: after GetResourceLayout the size, the alignment, where a mip level starts, where an
+// element is and the element at an offset, the copies into and out of a subresource, then the
+// tiling in 64 KiB tiles. Arguments and the XG_RESOURCE_LAYOUT shape are those a title built
+// with a later kit calls them with; the fields of the layout no title is known to read follow
+// the Xbox One structure of the same name.
+struct SeriesComputer {
+    void *const *vtable;
+    std::atomic<std::uint32_t> references;
+    ResourceDescription desc;
+    gfx10::Texture texture;
+};
+constexpr std::uint32_t swizzled = 0x100, max_layout_mips = 15, allow_depth_stencil = 2;
+// the console's texture for a description that names a swizzle mode, if it has a layout here
+gfx10::Texture series_texture(const ResourceDescription &d) {
+    if ((d.layout & ~0xffu) != swizzled || d.width > 0xffffffffu)
+        return {};
+    gfx10::Dimension dimension;
+    switch (d.dimension) {
+    case 2:
+        dimension = gfx10::Dimension::texture1d;
+        break;
+    case 3:
+        dimension = gfx10::Dimension::texture2d;
+        break;
+    case 4:
+        dimension = gfx10::Dimension::texture3d;
+        break;
+    default:
+        return {};
+    }
+    auto texture =
+        gfx10::texture(dimension, static_cast<std::uint32_t>(d.width), d.height,
+                       d.depth_or_array_size, d.mips, d.format, d.sample_count, d.layout & 0xff);
+    // the layout structure has room for 15 mips
+    return texture.valid && texture.mips <= max_layout_mips ? texture : gfx10::Texture{};
+}
+std::uint32_t series_add_ref(SeriesComputer *self) { return ++self->references; }
+std::uint32_t series_release(SeriesComputer *self) {
+    const auto left = --self->references;
+    if (!left)
+        delete self;
+    return left;
+}
+// XG_RESOURCE_LAYOUT of xg_xs.dll: an XG_PLANE_LAYOUT for each of up to four planes, each with
+// an XG_MIPLEVEL_LAYOUT for each of up to 15 mips
+struct SeriesMip {
+    std::uint64_t size, offset, slice_size;
+    std::uint32_t pitch_texels, pitch_bytes, alignment;
+    std::uint32_t padded[3]; // width and height in elements, depth or array size
+    std::uint32_t elements[2], texels[2];
+    std::uint32_t depth_or_array, samples, mode;
+    std::uint64_t bank_rotation[2];
+    std::uint32_t slice_depth, in_tail;
+    std::uint32_t tail_position; // where a tail mip starts in elements: x bits 0-10, y 11-21
+};
+struct SeriesPlane {
+    std::uint32_t usage; // 1 data, 7 depth, 8 stencil
+    std::uint64_t size, slice_size, offset, alignment;
+    std::uint32_t element_bytes, standard_mips, tail_mips;
+    SeriesMip mips[max_layout_mips];
+};
+struct SeriesLayout {
+    std::uint64_t size, alignment;
+    std::uint32_t mips, planes;
+    SeriesPlane plane[4];
+    std::uint32_t dimension;
+};
+static_assert(sizeof(SeriesMip) == 0x70 && sizeof(SeriesPlane) == 0x6c8 &&
+              sizeof(SeriesLayout) == 0x1b40);
+// the mode a tail mip is given in: the 256-byte one of its kind (3, render, for the render
+// modes, which GFX10 has no 256-byte form of), a depth mode itself
+std::uint32_t tail_mode(std::uint32_t mode) {
+    switch (mode) {
+    case 2:
+    case 6:
+    case 10:
+    case 18:
+    case 22:
+    case 26:
+        return gfx10::sw_256b_d;
+    case 23:
+    case 27:
+        return 3;
+    case 24:
+        return mode;
+    default:
+        return gfx10::sw_256b_s;
+    }
+}
+SeriesMip series_mip(const ResourceDescription &d, const gfx10::Layout &l, std::uint32_t i) {
+    const auto &m = l.mips[i];
+    const bool three_d = d.dimension == 4;
+    const std::uint32_t array = std::max<std::uint32_t>(d.depth_or_array_size, 1);
+    SeriesMip out{};
+    out.pitch_texels = m.pitch * l.desc.block;
+    out.pitch_bytes = m.pitch * l.desc.element_bytes;
+    out.padded[0] = m.pitch;
+    out.padded[1] = m.rows;
+    out.padded[2] = three_d ? m.depth_pitch : array;
+    out.elements[0] = m.width;
+    out.elements[1] = m.height;
+    out.texels[0] = std::max(static_cast<std::uint32_t>(d.width >> i), 1u);
+    out.texels[1] = std::max(d.height >> i, 1u);
+    out.depth_or_array = three_d ? m.depth : array;
+    out.samples = l.desc.samples;
+    out.slice_depth = l.block[2];
+    const auto slice = std::uint64_t{m.pitch} * m.rows * l.desc.element_bytes;
+    const std::uint64_t depth = three_d ? m.depth_pitch : 1;
+    if (!m.in_tail) {
+        out.offset = m.offset;
+        out.slice_size = slice * l.desc.samples;
+        out.alignment = static_cast<std::uint32_t>(l.alignment);
+        out.mode = l.desc.mode;
+    } else {
+        out.in_tail = 1;
+        out.alignment = 256;
+        out.mode = tail_mode(l.desc.mode);
+        if (l.thick) { // a 3D tail mip is placed by its position, not by an offset
+            out.slice_size = l.alignment / l.block[2];
+            out.tail_position = m.tail.x | m.tail.y << 11;
+        } else {
+            out.offset = m.tail.offset;
+            out.slice_size = slice;
+        }
+    }
+    out.size = out.slice_size * depth;
+    return out;
+}
+std::int32_t series_layout(SeriesComputer *self, SeriesLayout *out) {
+    if (!out)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    const auto &t = self->texture;
+    std::memset(out, 0, sizeof *out);
+    out->size = t.size;
+    out->alignment = t.alignment;
+    out->mips = t.mips;
+    out->planes = static_cast<std::uint32_t>(t.planes.size());
+    out->dimension = self->desc.dimension;
+    // a depth plane is called one beside stencil or without mips
+    const bool depth =
+        (self->desc.flags & allow_depth_stencil) && (t.planes.size() > 1 || t.mips == 1);
+    for (std::size_t p = 0; p < t.planes.size() && p < 4; ++p) {
+        const auto &l = t.planes[p].layout;
+        auto &plane = out->plane[p];
+        plane.usage = t.planes[p].stencil ? 8 : depth ? 7 : 1;
+        plane.size = l.size;
+        plane.slice_size = l.slice_size;
+        plane.offset = t.planes[p].offset;
+        plane.alignment = l.alignment;
+        plane.element_bytes = l.desc.element_bytes;
+        plane.standard_mips = l.first_tail_mip;
+        plane.tail_mips = t.mips - l.first_tail_mip;
+        for (std::uint32_t i = 0; i < l.mips.size(); ++i)
+            plane.mips[i] = series_mip(self->desc, l, i);
+    }
+    return 0;
+}
+std::uint64_t series_bytes(SeriesComputer *self) { return self->texture.size; }
+std::uint64_t series_alignment(SeriesComputer *self) { return self->texture.alignment; }
+// (plane, mip): where it starts, from the start of the texture; 0 for one there is not
+std::uint64_t series_mip_offset(SeriesComputer *self, std::uint32_t plane, std::uint32_t mip) {
+    const auto &planes = self->texture.planes;
+    if (plane >= planes.size() || mip >= planes[plane].layout.mips.size())
+        return 0;
+    const auto &m = planes[plane].layout.mips[mip];
+    return planes[plane].offset + (m.in_tail ? m.tail.offset : m.offset);
+}
+// (plane, mip, x, y, z or array slice, sample, bit position): an element's offset from the
+// start of the texture, 0 outside it. Elements are whole bytes here, so the bit is 0.
+std::uint64_t series_element_offset(SeriesComputer *self, std::uint32_t plane, std::uint32_t mip,
+                                    std::uint64_t x, std::uint32_t y, std::uint32_t z,
+                                    std::uint32_t, std::uint32_t *bit) {
+    if (bit)
+        *bit = 0;
+    const auto &planes = self->texture.planes;
+    std::uint64_t at = 0;
+    if (plane >= planes.size() || x > 0xffffffffu ||
+        !planes[plane].layout.offset(mip, static_cast<std::uint32_t>(x), y, z, at))
+        return 0;
+    return planes[plane].offset + at;
+}
+std::int32_t series_copy(SeriesComputer *self, std::uint8_t *tiled, std::uint32_t plane,
+                         std::uint32_t subresource, std::uint8_t *linear, std::uint32_t row_pitch,
+                         std::uint32_t depth_pitch, bool into) {
+    const auto &t = self->texture;
+    if (!tiled || !linear || plane >= t.planes.size() || subresource / t.mips >= 0x10000)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    const auto &p = t.planes[plane];
+    const auto mip = subresource % t.mips;
+    if (!p.layout.addressable())                      // a pipe or bank XOR mode, or several samples
+        return static_cast<std::int32_t>(0x80004001); // E_NOTIMPL
+    // the rows' extent: the title's memory holds them, as it holds the whole texture
+    const auto &m = p.layout.mips[mip];
+    const auto bytes = std::size_t{m.depth - 1} * depth_pitch +
+                       std::size_t{m.height - 1} * row_pitch +
+                       std::size_t{m.width} * p.layout.desc.element_bytes;
+    return p.layout.copy(tiled + p.offset, static_cast<std::size_t>(p.layout.size), mip,
+                         subresource / t.mips, linear, bytes, row_pitch, depth_pitch, into)
+               ? 0
+               : static_cast<std::int32_t>(0x80070057);
+}
+// (texture, plane, subresource, rows, row pitch, depth pitch)
+std::int32_t series_copy_into(SeriesComputer *self, void *resource, std::uint32_t plane,
+                              std::uint32_t subresource, const void *data, std::uint32_t pitch,
+                              std::uint32_t depth_pitch) {
+    return series_copy(self, static_cast<std::uint8_t *>(resource), plane, subresource,
+                       const_cast<std::uint8_t *>(static_cast<const std::uint8_t *>(data)), pitch,
+                       depth_pitch, true);
+}
+// (rows, plane, subresource, sample, texture, row pitch, depth pitch)
+std::int32_t series_copy_from(SeriesComputer *self, void *data, std::uint32_t plane,
+                              std::uint32_t subresource, std::uint32_t, const void *resource,
+                              std::uint32_t pitch, std::uint32_t depth_pitch) {
+    return series_copy(
+        self, const_cast<std::uint8_t *>(static_cast<const std::uint8_t *>(resource)), plane,
+        subresource, static_cast<std::uint8_t *>(data), pitch, depth_pitch, false);
+}
+// GetResourceTiling as Direct3D 12 has it (D3D12_PACKED_MIP_INFO, D3D12_TILE_SHAPE,
+// D3D12_SUBRESOURCE_TILING) in 64 KiB tiles of plane 0, for the 64 KiB 2D modes; other layouts
+// have no such tiles and fail. The tail is the packed part, the first tile of each slice. With
+// a tail the console lists two slices at most and zeroes all but the first.
+struct PackedMips {
+    std::uint8_t standard, packed;
+    std::uint32_t tiles, start;
+};
+struct SubresourceTiling {
+    std::uint32_t width;
+    std::uint16_t height, depth;
+    std::uint32_t start;
+};
+static_assert(sizeof(PackedMips) == 12 && sizeof(SubresourceTiling) == 12);
+std::int32_t series_tiling(SeriesComputer *self, std::uint32_t *tile_count, PackedMips *packed,
+                           std::uint32_t *shape, std::uint32_t *tiling_count, std::uint32_t first,
+                           SubresourceTiling *tilings) {
+    constexpr std::uint64_t tile = 0x10000;
+    const auto &t = self->texture;
+    const auto &l = t.planes[0].layout;
+    if (l.alignment != tile)
+        return static_cast<std::int32_t>(0x80004005); // E_FAIL
+    if (l.thick)
+        return static_cast<std::int32_t>(0x80004001); // E_NOTIMPL
+    const auto standard = l.first_tail_mip;
+    const bool tail = standard < t.mips;
+    const std::uint64_t tail_tiles = standard == 0       ? l.slice_size / tile
+                                     : standard < t.mips ? l.mips[standard - 1].offset / tile
+                                                         : 0;
+    if (tile_count)
+        *tile_count = static_cast<std::uint32_t>(l.size / tile);
+    if (packed)
+        *packed = {static_cast<std::uint8_t>(standard),
+                   static_cast<std::uint8_t>(t.mips - standard),
+                   static_cast<std::uint32_t>(tail_tiles), 0};
+    if (shape) {
+        shape[0] = l.block[0] * l.desc.block;
+        shape[1] = l.block[1] * l.desc.block;
+        shape[2] = l.block[2];
+    }
+    if (tiling_count) {
+        const auto slices = tail ? std::min(l.slices, 2u) : l.slices;
+        const auto all = standard * slices;
+        const auto wanted = std::min(all > first ? all - first : 0, *tiling_count);
+        for (std::uint32_t i = 0; tilings && i < wanted; ++i) {
+            const auto slice = (first + i) / standard, mip = (first + i) % standard;
+            const auto &m = l.mips[mip];
+            if (tail && slice > 0)
+                tilings[i] = {0, 0, 0, 0};
+            else
+                tilings[i] = {m.pitch / l.block[0], static_cast<std::uint16_t>(m.rows / l.block[1]),
+                              1,
+                              static_cast<std::uint32_t>(
+                                  (std::uint64_t{slice} * l.slice_size + m.offset) / tile)};
+        }
+        *tiling_count = wanted;
+    }
+    return 0;
+}
+template <int Slot> std::int32_t series_unknown(SeriesComputer *) {
+    std::fprintf(stderr, "[Runtime] unimplemented xg_xs.dll texture computer method %d\n", Slot);
+    std::fflush(stderr);
+    return static_cast<std::int32_t>(0x80004001); // E_NOTIMPL
+}
+void *const series_computer_vtable[] = {
+    reinterpret_cast<void *>(&series_add_ref),
+    reinterpret_cast<void *>(&series_release),
+    reinterpret_cast<void *>(&series_layout),
+    reinterpret_cast<void *>(&series_bytes),
+    reinterpret_cast<void *>(&series_alignment),
+    reinterpret_cast<void *>(&series_mip_offset),
+    reinterpret_cast<void *>(&series_element_offset),
+    // the element at an offset: its arguments are not known here
+    reinterpret_cast<void *>(&series_unknown<7>),
+    reinterpret_cast<void *>(&series_copy_into),
+    reinterpret_cast<void *>(&series_copy_from),
+    reinterpret_cast<void *>(&series_tiling),
+    reinterpret_cast<void *>(&series_unknown<11>),
+    reinterpret_cast<void *>(&series_unknown<12>),
+};
+// XGCreateTextureComputer of xg_xs.dll: the console's layout where the description names a
+// swizzle mode GFX10 has and its format has a layout here; the plain one otherwise, as before
+std::int32_t create_series_texture_computer(const ResourceDescription *description,
+                                            void **computer) {
+    if (!description || !computer)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    if (auto texture = series_texture(*description); texture.valid) {
+        *computer = new SeriesComputer{series_computer_vtable, 1, *description, std::move(texture)};
+        return 0;
+    }
+    return create_texture_computer(description, reinterpret_cast<Computer **>(computer));
+}
+} // namespace
+void *series_texture_computer(const void *description) {
+    if (!description)
+        return nullptr;
+    const auto &d = *static_cast<const ResourceDescription *>(description);
+    auto texture = series_texture(d);
+    return texture.valid ? new SeriesComputer{series_computer_vtable, 1, d, std::move(texture)}
+                         : nullptr;
+}
+namespace {
 // There is one layout, so one tile mode: 0.
 std::uint32_t optimal_tile_mode(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
                                 std::uint32_t, std::uint32_t, std::uint32_t) {
@@ -326,7 +649,8 @@ void install_xg(Registry &registry, std::string_view module) {
     registry.add(module, "XGCreateTexture2DComputer",
                  reinterpret_cast<void *>(&create_texture2d_computer));
     registry.add(module, "XGCreateTextureComputer",
-                 reinterpret_cast<void *>(&create_texture_computer));
+                 module == "xg_xs.dll" ? reinterpret_cast<void *>(&create_series_texture_computer)
+                                       : reinterpret_cast<void *>(&create_texture_computer));
     registry.add(module, "XGComputeTexture2DLayout", reinterpret_cast<void *>(&texture2d_layout));
     registry.add(module, "XGComputeTexture3DLayout", reinterpret_cast<void *>(&texture3d_layout));
     registry.add(module, "XGComputeOptimalTileMode", reinterpret_cast<void *>(&optimal_tile_mode));

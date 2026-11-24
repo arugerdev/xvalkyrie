@@ -82,3 +82,10 @@ The build fetches the NuGet package `Microsoft.Direct3D.D3D12` 1.620.2 and copie
 `D3D12Core.dll` to `D3D12\` next to `xvboot.exe`, which uses it in place of an older
 Direct3D 12 runtime of the system when it is there. It is not part of the source and not
 in the release archives; the package's `LICENSE.txt` has its terms.
+
+## Ported code (GPL-3.0-or-later)
+
+`src/runtime/modules/texture_layout.cpp` and `texture_layout.hpp` are a port to C++ of
+`crates/victory-formats/src/texture.rs` of
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory), under the same license as this
+project. That code follows AMD's addrlib (MIT), credited in `texture_layout.hpp`.

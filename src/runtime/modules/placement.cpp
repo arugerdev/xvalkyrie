@@ -431,9 +431,12 @@ bool series_copy_out(SeriesCopy copy, void *computer, void *destination, UINT su
         return false;
     }
 }
+// the console's XG where the title's system folder has it, the layouts of ours otherwise
 void *series_computer(const D3D12_RESOURCE_DESC &layout) {
     void *computer = nullptr;
     const auto create = series_xg();
+    if (!create)
+        return series_texture_computer(&layout);
     __try {
         if (!create || FAILED(create(&layout, &computer)))
             computer = nullptr;
@@ -537,6 +540,11 @@ std::size_t placed_bytes(const D3D12_RESOURCE_DESC &desc, UINT tile_mode) {
 } // namespace
 
 std::vector<Placement> pending; // placed where there is no memory yet
+// XV_D3D_TRACE, read once: placements are made all the time
+bool tracing() {
+    static const bool on = std::getenv("XV_D3D_TRACE") != nullptr;
+    return on;
+}
 void track_placement(ID3D12Resource *resource, const void *address,
                      const D3D12_RESOURCE_DESC *layout, DXGI_FORMAT format) {
     if (!resource || !address)
@@ -545,16 +553,20 @@ void track_placement(ID3D12Resource *resource, const void *address,
     // the texels are laid out in the title's memory as its format has them
     if (format != DXGI_FORMAT_UNKNOWN)
         desc.Format = format;
-    if (layout && series_xg() && desc.SampleDesc.Count == 1 &&
+    // a Series title: the console's XG says how the texture lies in its memory, the one of
+    // ours where the title's system folder has none (for a layout that names a swizzle mode)
+    void *const own = layout && !series_xg() ? series_texture_computer(layout) : nullptr;
+    if (own)
+        series_release(own);
+    if (layout && (series_xg() || own) && desc.SampleDesc.Count == 1 &&
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
          desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)) {
-        // a Series title: the console's own XG says how the texture lies in its memory
         auto *const computer = series_computer(*layout);
         const auto bytes = computer ? static_cast<std::size_t>(series_size(computer)) : 0;
         if (computer)
             series_release(computer);
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_TRACE") && shown++ < 5)
+        if (static std::atomic<int> shown{0}; tracing() && shown++ < 5)
             std::fprintf(stderr, "[Runtime] placement texture at %llx, layout 0x%x, %zu bytes%s\n",
                          static_cast<unsigned long long>(start), layout->Layout, bytes,
                          bytes && readable(start, bytes) ? "" : ", not readable");
@@ -602,7 +614,7 @@ void track_placement(ID3D12Resource *resource, const void *address,
             : 0;
     const auto start = reinterpret_cast<std::uintptr_t>(address);
     const auto bytes = placed_bytes(desc, tile_mode);
-    if (static std::atomic<int> shown{0}; std::getenv("XV_D3D_TRACE") && shown++ < 5)
+    if (static std::atomic<int> shown{0}; tracing() && shown++ < 5)
         std::fprintf(stderr, "[Runtime] placement texture at %llx, tile mode %u, %zu bytes%s\n",
                      static_cast<unsigned long long>(start), tile_mode, bytes,
                      readable(start, bytes) ? "" : ", not all readable");

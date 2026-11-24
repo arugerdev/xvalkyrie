@@ -606,8 +606,8 @@ bool copy_physical_pages(const ULONG_PTR *pages, std::size_t offset, std::uint8_
         if (!state.view)
             return false;
         for (std::size_t index = 0, left = offset + size; left; ++index) {
-            const auto number = pages[index];
-            if (number >= state.used.size() || !state.used[number])
+            ULONG_PTR number = 0;
+            if (!page_of(state, pages[index], &number) || !state.used[number])
                 return false;
             auto *const at = state.view + number * page;
             if (!VirtualAlloc(at, page, MEM_COMMIT, PAGE_READWRITE))

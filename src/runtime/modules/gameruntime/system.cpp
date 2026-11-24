@@ -120,10 +120,14 @@ std::string folder_of_title(const std::filesystem::path &name) {
     std::filesystem::create_directories(folder, error);
     return utf8(folder);
 }
-// XPersistentLocalStorage
-std::string local_storage() { return folder_of_title("LocalStorage"); }
+// XPersistentLocalStorage. On the console it is a folder mounted at the root of a drive
+// (Microsoft's XPersistentLocalStorageGetPath reference), so its path ends with a separator
+// and titles append their own names to it.
+std::string local_storage_folder() { return folder_of_title("LocalStorage"); }
+std::string local_storage() { return local_storage_folder() + "\\"; }
 // XGameSaveFiles: saved games as plain files, in a folder that is the user's. Nothing
-// synchronizes it, so there is no screen to show while it does.
+// synchronizes it, so there is no screen to show while it does. On the console the folder
+// does not end with a separator (Microsoft's GameSaveFilesCombo sample), and titles add one.
 HRESULT WINAPI save_files_folder(void *, void *, const char *, XAsyncBlock *block) {
     const auto folder = folder_of_title("Files");
     return finish(block, folder_identity, S_OK,
@@ -189,14 +193,18 @@ HRESULT WINAPI save_device_callback(void *, void *, void *) { return S_OK; }
 // no sync UI is ever raised
 HRESULT WINAPI save_ui_response(void *, void *, std::uint32_t) { return E_UNEXPECTED; }
 
+// the characters of the path, its separator included, and the terminator
 HRESULT WINAPI storage_path_size(void *, std::size_t *size) {
     if (!size)
         return E_POINTER;
     *size = local_storage().size() + 1;
     return S_OK;
 }
+// A buffer too small for the path fails with E_FAIL on the console, the reference says;
+// HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) is what a PC gives.
 HRESULT WINAPI storage_path(void *, std::size_t size, char *buffer, std::size_t *used) {
-    return copy_text(local_storage(), size, buffer, used);
+    const auto status = copy_text(local_storage(), size, buffer, used);
+    return status == e_not_sufficient_buffer ? E_FAIL : status;
 }
 // XPersistentLocalStorageSpaceInfo: available and used bytes
 HRESULT WINAPI storage_space(void *, std::uint64_t *info) {
@@ -329,8 +337,10 @@ HRESULT WINAPI mount_async(void *, const char *, XAsyncBlock *block) {
 HRESULT WINAPI mount_result(void *, XAsyncBlock *block, Mount **handle) {
     return result(block, mount_identity, sizeof *handle, handle, nullptr);
 }
+// The folder a mount names, without a separator: the reference does not give the console's
+// form of a mount path, so it stays the same for every mount.
 std::string path_of(const Mount *handle) {
-    return handle == &storage_mount ? local_storage() : utf8(package_root());
+    return handle == &storage_mount ? local_storage_folder() : utf8(package_root());
 }
 HRESULT WINAPI mount_path_size(void *, Mount *handle, std::size_t *size) {
     if (!size)

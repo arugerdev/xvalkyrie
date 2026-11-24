@@ -4,7 +4,11 @@
 #include <catch2/catch.hpp>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <string_view>
+#include <vector>
 
 // The Gaming Runtime as a title's half reaches it: QueryApiImpl for the table of an API, then
 // a slot of the table with the table first.
@@ -51,6 +55,25 @@ Result call(std::string_view api, std::string_view method, Arguments... argument
 }
 HRESULT wait(XAsyncBlock *block) {
     return call<HRESULT, XAsyncBlock *, bool>("XAsync", "XAsyncGetStatus", block, true);
+}
+// whether `folder` holds an entry called `name`, looked for from the folder itself
+bool holds(const std::string &folder, const std::string &name) {
+    for (const auto &entry : std::filesystem::directory_iterator(folder))
+        if (entry.path().filename() == name)
+            return true;
+    return false;
+}
+// the persistent local storage path, the way a title asks for it
+std::string local_storage_path() {
+    std::size_t size = 0, used = 0;
+    REQUIRE(call<HRESULT, std::size_t *>("XPersistentLocalStorage",
+                                         "XPersistentLocalStorageGetPathSize", &size) == S_OK);
+    std::vector<char> path(size);
+    REQUIRE(call<HRESULT, std::size_t, char *, std::size_t *>("XPersistentLocalStorage",
+                                                              "XPersistentLocalStorageGetPath",
+                                                              size, path.data(), &used) == S_OK);
+    REQUIRE(used == size);
+    return path.data();
 }
 } // namespace
 
@@ -217,6 +240,84 @@ TEST_CASE("a PlayFab save configuration keeps the place the title names") {
                 folder) == S_OK);
     CHECK(std::string_view(folder) == "T:\\saves");
     call<void, void *>("XGameSave", "PFXGameSaveFreeConfig", config);
+}
+
+TEST_CASE("the persistent local storage path ends with a separator, counted in its size") {
+    std::size_t size = 0, used = 0;
+    REQUIRE(call<HRESULT, std::size_t *>("XPersistentLocalStorage",
+                                         "XPersistentLocalStorageGetPathSize", &size) == S_OK);
+    REQUIRE(size > 2);
+    std::vector<char> path(size, 'x');
+    // the size is the path's characters and its terminator: one less is too small
+    CHECK(call<HRESULT, std::size_t, char *, std::size_t *>(
+              "XPersistentLocalStorage", "XPersistentLocalStorageGetPath", size - 1, path.data(),
+              &used) == E_FAIL);
+    CHECK(call<HRESULT, std::size_t, char *, std::size_t *>("XPersistentLocalStorage",
+                                                            "XPersistentLocalStorageGetPath", 0,
+                                                            nullptr, &used) == E_FAIL);
+    REQUIRE(call<HRESULT, std::size_t, char *, std::size_t *>("XPersistentLocalStorage",
+                                                              "XPersistentLocalStorageGetPath",
+                                                              size, path.data(), nullptr) == S_OK);
+    const std::string folder(path.data());
+    CHECK(folder.size() == size - 1);
+    CHECK(folder.back() == '\\');
+    CHECK(std::filesystem::is_directory(folder));
+    CHECK(local_storage_path() == folder);
+
+    // a title appends its own names straight to the path, and they are inside the folder
+    const std::string settings = "xv-test-settings";
+    std::filesystem::remove_all(folder + settings);
+    REQUIRE(CreateDirectoryA((folder + settings).c_str(), nullptr));
+    std::ofstream(folder + settings + "\\settings.xml") << "<settings/>";
+    CHECK(holds(folder, settings));
+    CHECK(holds(folder + settings, "settings.xml"));
+    std::filesystem::remove_all(folder + settings);
+}
+
+TEST_CASE("the persistent local storage mounted for a package is its folder") {
+    void *mount = nullptr;
+    REQUIRE(call<HRESULT, const char *, void **>("XPersistentLocalStorage",
+                                                 "XPersistentLocalStorageMountForPackage",
+                                                 "package", &mount) == S_OK);
+    std::size_t size = 0;
+    REQUIRE(call<HRESULT, void *, std::size_t *>("XPackage", "XPackageGetMountPathSize", mount,
+                                                 &size) == S_OK);
+    REQUIRE(size > 1);
+    std::vector<char> path(size, 'x');
+    CHECK(FAILED((call<HRESULT, void *, std::size_t, char *>("XPackage", "XPackageGetMountPath",
+                                                             mount, size - 1, path.data()))));
+    REQUIRE(call<HRESULT, void *, std::size_t, char *>("XPackage", "XPackageGetMountPath", mount,
+                                                       size, path.data()) == S_OK);
+    CHECK(std::strlen(path.data()) == size - 1);
+    CHECK(std::filesystem::equivalent(path.data(), local_storage_path()));
+    call<void, void *>("XPackage", "XPackageCloseMountHandle", mount);
+}
+
+TEST_CASE("the saved-game files folder ends without a separator, as on the console") {
+    XAsyncBlock block{};
+    REQUIRE(call<HRESULT, void *, const char *, XAsyncBlock *>(
+                "XGameSave", "XGameSaveFilesGetFolderWithUiAsync", nullptr, "configuration",
+                &block) == S_OK);
+    REQUIRE(wait(&block) == S_OK);
+    std::size_t size = 0;
+    REQUIRE(call<HRESULT, XAsyncBlock *, std::size_t *>("XAsync", "XAsyncGetResultSize", &block,
+                                                        &size) == S_OK);
+    REQUIRE(size > 1);
+    std::vector<char> path(size, 'x');
+    REQUIRE(call<HRESULT, XAsyncBlock *, std::size_t, char *>("XGameSave",
+                                                              "XGameSaveFilesGetFolderWithUiResult",
+                                                              &block, size, path.data()) == S_OK);
+    const std::string folder(path.data());
+    CHECK(folder.size() == size - 1);
+    CHECK(folder.back() != '\\');
+    CHECK(std::filesystem::is_directory(folder));
+
+    // a title adds the separator, then its container
+    const std::string container = "xv-test-container";
+    std::filesystem::remove_all(folder + "\\" + container);
+    REQUIRE(CreateDirectoryA((folder + "\\" + container).c_str(), nullptr));
+    CHECK(holds(folder, container));
+    std::filesystem::remove_all(folder + "\\" + container);
 }
 
 TEST_CASE("speech is a WAV file") {

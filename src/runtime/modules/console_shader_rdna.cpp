@@ -4521,8 +4521,13 @@ class Translator {
     std::string finish() {
         if (stage_ != Stage::compute && !exported_)
             give_up("nothing exported");
-        if (stage_ == Stage::vertex && !fetched_ && !shader_.inputs.empty() && !shader_.streams)
-            give_up("a vertex shader that does not fetch its inputs");
+        // A vertex shader that calls no fetch shader reads its vertices itself, from buffers it
+        // has descriptors of: it starts with the vertex's index in v0 and the instance's in v3,
+        // as one that fetches has them, and takes nothing from the input assembler.
+        const bool pulls = stage_ == Stage::vertex && !fetched_ && !shader_.inputs.empty();
+        if (pulls)
+            prologue_ = "    " + v(0) + " = input.xv_vertex;\n    " + v(3) +
+                        " = input.xv_instance;\n" + prologue_;
         std::string text = helpers;
         if (uses_words_)
             text += "struct Words { uint w[" + std::to_string(words_in_element) + "]; };\n";
@@ -4582,14 +4587,16 @@ class Translator {
         }
         std::string more;
         if (stage_ == Stage::vertex) {
-            if (!vertex_id_)
+            if (!vertex_id_ || pulls)
                 more += "    uint xv_vertex : SV_VertexID;\n";
-            if (!instance_id_)
+            if (!instance_id_ || pulls)
                 more += "    uint xv_instance : SV_InstanceID;\n";
         }
-        const bool no_input = shader_.inputs.empty() && more.empty();
+        static const std::vector<Element> none;
+        const auto &inputs = pulls ? none : shader_.inputs;
+        const bool no_input = inputs.empty() && more.empty();
         if (!no_input)
-            text += structure("Input", shader_.inputs, stage_ == Stage::pixel, more);
+            text += structure("Input", inputs, stage_ == Stage::pixel, more);
         if (shader_.outputs.empty()) // a pixel shader that only discards
             return text + "void main(" + (no_input ? "" : "Input input") + ") {\n" + registers +
                    prologue_ + body_ + "}\n";

@@ -330,3 +330,31 @@ TEST_CASE("a swizzle between the pixels of a quad reads the register in its addr
     const auto source = pixel_translated({0xd8d48000, 0x03000002, 0xf8001801, 0x00000003});
     CHECK(source.find("= asfloat(v2);") != std::string::npos);
 }
+
+TEST_CASE("a vertex shader that calls no fetch shader reads its vertex and instance itself") {
+    // v_cvt_f32_u32 v1, v0; v_cvt_f32_u32 v2, v3; exp pos0 v1, v2, v1, v1 done
+    const std::uint32_t code[] = {0x7e020d00, 0x7e040d03, 0xf80008cf, 0x01010201, end_program};
+    constexpr std::size_t region = 0x140, header = 0x28;
+    std::vector<std::uint8_t> file(region + header + sizeof code);
+    const auto put = [&](std::size_t offset, std::uint32_t value) {
+        std::memcpy(file.data() + offset, &value, sizeof value);
+    };
+    std::memcpy(file.data(), "FSSM", 4);
+    put(0xc0, region);
+    put(0xc8, header + sizeof code);
+    std::memcpy(file.data() + region + header, code, sizeof code);
+    const std::uint32_t root[] = {1, 0, 24, 0, 0, 0};
+    const rdna::Shader shader{file,
+                              {reinterpret_cast<const std::uint8_t *>(root), sizeof root},
+                              {{"POSITION", 0, 3, 3, false, 0, 7, 7}},
+                              {{"SV_Position", 0, 3, 4, true, 0, 15, 0}}};
+    std::string why;
+    const auto source = rdna::translate(ShaderStage::vertex, shader, &why);
+    INFO(why);
+    REQUIRE(source);
+    INFO(*source);
+    CHECK(console_shader_errors(ShaderStage::vertex, *source).empty());
+    CHECK(source->find("v0 = input.xv_vertex;") != std::string::npos);
+    CHECK(source->find("v3 = input.xv_instance;") != std::string::npos);
+    CHECK(source->find("POSITION") == std::string::npos);
+}

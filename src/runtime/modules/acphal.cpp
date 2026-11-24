@@ -11,7 +11,9 @@
 #include <cstring>
 #include <deque>
 #include <intrin.h>
+#include <memory>
 #include <mutex>
+#include <opus.h>
 #include <utility>
 #include <vector>
 #include <windows.h>
@@ -326,139 +328,299 @@ HRESULT WINAPI acp_hal_create(Hal **hal) {
     return S_OK;
 }
 
-// xapu.dll, the Series console's audio decoder: Opus decoding and sample rate conversion
-// on the audio hardware, as a queue of commands and their results. Nothing is decoded here:
-// every command is answered at once, a Process command with silence of the length asked for.
+// xapu.dll, the Series console's audio decoder (XAPU): Opus decoding and sample rate conversion
+// on the audio hardware, as commands for a client's streams and their results. The names and
+// rules are those of xapu.h (Microsoft's XAPU reference for the GDK); the structures are packed,
+// as titles lay them out. A command is carried out when it is queued, so its result is ready at
+// once and the results come in the order of the commands, with DisableFifoOrdering or without it.
+enum class XApuProcessType : std::uint32_t { decode_opus = 1, decode_convert_opus, convert_pcm };
+enum class XApuCommandType : std::uint32_t { activate = 1, deactivate, process, notify, reset };
 #pragma pack(push, 1)
-struct XApuCommand {
-    std::uint32_t type, stream, sequence, options;
+struct XApuCommandId {
+    XApuCommandType type;
+    std::uint32_t stream_index, sequence, options;
     void *context;
 };
-struct XApuActivate {
-    XApuCommand id;
-    std::uint32_t channels;
+struct XApuDecodeConvertActivateCommand {
+    XApuCommandId id;
+    std::uint32_t channel_count, initialize_data_length;
+    void *initialize_data;
+    float start_pitch;
+    std::uint32_t processing_buffer_length;
+    void *processing_buffer;
 };
-struct XApuProcess {
-    XApuCommand id;
-    float ramp, pitch;
-    std::uint32_t first_frame, frames, input_bytes;
-    void *input;
-    std::uint32_t output_bytes;
-    void *output;
+struct XApuDecodeConvertCommand {
+    XApuCommandId id;
+    float pitch_ramp_rate, target_pitch;
+    std::uint32_t first_frame_index, frame_count, input_data_length;
+    const void *input_data;
+    std::uint32_t max_output_data_length;
+    void *output_data;
 };
 struct XApuResult {
-    XApuCommand id;
+    XApuCommandId id;
     std::uint32_t state;
-    std::uint64_t state_data, time;
-    HRESULT error;
-    std::uint32_t frames, output_bytes;
-    void *output;
-    float pitch;
-    std::uint32_t input_bytes;
-    void *input;
+    std::uint64_t state_data, total_execution_time; // the time in microseconds
+    HRESULT error_code;
+    std::uint32_t output_frame_count, output_data_length;
+    void *output_data;
+    float current_pitch;
+    std::uint32_t input_data_length;
+    const void *input_data;
 };
-struct XApuConnectInput {
-    std::uint32_t process, streams, commands_per_stream, data_bytes, frames_per_output, options;
+struct XApuConnectInputParameters {
+    XApuProcessType process_type;
+    std::uint32_t max_stream_count, max_queued_commands_per_stream, base_data_length,
+        max_frame_count_per_output, options;
 };
-struct XApuConnectOutput {
-    void *data;
-    HANDLE ready;
+struct XApuConnectOutputParameters {
+    void *base_data;
+    HANDLE result_ready_event;
+};
+struct XApuUtilization {
+    std::uint32_t available_stream_count, maximum_stream_count;
 };
 #pragma pack(pop)
-struct XApu {
-    std::mutex mutex;
-    std::deque<XApuResult> results;
-    std::vector<std::uint32_t> channels;
-    void *data = nullptr;
-    HANDLE ready = nullptr;
-    std::uint32_t frames_per_output = 0;
+static_assert(sizeof(XApuDecodeConvertActivateCommand) == 56 &&
+              sizeof(XApuDecodeConvertCommand) == 64 && sizeof(XApuResult) == 80);
+// the flags of XApuCommandOptions, XApuConnectOptions and XApuStateOptions
+constexpr std::uint32_t signal_on_completion = 1;
+constexpr std::uint32_t deinterleaved_output = 4, enable_result_ready_event = 8;
+constexpr std::uint32_t output_ready = 1, need_more_input = 2;
+constexpr HRESULT xapu_e_queue_full = static_cast<HRESULT>(0x8ac81000),
+                  xapu_e_pending_results = static_cast<HRESULT>(0x8ac81001),
+                  xapu_e_invalid_command = static_cast<HRESULT>(0x8ac81002),
+                  xapu_e_invalid_stream_index = static_cast<HRESULT>(0x8ac81003),
+                  xapu_e_already_active = static_cast<HRESULT>(0x8ac81005),
+                  xapu_e_buffer_too_small = static_cast<HRESULT>(0x8ac81006),
+                  xapu_e_bad_opus_packet = static_cast<HRESULT>(0x8ac81008);
+constexpr int max_packet_frames = 5760; // the longest Opus packet at 48 kHz (120 ms)
+
+struct DestroyOpusDecoder {
+    void operator()(OpusDecoder *decoder) const { opus_decoder_destroy(decoder); }
 };
-constexpr HRESULT xapu_no_results = static_cast<HRESULT>(0x8ac81001);
-HRESULT WINAPI xapu_connect(const XApuConnectInput *input, XApuConnectOutput *output,
-                            XApu **handle) {
-    if (!input || !output || !handle)
+struct XApuStream {
+    bool active = false;
+    std::uint32_t channels = 0;
+    std::unique_ptr<OpusDecoder, DestroyOpusDecoder> decoder; // for DecodeOpus
+    std::uint32_t queued = 0;                                 // its results not dequeued yet
+};
+// what an XApuHandle stands for
+struct XApuClient {
+    XApuConnectInputParameters parameters;
+    void *base_data = nullptr;
+    HANDLE result_ready_event = nullptr;
+    std::mutex mutex;
+    std::vector<XApuStream> streams;
+    std::deque<XApuResult> results;
+    std::uint32_t commands = 0, dequeued = 0; // since the connection
+    std::vector<float> pcm;                   // a packet as libopus decodes it
+};
+
+// XApuConnect: one process type for every stream of the client, and the memory its inputs,
+// outputs and processing buffers are placed in. DecodeOpus has no output length of its own; the
+// conversions have one of five.
+HRESULT WINAPI xapu_connect(const XApuConnectInputParameters *params,
+                            XApuConnectOutputParameters *data, XApuClient **handle) {
+    if (data)
+        *data = {};
+    if (!params || !data || !handle)
         return E_INVALIDARG;
-    auto *const client = new XApu;
-    client->channels.assign(std::max(input->streams, 1u), 2);
-    client->frames_per_output = input->frames_per_output;
-    if (input->data_bytes)
-        client->data = allocate_aligned(input->data_bytes, 0x10000, nullptr);
-    if (input->options & 8)
-        client->ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    *output = {client->data, client->ready};
+    const auto &input = *params;
+    const auto frames = input.max_frame_count_per_output;
+    const bool decoding = input.process_type == XApuProcessType::decode_opus;
+    const bool converting = input.process_type == XApuProcessType::decode_convert_opus ||
+                            input.process_type == XApuProcessType::convert_pcm;
+    if (!(decoding ? frames == 0
+                   : converting && (frames == 256 || frames == 480 || frames == 512 ||
+                                    frames == 960 || frames == 1024)) ||
+        input.max_stream_count < 1 || input.max_stream_count > 500 ||
+        input.max_queued_commands_per_stream < 1 || input.max_queued_commands_per_stream > 16 ||
+        !input.base_data_length)
+        return E_INVALIDARG;
+    auto *const base_data = allocate_aligned(input.base_data_length, 0x10000, nullptr);
+    if (!base_data)
+        return E_OUTOFMEMORY;
+    auto *const client = new XApuClient;
+    client->parameters = input;
+    client->base_data = base_data;
+    client->streams.resize(input.max_stream_count);
+    if (decoding)
+        client->pcm.resize(std::size_t{max_packet_frames} * 2);
+    if (input.options & enable_result_ready_event)
+        client->result_ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    *data = {client->base_data, client->result_ready_event};
     *handle = client;
-    std::fprintf(stderr,
-                 "[Runtime] audio decoder connected: process type %u, %u streams (nothing is "
-                 "decoded: silence)\n",
-                 input->process, input->streams);
+    std::fprintf(stderr, "[Runtime] audio decoder connected: process type %u, %u streams%s\n",
+                 static_cast<std::uint32_t>(input.process_type), input.max_stream_count,
+                 decoding ? "" : " (no rate conversion: silence)");
     std::fflush(stderr);
     return S_OK;
 }
-HRESULT WINAPI xapu_disconnect(XApu *client) {
+// XApuDisconnect frees all the client has, and says when it left results it did not dequeue
+HRESULT WINAPI xapu_disconnect(XApuClient *client) {
     if (!client)
         return E_INVALIDARG;
-    if (client->data)
-        VirtualFree(client->data, 0, MEM_RELEASE);
-    if (client->ready)
-        CloseHandle(client->ready);
+    const bool pending = !client->results.empty();
+    VirtualFree(client->base_data, 0, MEM_RELEASE);
+    if (client->result_ready_event)
+        CloseHandle(client->result_ready_event);
     delete client;
+    return pending ? xapu_e_pending_results : S_OK;
+}
+
+HRESULT activate(const XApuClient &client, XApuStream &stream,
+                 const XApuDecodeConvertActivateCommand &command) {
+    if (stream.active)
+        return xapu_e_already_active;
+    if (command.channel_count < 1 || command.channel_count > 2)
+        return E_INVALIDARG;
+    if (client.parameters.process_type == XApuProcessType::decode_opus) {
+        int error = OPUS_OK;
+        stream.decoder.reset(
+            opus_decoder_create(48000, static_cast<int>(command.channel_count), &error));
+        if (!stream.decoder)
+            return E_OUTOFMEMORY;
+    }
+    stream.active = true;
+    stream.channels = command.channel_count;
     return S_OK;
 }
-HRESULT WINAPI xapu_enqueue(XApu *client, const XApuCommand *command, std::uint32_t *count) {
+// DecodeOpus: one packet into the command's output, its frames from first_frame_index on and at
+// most frame_count of them. Deinterleaved, the right channel follows the left one's frames. What
+// does not fit is said, and what fits is kept.
+void decode(XApuClient &client, XApuStream &stream, const XApuDecodeConvertCommand &command,
+            XApuResult &result) {
+    const int decoded = opus_decode_float(stream.decoder.get(),
+                                          static_cast<const unsigned char *>(command.input_data),
+                                          static_cast<opus_int32>(command.input_data_length),
+                                          client.pcm.data(), max_packet_frames, 0);
+    if (decoded < 0) {
+        result.error_code = xapu_e_bad_opus_packet;
+        return;
+    }
+    const auto channels = stream.channels;
+    const auto frame_bytes = channels * static_cast<std::uint32_t>(sizeof(float));
+    const auto first = std::min(command.first_frame_index, static_cast<std::uint32_t>(decoded));
+    const auto wanted = std::min(static_cast<std::uint32_t>(decoded) - first, command.frame_count);
+    const auto frames = std::min(wanted, command.max_output_data_length / frame_bytes);
+    if (frames < wanted)
+        result.error_code = xapu_e_buffer_too_small;
+    const float *const pcm = client.pcm.data() + std::size_t{first} * channels;
+    auto *const output = static_cast<float *>(command.output_data);
+    if (channels == 2 && client.parameters.options & deinterleaved_output) {
+        for (std::uint32_t i = 0; i < frames; ++i) {
+            output[i] = pcm[2 * i];
+            output[frames + i] = pcm[2 * i + 1];
+        }
+    } else {
+        std::memcpy(output, pcm, std::size_t{frames} * frame_bytes);
+    }
+    result.output_frame_count = frames;
+    result.output_data_length = frames * frame_bytes;
+}
+void process(XApuClient &client, XApuStream &stream, const XApuDecodeConvertCommand &command,
+             XApuResult &result) {
+    result.output_data = command.output_data;
+    result.input_data_length = command.input_data_length;
+    result.input_data = command.input_data;
+    if (!stream.active) {
+        result.error_code = xapu_e_invalid_stream_index;
+    } else if (!command.input_data || !command.input_data_length || !command.output_data) {
+        result.error_code = E_INVALIDARG;
+    } else if (client.parameters.process_type == XApuProcessType::decode_opus) {
+        decode(client, stream, command, result);
+    } else {
+        // the rate conversion is not done here: the input is taken whole, and an output's
+        // length of silence given for it
+        const auto frame_bytes = stream.channels * static_cast<std::uint32_t>(sizeof(float));
+        const auto frames = std::min(client.parameters.max_frame_count_per_output,
+                                     command.max_output_data_length / frame_bytes);
+        std::memset(command.output_data, 0, std::size_t{frames} * frame_bytes);
+        result.state = output_ready | need_more_input;
+        result.output_frame_count = frames;
+        result.output_data_length = frames * frame_bytes;
+        result.current_pitch = command.target_pitch;
+    }
+}
+// XApuEnqueueCommand: the command is carried out at once, and its result keeps a place in its
+// stream's queue until it is dequeued
+HRESULT WINAPI xapu_enqueue_command(XApuClient *client, const XApuCommandId *command,
+                                    std::uint32_t *total_command_count) {
     if (!client || !command)
         return E_INVALIDARG;
+    if (command->type < XApuCommandType::activate || command->type > XApuCommandType::reset)
+        return xapu_e_invalid_command;
+    const std::lock_guard lock(client->mutex);
+    if (command->stream_index >= client->streams.size())
+        return xapu_e_invalid_stream_index;
+    auto &stream = client->streams[command->stream_index];
+    if (stream.queued >= client->parameters.max_queued_commands_per_stream)
+        return xapu_e_queue_full;
+    const auto start = std::chrono::steady_clock::now();
     XApuResult result{};
     result.id = *command;
-    result.pitch = 1;
-    const std::lock_guard lock(client->mutex);
-    const auto stream = command->stream < client->channels.size() ? command->stream : 0;
-    if (command->type == 1) {
-        const auto channels = reinterpret_cast<const XApuActivate *>(command)->channels;
-        client->channels[stream] = channels == 1 ? 1 : 2;
-    } else if (command->type == 3) {
-        const auto *const process = reinterpret_cast<const XApuProcess *>(command);
-        const std::uint32_t frame_bytes = client->channels[stream] * sizeof(float);
-        std::uint32_t frames = process->frames ? process->frames : client->frames_per_output;
-        frames = std::min(frames ? frames : 960, process->output_bytes / frame_bytes);
-        if (process->output && frames)
-            std::memset(process->output, 0, std::size_t{frames} * frame_bytes);
-        result.state = 1 | 2; // output ready, and more input wanted
-        result.frames = frames;
-        result.output_bytes = frames * frame_bytes;
-        result.output = process->output;
-        result.pitch = process->pitch;
-        result.input_bytes = process->input_bytes;
-        result.input = process->input;
+    result.current_pitch = 1;
+    switch (command->type) {
+    case XApuCommandType::activate:
+        result.error_code = activate(
+            *client, stream, *reinterpret_cast<const XApuDecodeConvertActivateCommand *>(command));
+        break;
+    case XApuCommandType::deactivate:
+        stream.active = false;
+        stream.decoder.reset();
+        break;
+    case XApuCommandType::process:
+        process(*client, stream, *reinterpret_cast<const XApuDecodeConvertCommand *>(command),
+                result);
+        break;
+    case XApuCommandType::notify: // not used
+        break;
+    case XApuCommandType::reset: // the stream as its activation left it
+        if (stream.decoder)
+            opus_decoder_ctl(stream.decoder.get(), OPUS_RESET_STATE);
+        break;
     }
+    result.total_execution_time = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+    ++stream.queued;
+    ++client->commands;
     client->results.push_back(result);
-    if (count)
-        *count = static_cast<std::uint32_t>(client->results.size());
-    if (client->ready && command->options & 1)
-        SetEvent(client->ready);
+    if (total_command_count)
+        *total_command_count = client->commands;
+    if (command->options & signal_on_completion && client->result_ready_event)
+        SetEvent(client->result_ready_event);
     return S_OK;
 }
-HRESULT WINAPI xapu_dequeue(XApu *client, XApuResult *result) {
-    if (!client || !result)
+// XApuDequeueResult: the oldest result, which frees its place in its stream's queue
+HRESULT WINAPI xapu_dequeue_result(XApuClient *client, XApuResult *command_result) {
+    if (!client || !command_result)
         return E_INVALIDARG;
     const std::lock_guard lock(client->mutex);
     if (client->results.empty())
-        return xapu_no_results;
-    *result = client->results.front();
+        return xapu_e_pending_results;
+    const auto result = client->results.front();
     client->results.pop_front();
+    --client->streams[result.id.stream_index].queued;
+    ++client->dequeued;
+    *command_result = result;
     return S_OK;
 }
-std::uint32_t WINAPI xapu_result_count(XApu *client, std::uint32_t *total) {
+// XApuGetResultCount: the results waiting, and how many have been dequeued since the connection
+std::uint32_t WINAPI xapu_get_result_count(XApuClient *client, std::uint32_t *total_result_count) {
+    if (!client)
+        return 0;
     const std::lock_guard lock(client->mutex);
-    const auto count = static_cast<std::uint32_t>(client->results.size());
-    if (total)
-        *total = count;
-    return count;
+    if (total_result_count)
+        *total_result_count = client->dequeued;
+    return static_cast<std::uint32_t>(client->results.size());
 }
-// XApuUtilization: streams available, and the most there can be
-HRESULT WINAPI xapu_utilization(std::uint32_t, std::uint32_t, std::uint32_t *utilization) {
+// XApuGetUtilization: the streams the decoder can take now, and the most it processes at once
+HRESULT WINAPI xapu_get_utilization(XApuProcessType, std::uint32_t, XApuUtilization *utilization) {
     if (!utilization)
         return E_INVALIDARG;
-    utilization[0] = utilization[1] = 256;
+    *utilization = {256, 256};
     return S_OK;
 }
 
@@ -482,10 +644,10 @@ void install_acphal(Registry &registry) {
     const std::pair<const char *, void *> decoder[] = {
         {"XApuConnect", erase(xapu_connect)},
         {"XApuDisconnect", erase(xapu_disconnect)},
-        {"XApuEnqueueCommand", erase(xapu_enqueue)},
-        {"XApuDequeueResult", erase(xapu_dequeue)},
-        {"XApuGetResultCount", erase(xapu_result_count)},
-        {"XApuGetUtilization", erase(xapu_utilization)}};
+        {"XApuEnqueueCommand", erase(xapu_enqueue_command)},
+        {"XApuDequeueResult", erase(xapu_dequeue_result)},
+        {"XApuGetResultCount", erase(xapu_get_result_count)},
+        {"XApuGetUtilization", erase(xapu_get_utilization)}};
     for (const auto &[name, function] : decoder)
         registry.add("xapu.dll", name, function);
     registry.add("chad.dll", "XDspConnect", erase(no_audio_dsp));

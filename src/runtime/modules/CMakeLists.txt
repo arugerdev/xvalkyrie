@@ -10,4 +10,4 @@ add_library(xv_runtime_modules xg.cpp texture_layout.cpp kernel.cpp memory.cpp d
 target_include_directories(xv_runtime_modules PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_compile_definitions(xv_runtime_modules PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(xv_runtime_modules PRIVATE xv_options xv_core xv_host xv_game_config xv_runtime_common
-  xv_graphics xv_input xv_surface d3d12 dxgi shlwapi onecore ole32 sapi ws2_32)
+  xv_graphics xv_input xv_surface opus d3d12 dxgi shlwapi onecore ole32 sapi ws2_32)

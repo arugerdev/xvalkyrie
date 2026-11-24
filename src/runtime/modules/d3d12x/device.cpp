@@ -865,6 +865,37 @@ HRESULT STDMETHODCALLTYPE check_feature_support(ID3D12Device *self, D3D12_FEATUR
 // its own, a descriptor's worth per host descriptor; the host's descriptor at the same index
 // is the one that counts. Descriptors made through the device are the host's already (the
 // shadow holds a mark); those the title wrote are hardware descriptors, read when used.
+//
+// The host's CPU may only write a heap that shaders see: a copy from one is invalid
+// (ID3D12Device::CopyDescriptors in Microsoft's documentation), and so is the CPU handle of
+// ClearUnorderedAccessView*. Titles copy within the heaps they bind, and so does the decoding
+// of what they wrote. So the host's descriptors of a heap shaders see are made in a twin
+// heap shaders do not see, and the slots written there since the last submission are copied
+// to the heap shaders see before a queue is given work (copy_twins).
+struct Twin {
+    ID3D12Device *device;
+    ID3D12DescriptorHeap *heap; // the twin, which the CPU reads
+    D3D12_CPU_DESCRIPTOR_HANDLE visible, start;
+    D3D12_DESCRIPTOR_HEAP_TYPE type;
+    UINT count, step;
+    // a bit for each slot written, and a bit for each word of those that may have one
+    std::unique_ptr<std::atomic<std::uint64_t>[]> written, words;
+    std::atomic<bool> any{false};
+    Twin(ID3D12Device *device, ID3D12DescriptorHeap *heap, D3D12_CPU_DESCRIPTOR_HANDLE visible,
+         D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, UINT step)
+        : device(device), heap(heap), visible(visible),
+          start(heap->GetCPUDescriptorHandleForHeapStart()), type(type), count(count), step(step),
+          written(new std::atomic<std::uint64_t>[(count + 63) / 64] {}),
+          words(new std::atomic<std::uint64_t>[(count + 4095) / 4096] {}) {}
+    ~Twin() { heap->Release(); }
+    void wrote(std::size_t index, std::size_t slots = 1) {
+        for (const auto end = std::min<std::size_t>(index + slots, count); index < end; ++index) {
+            written[index / 64].fetch_or(1ull << (index % 64), std::memory_order_relaxed);
+            words[index / 4096].fetch_or(1ull << (index / 64 % 64), std::memory_order_release);
+        }
+        any.store(true, std::memory_order_release);
+    }
+};
 struct ShadowHeap {
     std::uintptr_t base, end;
     D3D12_CPU_DESCRIPTOR_HANDLE host;
@@ -877,6 +908,7 @@ struct ShadowHeap {
     void *owner;           // the heap the title holds
     bool borrowed = false; // the memory is the title's own, from its allocation hooks
     UINT host_count = ~0u; // the host's descriptors, where it has fewer than the title
+    std::shared_ptr<Twin> twin; // for a heap shaders see: where `host` is
 };
 // The console's descriptor sizes, which titles also have compiled in: the device's inline
 // methods copy descriptors of these sizes themselves
@@ -946,11 +978,66 @@ struct BufferView {
 std::map<std::uint64_t, BufferView> buffer_views; // under memory_view_mutex
 // XV_D3D_LOST: what the shader resource view in each of the host's slots was made of
 std::map<std::uint64_t, std::string> lost_views; // under memory_view_mutex
+// the host's descriptors of `slots` slots from `at` were written: the twin's go to the heap
+// shaders see before the next submission
+void wrote(const ShadowHeap &heap, std::uintptr_t at, std::size_t slots = 1) {
+    if (heap.twin)
+        heap.twin->wrote(
+            std::min<std::uintptr_t>((at - heap.base) / heap.stride, heap.host_count - 1), slots);
+}
+void wrote(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::size_t slots = 1) {
+    const std::lock_guard lock(shadow_mutex);
+    if (const auto *heap = shadow_heap(handle.ptr))
+        wrote(*heap, handle.ptr, slots);
+}
+// the same for a descriptor written by the host's own slot, as a view made again for a draw is
+void wrote_slot(std::uint64_t slot) {
+    const std::lock_guard lock(shadow_mutex);
+    for (const auto &[base, heap] : shadow_heaps)
+        if (auto *const twin = heap.twin.get();
+            twin && slot >= twin->start.ptr &&
+            slot < twin->start.ptr + std::uint64_t{twin->count} * twin->step) {
+            twin->wrote((slot - twin->start.ptr) / twin->step);
+            return;
+        }
+}
+// The twins' slots written since the last time, to the heaps shaders see, in runs
+void copy_twins() {
+    std::vector<std::shared_ptr<Twin>> twins;
+    {
+        const std::lock_guard lock(shadow_mutex);
+        for (const auto &[base, heap] : shadow_heaps)
+            if (heap.twin && heap.twin->any.exchange(false, std::memory_order_acq_rel))
+                twins.push_back(heap.twin);
+    }
+    using Copy = void(STDMETHODCALLTYPE *)(void *, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                           D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+    for (const auto &twin : twins) {
+        const auto copy = original<Copy>(twin->device, 24);
+        for (std::size_t group = 0; group < (std::size_t{twin->count} + 4095) / 4096; ++group) {
+            auto marked = twin->words[group].exchange(0, std::memory_order_acq_rel);
+            while (marked) {
+                const auto word = group * 64 + static_cast<unsigned>(std::countr_zero(marked));
+                marked &= marked - 1;
+                auto bits = twin->written[word].exchange(0, std::memory_order_acq_rel);
+                while (bits) {
+                    const auto first = static_cast<unsigned>(std::countr_zero(bits));
+                    const auto run = static_cast<unsigned>(std::countr_one(bits >> first));
+                    const auto index = word * 64 + first;
+                    copy(twin->device, run, {twin->visible.ptr + index * twin->step},
+                         {twin->start.ptr + index * twin->step}, twin->type);
+                    bits = run + first >= 64 ? 0 : bits & ~(((1ull << run) - 1) << first);
+                }
+            }
+        }
+    }
+}
 // The mark of a host descriptor, and the host's handle of the slot that holds it: a title
 // that copies descriptors itself (the device's inline CopyDescriptorsSimple) carries both
 // along, which tells where the host's descriptor of the copy is to come from.
 void set_mark(const ShadowHeap &heap, std::uintptr_t at) {
     at = heap.base + (at - heap.base) / heap.stride * heap.stride;
+    wrote(heap, at);
     const std::uint64_t words[2]{host_mark, host_slot(heap, at).ptr};
     std::memcpy(reinterpret_cast<void *>(at), words, sizeof words);
 }
@@ -1074,6 +1161,7 @@ void decode_written(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     using Create = void(STDMETHODCALLTYPE *)(void *, const D3D12_CONSTANT_BUFFER_VIEW_DESC *,
                                              D3D12_CPU_DESCRIPTOR_HANDLE);
     original<Create>(heap->device, 17)(heap->device, &view, host_handle(handle));
+    wrote(*heap, handle.ptr);
 }
 // A title of the later kits exports __XMemAllocationHooks__ (allocate, free): the console's
 // Direct3D takes a descriptor heap's memory through them, as an object of type 4 (the low
@@ -1144,6 +1232,25 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
         return;
     }
     const auto base = reinterpret_cast<std::uintptr_t>(memory);
+    const bool visible = (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+    const UINT host_stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+    // the twin of a heap shaders see; without one the host's descriptors are made in it
+    std::shared_ptr<Twin> twin;
+    if (visible) {
+        D3D12_DESCRIPTOR_HEAP_DESC twin_desc = desc;
+        twin_desc.Flags &= ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        twin_desc.NumDescriptors = std::min(desc.NumDescriptors, host_count);
+        void *made = nullptr;
+        using Create = HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_DESCRIPTOR_HEAP_DESC *,
+                                                    REFIID, void **);
+        if (SUCCEEDED(original<Create>(device, 14)(device, &twin_desc,
+                                                   __uuidof(ID3D12DescriptorHeap), &made)) &&
+            made) {
+            twin = std::make_shared<Twin>(device, static_cast<ID3D12DescriptorHeap *>(made), host,
+                                          desc.Type, twin_desc.NumDescriptors, host_stride);
+            host = twin->start;
+        }
+    }
     const std::lock_guard lock(shadow_mutex);
     shadow_heaps[base] = {base,
                           base + std::size_t{desc.NumDescriptors} * stride,
@@ -1151,12 +1258,13 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
                           stride,
                           desc.Type,
                           device,
-                          (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0,
+                          visible,
                           gpu,
-                          device->GetDescriptorHandleIncrementSize(desc.Type),
+                          host_stride,
                           heap,
                           title_memory != nullptr,
-                          host_count};
+                          host_count,
+                          std::move(twin)};
     shadow_of[heap] = base;
 }
 // Before the GPU runs: what the title wrote straight into a shader-visible heap since last
@@ -2302,6 +2410,8 @@ void STDMETHODCALLTYPE copy_descriptors(ID3D12Device *self, UINT destination_ran
                                   const UINT *, D3D12_DESCRIPTOR_HEAP_TYPE);
     original<Copy>(self, 23)(self, destination_ranges, host_destinations.data(), destination_sizes,
                              source_ranges, host_sources.data(), source_sizes, type);
+    for (UINT range = 0; range < destination_ranges; ++range)
+        wrote(destinations[range], destination_sizes ? destination_sizes[range] : 1);
 }
 void STDMETHODCALLTYPE copy_descriptors_simple(ID3D12Device *self, UINT count, Handle destination,
                                                Handle source, D3D12_DESCRIPTOR_HEAP_TYPE type) {
@@ -2312,6 +2422,7 @@ void STDMETHODCALLTYPE copy_descriptors_simple(ID3D12Device *self, UINT count, H
     using Copy =
         void(STDMETHODCALLTYPE *)(void *, UINT, Handle, Handle, D3D12_DESCRIPTOR_HEAP_TYPE);
     original<Copy>(self, 24)(self, count, host_handle(destination), host_handle(source), type);
+    wrote(destination, count);
 }
 // CreateDescriptorHeap: the heap's CPU handles are the console's (shadow memory), its GPU
 // handles the host's, returned in RAX (9, 10)
@@ -2814,6 +2925,7 @@ void structured_view(ID3D12Device *device, std::uint64_t slot, std::uint32_t str
     made.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(device, 18)(
         device, view.resource, &made, Handle{slot});
+    wrote_slot(slot);
     const std::lock_guard lock(memory_view_mutex);
     buffer_views[slot] = {view.resource, made};
 }
@@ -6301,6 +6413,7 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
     if (const auto *text = std::getenv("XV_D3D_SLOW"))
         Sleep(std::atoi(text));
     decode_written_heaps();
+    copy_twins();
     upload_placements_d3d12(self);
     std::vector<ID3D12CommandList *> host(count);
     for (UINT i = 0; i < count; ++i)

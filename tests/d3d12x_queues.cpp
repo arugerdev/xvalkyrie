@@ -5,14 +5,16 @@
 // What orders the GPU's work on the console without a fence: FlushPipelineX in a list, and
 // Wait32BitValueX / Wait64BitValueX, a wait for a value another queue's work writes in memory.
 // The host has no wait on memory: a list with one runs after what the other queues were given
-// before it, up to a wait of theirs that is not over.
+// before it, up to a wait of theirs that is not over. A list's own work on memory by address
+// (copies, fills, values written) is done when a queue is given the list, in its order.
 namespace {
 using namespace d3d12x_test;
 
 // The later kits' layout of queues and lists, set by the title's first Signal at the queue's
 // slot 16 (see queue_by_layout): every list method from 59 on is two slots further, and so are
 // the queue's Signal (16) and Wait (17).
-constexpr std::uint32_t queue_signal = 16, queue_wait = 17, flush_pipeline = 69, wait_32 = 73;
+constexpr std::uint32_t queue_signal = 16, queue_wait = 17, copy_memory = 62, fill_32 = 63,
+                        flush_pipeline = 69, wait_32 = 73, write_32 = 90;
 ID3D12Fence *fence() {
     ID3D12Fence *made = nullptr;
     REQUIRE(SUCCEEDED(device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&made))));
@@ -140,4 +142,31 @@ TEST_CASE("FlushPipelineX orders a list's work as a barrier does") {
     add->Release();
     signature->Release();
     results->Release();
+}
+
+TEST_CASE("a list's copies, fills and values in memory are done when it runs, in its order") {
+    if (!device())
+        return;
+    later_layout();
+    auto *const memory = static_cast<std::uint32_t *>(
+        VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    REQUIRE(memory);
+    const auto at = [memory](std::size_t word) {
+        return reinterpret_cast<std::uint64_t>(memory + word);
+    };
+    Work work;
+    // CopyMemoryX after FillMemoryWith32BitValueX copies what the fill wrote
+    work.record(fill_32, at(0), std::uint64_t{64}, 7u, 0u);
+    work.record(copy_memory, at(32), at(0), std::uint64_t{16}, 0u);
+    work.record(write_32, at(64), 9u, 0u);
+    CHECK(memory[0] == 0);
+    CHECK(memory[64] == 0);
+    work.run();
+    CHECK(memory[15] == 7);
+    CHECK(memory[16] == 0);
+    CHECK(memory[32] == 7);
+    CHECK(memory[35] == 7);
+    CHECK(memory[36] == 0);
+    CHECK(memory[64] == 9);
+    VirtualFree(memory, 0, MEM_RELEASE);
 }

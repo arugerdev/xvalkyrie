@@ -167,11 +167,12 @@ TEST_CASE("WriteBufferImmediate writes the title's own memory itself") {
     Work work;
     // list slot 111 on the Series console, ID3D12GraphicsCommandList2's only method
     work.record(111, 2u, parameters, static_cast<const D3D12_WRITEBUFFERIMMEDIATE_MODE *>(nullptr));
-    // the title's memory when the list is recorded, the buffer when it runs
-    CHECK(memory.word(16384) == 0x1234);
+    // both when the list runs: the title's memory when a queue is given it
+    CHECK(memory.word(16384) == pattern);
     CHECK(words(output)[16] == 0);
     work.run();
     CHECK(removed_reason() == S_OK);
+    CHECK(memory.word(16384) == 0x1234);
     CHECK(words(output)[16] == 0x4321);
     buffer->Release();
 }

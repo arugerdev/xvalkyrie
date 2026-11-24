@@ -18,6 +18,7 @@
 #include <d3d12.h>
 #include <deque>
 #include <dxgi1_6.h>
+#include <functional>
 #include <intrin.h>
 #include <map>
 #include <memory>
@@ -4024,6 +4025,8 @@ struct ListProxy {
     UINT vertex_calls = 0;
     bool legacy_barriers = false; // Barrier as on a host without enhanced barriers
     bool waits_memory = false;    // it has a Wait32BitValueX or Wait64BitValueX
+    // what it does to memory by address, in order, done when a queue is given it (when_run)
+    std::vector<std::function<void()>> on_memory;
     RootArgument &argument(UINT parameter) {
         if (graphics_arguments.size() <= parameter)
             graphics_arguments.resize(std::min<std::size_t>(parameter, 63) + 1);
@@ -4765,6 +4768,15 @@ void STDMETHODCALLTYPE copy_texture_region_x(void *self, const D3D12_TEXTURE_COP
 }
 void STDMETHODCALLTYPE execute_bundle(void *self, ID3D12GraphicsCommandList *bundle) {
     host_of(self)->ExecuteBundle(static_cast<List *>(host_list(bundle)));
+    // the bundle's work on memory, there in the list
+    {
+        const std::lock_guard lock(proxy_mutex);
+        if (!list_proxies.contains(bundle))
+            return;
+    }
+    auto &into = static_cast<ListProxy *>(self)->on_memory;
+    const auto &from = static_cast<ListProxy *>(static_cast<void *>(bundle))->on_memory;
+    into.insert(into.end(), from.begin(), from.end());
 }
 // XV_D3D_TRACE: the first calls of a method, with a handle and the host's for it
 void trace_handle(const char *method, Handle handle) {
@@ -4828,6 +4840,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->graphics_arguments.clear();
     list->ours_bound = false;
     list->waits_memory = false;
+    list->on_memory.clear();
     const auto result = host_of(self)->Reset(allocator, state);
     if (static std::atomic<int> shown{0};
         std::getenv("XV_D3D_LOST") && (FAILED(result) || shown < 80) && shown++ < 200) {
@@ -5851,11 +5864,21 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
     host->Release();
 }
 // The methods of a list that work on memory by its address (the console header's slots 60
-// to 63, 69 to 72 and 88 to 90). On the console a GPU address is the title's own memory and
+// to 63, 69, 70 and 88 to 90). On the console a GPU address is the title's own memory and
 // the GPU does the work when it gets there; titles time their frames with the values it
-// writes. Here the CPU does it when the list is recorded, and what waits for a value to be
-// there has nothing left to wait for.
+// writes. The host's GPU cannot reach that memory, so the CPU does the work, in the list's
+// order, when a queue is given the list (each time it is), not when it is recorded.
 bool title_memory(std::uint64_t address, std::uint64_t size, bool write);
+void when_run(void *self, std::function<void()> work) {
+    {
+        const std::lock_guard lock(proxy_mutex);
+        if (!list_proxies.contains(self)) {
+            work();
+            return;
+        }
+    }
+    static_cast<ListProxy *>(self)->on_memory.push_back(std::move(work));
+}
 template <class Value> void write_value(std::uint64_t destination, Value value) {
     if (title_memory(destination, sizeof value, true))
         std::memcpy(reinterpret_cast<void *>(destination), &value, sizeof value);
@@ -5866,28 +5889,30 @@ std::uint64_t host_clock() {
     return static_cast<std::uint64_t>(counter.QuadPart);
 }
 // D3D12XBOX_WRITE_VALUE_BOP_FLAGS: 1 the GPU's timestamp, 2 the system's
-void STDMETHODCALLTYPE write_64_bottom_of_pipe(void *, std::uint64_t destination,
+void STDMETHODCALLTYPE write_64_bottom_of_pipe(void *self, std::uint64_t destination,
                                                std::uint64_t value, UINT, UINT flags) {
-    write_value(destination, flags & 3 ? host_clock() : value);
+    when_run(self, [=] { write_value(destination, flags & 3 ? host_clock() : value); });
 }
-void STDMETHODCALLTYPE write_32_bottom_of_pipe(void *, std::uint64_t destination, UINT value, UINT,
-                                               UINT) {
-    write_value(destination, value);
+void STDMETHODCALLTYPE write_32_bottom_of_pipe(void *self, std::uint64_t destination, UINT value,
+                                               UINT, UINT) {
+    when_run(self, [=] { write_value(destination, value); });
 }
 // D3D12XBOX_WRITE_VALUE_TOP_FLAGS: 4 the GPU's timestamp, 8 the system's
-void STDMETHODCALLTYPE write_64_top_of_pipe(void *, std::uint64_t destination, std::uint64_t value,
-                                            UINT flags) {
-    write_value(destination, flags & 12 ? host_clock() : value);
+void STDMETHODCALLTYPE write_64_top_of_pipe(void *self, std::uint64_t destination,
+                                            std::uint64_t value, UINT flags) {
+    when_run(self, [=] { write_value(destination, flags & 12 ? host_clock() : value); });
 }
 // Write32BitValueTopOfPipeX and Write32BitValueBottomOfShaderX
-void STDMETHODCALLTYPE write_32(void *, std::uint64_t destination, UINT value, UINT) {
-    write_value(destination, value);
+void STDMETHODCALLTYPE write_32(void *self, std::uint64_t destination, UINT value, UINT) {
+    when_run(self, [=] { write_value(destination, value); });
 }
-void STDMETHODCALLTYPE copy_memory(void *, std::uint64_t destination, std::uint64_t source,
+void STDMETHODCALLTYPE copy_memory(void *self, std::uint64_t destination, std::uint64_t source,
                                    std::uint64_t size, UINT) {
-    if (title_memory(destination, size, true) && title_memory(source, size, false))
-        std::memmove(reinterpret_cast<void *>(destination), reinterpret_cast<const void *>(source),
-                     static_cast<std::size_t>(size));
+    when_run(self, [=] {
+        if (title_memory(destination, size, true) && title_memory(source, size, false))
+            std::memmove(reinterpret_cast<void *>(destination),
+                         reinterpret_cast<const void *>(source), static_cast<std::size_t>(size));
+    });
 }
 // FillMemoryWith32BitValueX, 64 and 128: the value over and over, for `size` bytes
 void fill_memory(std::uint64_t destination, std::uint64_t size, const void *value,
@@ -5898,22 +5923,25 @@ void fill_memory(std::uint64_t destination, std::uint64_t size, const void *valu
     for (std::uint64_t at = 0; at + width <= size; at += width)
         std::memcpy(bytes + at, value, width);
 }
-void STDMETHODCALLTYPE fill_memory_32(void *, std::uint64_t destination, std::uint64_t size,
+void STDMETHODCALLTYPE fill_memory_32(void *self, std::uint64_t destination, std::uint64_t size,
                                       UINT value, UINT) {
-    fill_memory(destination, size, &value, sizeof value);
+    when_run(self, [=] { fill_memory(destination, size, &value, sizeof value); });
 }
-void STDMETHODCALLTYPE fill_memory_64(void *, std::uint64_t destination, std::uint64_t size,
+void STDMETHODCALLTYPE fill_memory_64(void *self, std::uint64_t destination, std::uint64_t size,
                                       std::uint64_t value, UINT) {
-    fill_memory(destination, size, &value, sizeof value);
+    when_run(self, [=] { fill_memory(destination, size, &value, sizeof value); });
 }
-void STDMETHODCALLTYPE fill_memory_128(void *, std::uint64_t destination, std::uint64_t size,
+// the value is read when the list is recorded, as the other methods' values are
+void STDMETHODCALLTYPE fill_memory_128(void *self, std::uint64_t destination, std::uint64_t size,
                                        const UINT *value, UINT) {
-    if (value)
-        fill_memory(destination, size, value, 4 * sizeof *value);
+    if (!value)
+        return;
+    const std::array<UINT, 4> words{value[0], value[1], value[2], value[3]};
+    when_run(self, [=] { fill_memory(destination, size, words.data(), sizeof words); });
 }
 // ID3D12GraphicsCommandList2::WriteBufferImmediate (Xbox One's list slot 110, the Series
 // console's 111). A destination the host's GPU cannot see is the title's own memory, which the
-// CPU writes when the list is recorded, as for the console's write methods above.
+// CPU writes when the list is run, as for the console's write methods above.
 void STDMETHODCALLTYPE write_buffer_immediate(
     void *self, UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters,
     const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) {
@@ -5925,7 +5953,9 @@ void STDMETHODCALLTYPE write_buffer_immediate(
             if (modes)
                 host_modes.push_back(modes[i]);
         } else {
-            write_value(parameters[i].Dest, parameters[i].Value);
+            when_run(self, [destination = parameters[i].Dest, value = parameters[i].Value] {
+                write_value(destination, value);
+            });
         }
     }
     ID3D12GraphicsCommandList2 *list = nullptr;
@@ -6055,8 +6085,9 @@ void *make_list_proxy(List *host) {
 // ID3D12XboxDmaCommandList (a list of type 16): the console's hardware copies, fills and
 // (de)compresses memory by itself, in the order of a queue. The slots are the ones of the
 // console header's table. Resources are copied on a host list of ours; what works on
-// memory by address is done by the CPU when it is recorded, since on the console a GPU
-// address is the title's own memory. The compression formats are not known: those say so.
+// memory by address is done by the CPU when the list is run (when_run), since on the console
+// a GPU address is the title's own memory. The compression formats are not known: those say
+// so.
 constexpr UINT dma_list_type = 16;
 constexpr std::size_t dma_slots = 32;
 struct DmaProxy : ListProxy {
@@ -6090,6 +6121,7 @@ HRESULT STDMETHODCALLTYPE dma_device(void *self, REFIID iid, void **device) {
 }
 HRESULT STDMETHODCALLTYPE dma_reset(void *self, ID3D12CommandAllocator *, ID3D12PipelineState *) {
     auto *const list = static_cast<DmaProxy *>(self);
+    list->on_memory.clear();
     return list->host->Reset(list->allocator, nullptr);
 }
 void STDMETHODCALLTYPE dma_copy_buffer(void *self, ID3D12Resource *target, UINT64 target_offset,
@@ -6106,23 +6138,9 @@ void STDMETHODCALLTYPE dma_copy_resource(void *self, ID3D12Resource *target,
                                          ID3D12Resource *source) {
     host_of(self)->CopyResource(target, source);
 }
-void STDMETHODCALLTYPE dma_copy_memory(void *, std::uint64_t target, std::uint64_t source,
-                                       std::uint64_t bytes, UINT) {
-    if (title_memory(target, bytes, true) && title_memory(source, bytes, false))
-        std::memmove(reinterpret_cast<void *>(target), reinterpret_cast<void *>(source),
-                     static_cast<std::size_t>(bytes));
-}
-void STDMETHODCALLTYPE dma_fill_memory(void *, std::uint64_t target, std::uint64_t bytes,
-                                       UINT value, UINT) {
-    if (!title_memory(target, bytes, true))
-        return;
-    auto *const words = reinterpret_cast<std::uint32_t *>(target);
-    std::fill(words, words + bytes / 4, value);
-}
-void STDMETHODCALLTYPE dma_last_error(void *, std::uint64_t target) {
-    constexpr std::uint32_t none = 0;
-    if (title_memory(target, sizeof none, true))
-        std::memcpy(reinterpret_cast<void *>(target), &none, sizeof none);
+// the copy engine's memory methods are the list's: done when the list is run
+void STDMETHODCALLTYPE dma_last_error(void *self, std::uint64_t target) {
+    write_32(self, target, 0, 0);
 }
 void STDMETHODCALLTYPE dma_nothing(void *) {}
 const std::array<Slot, dma_slots> dma_vtable = [] {
@@ -6147,13 +6165,13 @@ const std::array<Slot, dma_slots> dma_vtable = [] {
     set(12, &copy_texture_region);
     set(13, &dma_copy_resource);
     set(15, &resource_barrier);
-    // queries and markers count nothing here; a wait is over when it is recorded, as the
-    // value it waits for was written when that was; packets for the hardware and the
+    // queries and markers count nothing here; a wait is over when the list is run, as the
+    // value it waits for was written by then (when_run); packets for the hardware and the
     // kickoff have nothing to go to
     for (const std::size_t ignored : {16, 17, 18, 19, 20, 21, 25, 30, 31})
         set(ignored, &dma_nothing);
-    set(22, &dma_copy_memory);
-    set(23, &dma_fill_memory);
+    set(22, &copy_memory);
+    set(23, &fill_memory_32);
     set(24, &write_64_bottom_of_pipe);
     set(26, &dma_last_error);
     return vtable;
@@ -6554,6 +6572,16 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
         std::fflush(stderr);
     }
     order_before(self, count, lists);
+    // the lists' work on memory, in their order (when_run)
+    for (UINT i = 0; i < count; ++i) {
+        {
+            const std::lock_guard lock(proxy_mutex);
+            if (!list_proxies.contains(lists[i]))
+                continue;
+        }
+        for (const auto &work : static_cast<ListProxy *>(static_cast<void *>(lists[i]))->on_memory)
+            work();
+    }
     self->ExecuteCommandLists(count, host.data());
     order_after(self);
     // the submission the host drops the device at

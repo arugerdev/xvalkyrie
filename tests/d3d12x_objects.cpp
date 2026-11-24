@@ -10,9 +10,9 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
-// The host's command allocators as a title holds them, with the console's methods past the
-// desktop's, on a WARP device. The calls come from code that calls the way a title's does:
-// `call [rax + slot * 8]`.
+// The host's command allocators and fences as a title holds them, with the console's methods
+// past the desktop's, on a WARP device. The calls come from code that calls the way a title's
+// does: `call [rax + slot * 8]`.
 namespace {
 using namespace xv::runtime::modules;
 
@@ -97,6 +97,58 @@ void *STDMETHODCALLTYPE memory_for_commands(void *, void *, void *, std::uint64_
     ++memory_asked;
     return nullptr;
 }
+
+// a fence as the device makes it for the title
+ID3D12Fence *title_fence(UINT64 initial) {
+    ID3D12Fence *fence = nullptr;
+    REQUIRE(SUCCEEDED(
+        warp().device->CreateFence(initial, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))));
+    d3d12x::console_fence(fence);
+    return fence;
+}
+// GetGpuAddressX (12), as the title reads what it gives
+const volatile std::uint64_t *completed_value(ID3D12Fence *fence) {
+    const auto address = title().call<std::uint64_t>(fence, 12);
+    REQUIRE(address);
+    REQUIRE(address % 8 == 0);
+    return reinterpret_cast<const volatile std::uint64_t *>(address);
+}
+// the value the title reads is `wanted` within a few seconds
+bool reaches(const volatile std::uint64_t *value, std::uint64_t wanted) {
+    for (int waited = 0; *value != wanted && waited < 5000; ++waited)
+        Sleep(1);
+    return *value == wanted;
+}
+// Private data that counts the references a fence keeps to it, which it lets go of when it is
+// destroyed
+constexpr GUID watch_guid{
+    0x5f0e6a4c, 0x2b7d, 0x4c1e, {0x9a, 0x3f, 0x61, 0x0d, 0x8e, 0x2b, 0x47, 0xc5}};
+class Watch final : public IUnknown {
+  public:
+    explicit Watch(ID3D12Fence *fence) {
+        REQUIRE(SUCCEEDED(fence->SetPrivateDataInterface(watch_guid, this)));
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+        if (!object)
+            return E_POINTER;
+        *object = iid == __uuidof(IUnknown) ? this : nullptr;
+        if (!*object)
+            return E_NOINTERFACE;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override { return --references_; }
+    // whether the fence is gone, within a few seconds
+    bool gone() const {
+        for (int waited = 0; references_ != 0 && waited < 5000; ++waited)
+            Sleep(1);
+        return references_ == 0;
+    }
+
+  private:
+    std::atomic<ULONG> references_{0};
+};
 } // namespace
 
 TEST_CASE("a command allocator's console methods leave the title's memory alone") {
@@ -159,4 +211,106 @@ TEST_CASE("a command allocator keeps its desktop methods for the title and the h
     CHECK(title().call<ULONG>(allocator, 1) == 2);
     CHECK(title().call<ULONG>(allocator, 2) == 1);
     CHECK(allocator->Release() == 0);
+}
+
+TEST_CASE("a fence's GetGpuAddressX gives where its completed value is, the same place each time") {
+    auto *const fence = title_fence(3);
+    const auto *const value = completed_value(fence);
+    CHECK(*value == 3);
+    CHECK(completed_value(fence) == value);
+    // another fence has a place of its own
+    auto *const other = title_fence(5);
+    const auto *const other_value = completed_value(other);
+    CHECK(other_value != value);
+    CHECK(*other_value == 5);
+    CHECK(*value == 3);
+    CHECK(title().call<ULONG>(other, 2) == 0);
+    CHECK(title().call<ULONG>(fence, 2) == 0);
+}
+
+TEST_CASE("the completed value a title reads follows Signal from the CPU and from a queue") {
+    auto *const fence = title_fence(0);
+    const auto *const value = completed_value(fence);
+    CHECK(*value == 0);
+    // the title's own Signal (10) is there at once
+    CHECK(title().call<HRESULT>(fence, 10, UINT64{7}) == S_OK);
+    CHECK(*value == 7);
+    // one from the host's side, as DirectStorage's
+    CHECK(SUCCEEDED(fence->Signal(9)));
+    CHECK(reaches(value, 9));
+    // a queue's
+    CHECK(SUCCEEDED(warp().queue->Signal(fence, 12)));
+    CHECK(reaches(value, 12));
+    // a queue's behind a wait: only once the GPU is past it
+    ID3D12Fence *gate = nullptr;
+    REQUIRE(SUCCEEDED(warp().device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate))));
+    CHECK(SUCCEEDED(warp().queue->Wait(gate, 1)));
+    CHECK(SUCCEEDED(warp().queue->Signal(fence, 20)));
+    Sleep(100);
+    CHECK(*value == 12);
+    CHECK(SUCCEEDED(gate->Signal(1)));
+    CHECK(reaches(value, 20));
+    // a lower value from the title, then the queue's after it
+    CHECK(title().call<HRESULT>(fence, 10, UINT64{2}) == S_OK);
+    CHECK(*value == 2);
+    CHECK(SUCCEEDED(warp().queue->Signal(fence, 4)));
+    CHECK(reaches(value, 4));
+    finish(warp().queue);
+    gate->Release();
+    CHECK(title().call<ULONG>(fence, 2) == 0);
+}
+
+TEST_CASE("a fence keeps its desktop methods for the title and the host") {
+    auto *const fence = title_fence(1);
+    const auto *const value = completed_value(fence);
+    CHECK(title().call<std::uint64_t>(fence, 8) == 1);
+    auto *const event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    REQUIRE(event);
+    CHECK(title().call<HRESULT>(fence, 9, UINT64{3}, event) == S_OK);
+    CHECK(WaitForSingleObject(event, 0) == WAIT_TIMEOUT);
+    CHECK(SUCCEEDED(warp().queue->Signal(fence, 3)));
+    CHECK(WaitForSingleObject(event, 5000) == WAIT_OBJECT_0);
+    CHECK(reaches(value, 3));
+    CHECK(title().call<std::uint64_t>(fence, 8) == 3);
+    CHECK(fence->GetCompletedValue() == 3);
+    CloseHandle(event);
+    // ID3D12Fence1 is the same object, with the flags it was made with (11)
+    ID3D12Fence1 *fence1 = nullptr;
+    CHECK(title().call<HRESULT>(fence, 0, &__uuidof(ID3D12Fence1),
+                                reinterpret_cast<void **>(&fence1)) == S_OK);
+    CHECK(static_cast<ID3D12Fence *>(fence1) == fence);
+    CHECK(title().call<UINT>(fence, 11) == D3D12_FENCE_FLAG_NONE);
+    if (fence1)
+        title().call<ULONG>(fence1, 2);
+    ID3D12Device *device = nullptr;
+    CHECK(title().call<HRESULT>(fence, 7, &__uuidof(ID3D12Device),
+                                reinterpret_cast<void **>(&device)) == S_OK);
+    CHECK(device == warp().device);
+    if (device)
+        device->Release();
+    CHECK(title().call<HRESULT>(fence, 6, L"title's fence") == S_OK);
+    // and the host's own calls of the methods the title's go elsewhere for
+    CHECK(SUCCEEDED(fence->Signal(5)));
+    CHECK(reaches(value, 5));
+    CHECK(title().call<ULONG>(fence, 2) == 0);
+}
+
+TEST_CASE("a fence whose value a title reads goes when the title lets go of it, either way") {
+    // the title's last Release takes ours along
+    auto *const fence = title_fence(0);
+    Watch watch(fence);
+    completed_value(fence);
+    CHECK(title().call<ULONG>(fence, 2) == 0);
+    CHECK(watch.gone());
+    // the last but ours through the host's side, as DirectStorage's after it signals: ours goes
+    // the next time a fence moves
+    auto *const held = title_fence(0);
+    Watch held_watch(held);
+    completed_value(held);
+    CHECK(held->Release() == 1);
+    auto *const moving = title_fence(0);
+    completed_value(moving);
+    CHECK(SUCCEEDED(moving->Signal(1)));
+    CHECK(held_watch.gone());
+    CHECK(title().call<ULONG>(moving, 2) == 0);
 }

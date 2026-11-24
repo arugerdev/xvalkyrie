@@ -20,6 +20,7 @@
 #include <dxgi1_6.h>
 #include <intrin.h>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -346,7 +347,7 @@ template <class Method> Method original(void *object, std::size_t index) {
 // differently runs the console's method only when the title calls it, and the host's
 // otherwise (its callers pass the object first; the title's, for methods that return a
 // structure, second). The console's methods are one table per kind of object.
-enum class Family { device, list, heap, queue, resource, allocator };
+enum class Family { device, list, heap, queue, resource, allocator, fence };
 constexpr std::size_t max_slots = 160;
 template <Family Kind> std::array<Slot, max_slots> console_table{};
 using Raw = std::uint64_t(STDMETHODCALLTYPE *)(void *, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -6299,6 +6300,99 @@ HRESULT STDMETHODCALLTYPE create_command_allocator(ID3D12Device *self, UINT type
         console_command_allocator(*allocator);
     return result;
 }
+// ID3D12Fence as the console has it: the desktop's methods to GetCreationFlags (11), then
+// GetGpuAddressX (12), where the fence's completed value is in memory. The console's GPU writes
+// it there and its CPU reads it at the same address; titles wait on it with MONITORX and
+// MWAITX. Here the title reads a copy, which follows the host's fence: whatever moves the
+// fence, the CPU or a queue, sets an event (SetEventOnCompletion) for a thread of ours, which
+// copies the new value.
+struct alignas(64) CompletedValue { // a cache line of its own, which the title watches
+    std::atomic<std::uint64_t> value{0};
+};
+struct FollowedFence {
+    std::unique_ptr<CompletedValue> completed = std::make_unique<CompletedValue>();
+    std::uint64_t armed = 0; // the value the event is set for
+};
+std::mutex fence_mutex;
+// each with a reference of ours, which goes when nothing else has one
+std::map<ID3D12Fence *, FollowedFence> followed_fences;
+HANDLE fence_moved = nullptr;
+// the fence's completed value to its copy, and the event for the next one
+void copy_completed_value(ID3D12Fence *fence, FollowedFence &followed) {
+    const auto completed = fence->GetCompletedValue();
+    followed.completed->value.store(completed, std::memory_order_release);
+    // UINT64_MAX: the device was removed, and the value stays
+    if (fence_moved && completed != UINT64_MAX && followed.armed != completed + 1 &&
+        SUCCEEDED(fence->SetEventOnCompletion(completed + 1, fence_moved)))
+        followed.armed = completed + 1;
+}
+void follow_fences() {
+    for (;;) {
+        WaitForSingleObject(fence_moved, INFINITE);
+        std::vector<ID3D12Fence *> unused;
+        {
+            const std::lock_guard lock(fence_mutex);
+            for (auto at = followed_fences.begin(); at != followed_fences.end();) {
+                // ours is the only reference left: the title's last went through the host
+                at->first->AddRef();
+                if (at->first->Release() == 1) {
+                    unused.push_back(at->first);
+                    at = followed_fences.erase(at);
+                    continue;
+                }
+                copy_completed_value(at->first, at->second);
+                ++at;
+            }
+        }
+        for (auto *const fence : unused)
+            fence->Release();
+    }
+}
+D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE fence_gpu_address(ID3D12Fence *self) {
+    static std::once_flag started;
+    std::call_once(started, [] {
+        fence_moved = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fence_moved)
+            std::thread(follow_fences).detach();
+    });
+    const std::lock_guard lock(fence_mutex);
+    const auto [at, added] = followed_fences.try_emplace(self);
+    if (added)
+        self->AddRef();
+    copy_completed_value(self, at->second);
+    return reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(&at->second.completed->value);
+}
+// Signal (10) from the title: the copy has the value at once, as the fence's memory does
+HRESULT STDMETHODCALLTYPE signal_fence(ID3D12Fence *self, UINT64 value) {
+    const auto result =
+        original<HRESULT(STDMETHODCALLTYPE *)(void *, UINT64)>(self, 10)(self, value);
+    const std::lock_guard lock(fence_mutex);
+    if (const auto at = followed_fences.find(self); at != followed_fences.end())
+        copy_completed_value(self, at->second);
+    return result;
+}
+// Release (2) from the title: our reference goes with its last
+ULONG STDMETHODCALLTYPE release_fence(ID3D12Fence *self) {
+    using Release = ULONG(STDMETHODCALLTYPE *)(void *);
+    const auto left = original<Release>(self, 2)(self);
+    if (left != 1)
+        return left;
+    {
+        const std::lock_guard lock(fence_mutex);
+        if (!followed_fences.erase(self))
+            return left;
+    }
+    return original<Release>(self, 2)(self);
+}
+// CreateFence (36): the fence with the console's methods
+HRESULT STDMETHODCALLTYPE create_fence(ID3D12Device *self, UINT64 initial, D3D12_FENCE_FLAGS flags,
+                                       REFIID iid, void **fence) {
+    using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT64, D3D12_FENCE_FLAGS, REFIID, void **);
+    const auto result = original<Create>(self, 36)(self, initial, flags, iid, fence);
+    if (SUCCEEDED(result) && fence && *fence)
+        console_fence(*fence);
+    return result;
+}
 // CreateCommandList (12), the desktop's way: a proxy as well
 HRESULT STDMETHODCALLTYPE create_command_list_desktop(ID3D12Device *self, UINT node,
                                                       D3D12_COMMAND_LIST_TYPE type,
@@ -7381,6 +7475,7 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     overrides.push_back({73, reinterpret_cast<Slot>(&create_command_list)});
     overrides.push_back({12, reinterpret_cast<Slot>(&create_command_list_desktop)});
     overrides.push_back({9, reinterpret_cast<Slot>(&create_command_allocator)});
+    overrides.push_back({36, reinterpret_cast<Slot>(&create_fence)});
     overrides.push_back({29, reinterpret_cast<Slot>(&create_placed_resource)});
     overrides.push_back({30, reinterpret_cast<Slot>(&create_reserved_resource)});
     overrides.push_back({60, reinterpret_cast<Slot>(&create_graphics_pipeline_x)});
@@ -7439,6 +7534,12 @@ void console_command_allocator(void *allocator) {
                                       {{9, reinterpret_cast<Slot>(&set_allocator_callback_x)},
                                        {10, reinterpret_cast<Slot>(&ignored_allocator_method)},
                                        {11, reinterpret_cast<Slot>(&ignored_allocator_method)}});
+}
+void console_fence(void *fence) {
+    console_vtable<Family::fence>(fence, 12, 13,
+                                  {{2, reinterpret_cast<Slot>(&release_fence)},
+                                   {10, reinterpret_cast<Slot>(&signal_fence)},
+                                   {12, reinterpret_cast<Slot>(&fence_gpu_address)}});
 }
 void call_as_title(const void *code, std::size_t size) {
     test_code_end = static_cast<const std::uint8_t *>(code) + size;

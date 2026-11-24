@@ -26,8 +26,9 @@ void console_d3d12_resource(void *resource);
 // reference of its own to the host's. Without `enhanced_barriers` its Barrier is as on a host
 // that has none. Exposed for the tests.
 void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barriers = true);
-// a command allocator handed to the title: the console's methods past the desktop's
+// a command allocator or fence handed to the title: the console's methods past the desktop's
 void console_command_allocator(void *allocator);
+void console_fence(void *fence);
 // Code at [code, code + size) calls the console's Direct3D 12 objects as the title's own code
 // does. Exposed for the tests, which have no title.
 void call_as_title(const void *code, std::size_t size);

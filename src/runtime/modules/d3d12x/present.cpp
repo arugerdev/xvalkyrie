@@ -52,7 +52,9 @@ std::mutex mutex;
 Presenter presenter;
 std::atomic<std::uint64_t> presents{0};
 // SetFrameIntervalX: the length of a frame, 60 Hz until the title says otherwise
+// (D3D12XBOX_FRAME_INTERVAL_60_HZ), and how many intervals a frame has to reach the display
 std::atomic<UINT> interval_microseconds{16667};
+std::atomic<UINT> period_intervals{1};
 
 // a format a flip swap chain takes, for what the title presents; UNKNOWN if there is none
 DXGI_FORMAT chain_format(DXGI_FORMAT format) {
@@ -343,72 +345,197 @@ HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_para
     return S_OK;
 }
 
+// The frame events: how a GDK title paces itself with no swap chain to wait for (names as
+// Microsoft's Xbox GDK samples, FramePacing above all, and public bindings of the GDK's
+// headers have them). A clock ticks once per frame interval. Each kind of event comes once
+// per tick, at its offset into the interval, and a wait for it ends on the next one no wait
+// has ended on yet: at once when one came while nobody waited, which lets a late title go on
+// at its own pace instead of losing an interval. Ticks are counted from the clock's start, so
+// lateness does not add up.
+namespace {
+using Clock = std::chrono::steady_clock;
+// D3D12XBOX_FRAME_EVENT_TYPE: the origin (D3D12XBOX_FRAME_EVENT_ORIGIN, where a frame
+// begins), the vertical blank and the flip
+constexpr UINT origin_event = 0, flip_event = 2;
+// ScheduleFrameEventX's DISABLE_SIGNAL: the title's objects are not signalled
+constexpr UINT disable_signal = 0x1;
+// WaitFrameEventX's flags: a wait for the origin that times out begins the frame all the same.
+// What any other flag means is not known here, so they change nothing.
+constexpr UINT begin_on_timeout = 0x2;
+// D3D12XBOX_SCHEDULE_FRAME_OBJECT_LIST: objects of the title's to signal with an event
+struct ScheduleObjectList {
+    UINT count;
+    HANDLE *objects;
+};
+// D3D12XBOX_WAIT_FRAME_OBJECT_LIST: objects of the title's that end a wait as well, and where
+// the index of the one that did goes
+struct WaitObjectList {
+    UINT count;
+    HANDLE *objects;
+    UINT *signaled_index;
+};
+struct FrameEvent {
+    Clock::duration offset{};    // into each interval
+    std::vector<HANDLE> objects; // duplicates of the title's, so that they outlive its own
+    bool signalled = false;      // the objects are signalled
+    std::uint64_t waited = 0;    // the last tick a wait ended on
+    std::uint64_t sent = 0;      // the last tick the objects were signalled on
+};
+struct FrameClock {
+    bool started = false;
+    std::uint64_t first = 0;         // the tick from which on `interval` counts
+    Clock::time_point start, before; // when tick `first` comes, and the one before it came
+    Clock::duration interval = std::chrono::microseconds(16667);
+    FrameEvent events[3];
+};
+std::mutex clock_mutex;
+FrameClock frame_clock;
+// frames begun, each one's number its token (D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL is none's)
+std::atomic<UINT64> frames_begun{0};
+
+// the clock, started at its first use (all of these with clock_mutex held)
+FrameClock &clock_at(Clock::time_point now) {
+    auto &clock = frame_clock;
+    if (!clock.started) {
+        clock.started = true;
+        clock.start = now;
+        clock.before = now - clock.interval;
+    }
+    return clock;
+}
+// when the event of `kind` of a tick comes, from the one before `first` on: at its offset into
+// the tick's interval, or at the interval's end for an offset longer than that
+Clock::time_point event_time(const FrameClock &clock, UINT kind, std::uint64_t tick) {
+    const auto offset = clock.events[kind].offset;
+    if (tick < clock.first)
+        return clock.before + std::min(offset, clock.start - clock.before);
+    return clock.start + clock.interval * static_cast<Clock::rep>(tick - clock.first) +
+           std::min(offset, clock.interval);
+}
+// the last tick whose event of `kind` has come by `now`
+std::uint64_t last_tick(const FrameClock &clock, UINT kind, Clock::time_point now) {
+    if (const auto at = event_time(clock, kind, clock.first); now >= at)
+        return clock.first + static_cast<std::uint64_t>((now - at) / clock.interval);
+    if (clock.first && now >= event_time(clock, kind, clock.first - 1))
+        return clock.first - 1;
+    return clock.first > 1 ? clock.first - 2 : 0;
+}
+
+// Until `until`, or until one of `objects` is signalled, whichever is first: to the
+// microsecond with a timer of the host's finer than its 15 ms tick, where it has one. The
+// index of the object, `count` when the time came, WAIT_FAILED for an object that cannot be
+// waited on.
+DWORD wait_until(Clock::time_point until, const HANDLE *objects, DWORD count) {
+    HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+    std::copy_n(objects, count, handles);
+    const auto left =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(until - Clock::now()).count();
+    HANDLE timer = nullptr;
+    if (left > 0) {
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -std::max<LONGLONG>(left / 100, 1); // from now, in 100 ns
+        if (timer && !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            CloseHandle(timer);
+            timer = nullptr;
+        }
+    }
+    const auto milliseconds =
+        static_cast<DWORD>(std::max<LONGLONG>((left + 999'999) / 1'000'000, 0));
+    DWORD ended = WAIT_TIMEOUT;
+    if (timer) {
+        handles[count] = timer;
+        ended = WaitForMultipleObjects(count + 1, handles, FALSE, INFINITE);
+        CloseHandle(timer);
+    } else if (count) {
+        ended = WaitForMultipleObjects(count, handles, FALSE, milliseconds);
+    } else if (milliseconds) {
+        Sleep(milliseconds);
+    }
+    if (ended < WAIT_OBJECT_0 + count)
+        return ended - WAIT_OBJECT_0;
+    if (ended >= WAIT_ABANDONED_0 && ended < WAIT_ABANDONED_0 + count)
+        return ended - WAIT_ABANDONED_0;
+    return ended == WAIT_FAILED ? WAIT_FAILED : count;
+}
+
+// Signals the title's objects at each event of theirs. The flip's only when a frame was shown
+// since the last flip: a flip is of a frame, and an engine counts its frames shown by them.
+void signal_events() {
+    for (;;) {
+        Clock::time_point wake;
+        {
+            const std::lock_guard lock(clock_mutex);
+            const auto now = Clock::now();
+            auto &clock = clock_at(now);
+            wake = now + clock.interval; // nothing to signal: a look again an interval later
+            for (UINT kind = 0; kind < std::size(clock.events); ++kind) {
+                auto &event = clock.events[kind];
+                if (!event.signalled || event.objects.empty())
+                    continue;
+                if (const auto tick = last_tick(clock, kind, now); tick > event.sent) {
+                    event.sent = tick; // only the last of those missed (a stall): no burst
+                    if (kind != flip_event || flipped.exchange(false))
+                        for (const auto object : event.objects)
+                            if (!SetEvent(object))
+                                ReleaseSemaphore(object, 1, nullptr);
+                }
+                wake = std::min(wake, event_time(clock, kind, event.sent + 1));
+            }
+        }
+        wait_until(wake, nullptr, 0);
+    }
+}
+} // namespace
+
+// SetFrameIntervalX(output, LengthInMicroseconds, PeriodInIntervals, flags). The period is
+// how many intervals a frame has to reach the display (the FramePacing sample's frame budget
+// is the length times the period, less the origin's offset); frames are shown here as they
+// are presented, so it changes no wait, and GetFrameStatisticsX gives it back. There is one
+// display to keep to, whatever the output, and no flag but FLAG_NONE is known.
 HRESULT STDMETHODCALLTYPE set_frame_interval(ID3D12Device *, void *, UINT microseconds, UINT period,
                                              UINT flags) {
     if (static std::atomic<int> shown{0}; frame_trace(shown))
         std::fprintf(stderr,
                      "[Runtime] SetFrameIntervalX: %u microseconds, period %u, flags 0x%x\n",
                      microseconds, period, flags);
-    if (microseconds)
-        interval_microseconds = microseconds;
+    // what a length of 0 does on the console is not known here, so the interval stays
+    if (!microseconds)
+        return S_OK;
+    {
+        const std::lock_guard lock(clock_mutex);
+        const auto now = Clock::now();
+        auto &clock = frame_clock;
+        // the new length counts from the next tick, which comes when it would have: a wait
+        // for it ends as it would have, and a title that sets the same length again keeps
+        // its ticks
+        if (clock.started && now >= clock.start) {
+            const auto passed = static_cast<std::uint64_t>((now - clock.start) / clock.interval);
+            clock.before = clock.start + clock.interval * static_cast<Clock::rep>(passed);
+            clock.start = clock.before + clock.interval;
+            clock.first += passed + 1;
+        }
+        clock.interval = std::chrono::microseconds(microseconds);
+        clock_at(now);
+    }
+    interval_microseconds = microseconds;
+    period_intervals = period;
     return S_OK;
 }
-// ScheduleFrameEventX: the objects a title wants signalled at a point of every frame (its
-// start, the vertical blank or the flip), each at an offset from it. A thread of ours keeps
-// the frame's time and signals them; one schedule per kind of event, replaced by the next.
-struct FrameObjects {
-    UINT count;
-    HANDLE *objects;
-};
-struct Schedule {
-    std::vector<HANDLE> objects; // duplicates of the title's, so that they outlive its own
-    UINT offset_microseconds = 0;
-    bool enabled = false;
-};
-std::mutex schedule_mutex;
-Schedule schedules[3];
-void run_schedules() {
-    using Clock = std::chrono::steady_clock;
-    auto origin = Clock::now();
-    for (;;) {
-        const auto frame = std::chrono::microseconds(std::max(interval_microseconds.load(), 1000u));
-        // each schedule at its offset, in the order of their offsets
-        std::vector<std::pair<UINT, std::vector<HANDLE>>> due;
-        {
-            const std::lock_guard lock(schedule_mutex);
-            const bool shown = flipped.exchange(false);
-            for (std::size_t type = 0; type < std::size(schedules); ++type) {
-                const auto &schedule = schedules[type];
-                // the flip's objects only when a frame was shown since the last time
-                if (schedule.enabled && !schedule.objects.empty() && (type != 2 || shown))
-                    due.emplace_back(schedule.offset_microseconds, schedule.objects);
-            }
-        }
-        std::stable_sort(due.begin(), due.end(),
-                         [](const auto &a, const auto &b) { return a.first < b.first; });
-        for (const auto &[offset, objects] : due) {
-            std::this_thread::sleep_until(origin + std::min<std::chrono::microseconds>(
-                                                       std::chrono::microseconds(offset), frame));
-            for (const auto object : objects)
-                if (!SetEvent(object))
-                    ReleaseSemaphore(object, 1, nullptr);
-        }
-        origin += frame;
-        if (origin < Clock::now() - frame * 4)
-            origin = Clock::now(); // fell behind (a debugger, a stall): no burst to catch up
-        std::this_thread::sleep_until(origin);
-    }
-}
+// ScheduleFrameEventX(type, IntervalOffsetInMicroseconds, objects, flags): where in each
+// interval an event comes, and the title's objects to signal with it (none given: those it
+// had stay), from the next one on
 HRESULT STDMETHODCALLTYPE schedule_frame_event(ID3D12Device *, UINT type, UINT offset,
                                                void *signal_list, UINT flags) {
-    const auto *const list = static_cast<const FrameObjects *>(signal_list);
+    const auto *const list = static_cast<const ScheduleObjectList *>(signal_list);
     if (static std::atomic<int> shown{0}; frame_trace(shown))
         std::fprintf(
             stderr,
             "[Runtime] ScheduleFrameEventX: type %u, offset %u, %u objects, flags 0x%x, from %s\n",
             type, offset, list ? list->count : 0, flags,
             detail::guest_location(_ReturnAddress()).c_str());
-    if (type >= std::size(schedules))
+    if (type >= std::size(frame_clock.events))
         return E_INVALIDARG;
     std::vector<HANDLE> objects;
     for (UINT i = 0; list && list->objects && i < list->count; ++i) {
@@ -418,51 +545,84 @@ HRESULT STDMETHODCALLTYPE schedule_frame_event(ID3D12Device *, UINT type, UINT o
             objects.push_back(copy);
     }
     {
-        const std::lock_guard lock(schedule_mutex);
-        auto &schedule = schedules[type];
+        const std::lock_guard lock(clock_mutex);
+        const auto now = Clock::now();
+        auto &clock = clock_at(now);
+        auto &event = clock.events[type];
         if (list) {
-            for (const auto old : schedule.objects)
+            for (const auto old : event.objects)
                 CloseHandle(old);
-            schedule.objects = std::move(objects);
+            event.objects = std::move(objects);
         }
-        schedule.offset_microseconds = offset;
-        schedule.enabled = !(flags & 1); // DISABLE_SIGNAL
+        event.offset = std::chrono::microseconds(offset);
+        event.signalled = !(flags & disable_signal);
+        event.sent = last_tick(clock, type, now);
     }
     static std::once_flag started;
-    std::call_once(started, [] { std::thread(run_schedules).detach(); });
+    std::call_once(started, [] { std::thread(signal_events).detach(); });
     return S_OK;
 }
-// The start of the next frame. A title that presents is held to the display's rate by the
-// swap chain; one that waits without presenting in between is held here.
-HRESULT STDMETHODCALLTYPE wait_frame_event(ID3D12Device *, UINT type, UINT timeout, void *list,
+// WaitFrameEventX(type, TimeOutInMs, objects, flags, token): S_FALSE when the time is up first,
+// S_OK when the event or one of the title's objects came, the object's index written then.
+// Only a wait for the origin begins a frame and writes its token; the other kinds of event
+// come whether a title has scheduled them or not, and leave the token as it was.
+HRESULT STDMETHODCALLTYPE wait_frame_event(ID3D12Device *, UINT type, UINT timeout, void *wait_list,
                                            UINT flags, UINT64 *token) {
     if (static std::atomic<int> shown{0}; frame_trace(shown))
         std::fprintf(
             stderr,
             "[Runtime] WaitFrameEventX: type %u, timeout %u, list %p, flags 0x%x, from %s\n", type,
-            timeout, list, flags, detail::guest_location(_ReturnAddress()).c_str());
-    using Clock = std::chrono::steady_clock;
-    static std::mutex wait_mutex;
-    static Clock::time_point last{};
-    static std::uint64_t presents_seen = ~std::uint64_t{0};
-    static UINT64 next_token = 0;
-    const std::lock_guard lock(wait_mutex);
+            timeout, wait_list, flags, detail::guest_location(_ReturnAddress()).c_str());
+    const auto *const list = static_cast<const WaitObjectList *>(wait_list);
+    const UINT count = list && list->objects ? list->count : 0;
+    // one place of the host's wait is the clock's
+    if (type >= std::size(frame_clock.events) || count >= MAXIMUM_WAIT_OBJECTS)
+        return E_INVALIDARG;
     const auto called = counter();
-    const auto frame = std::chrono::microseconds(interval_microseconds.load());
-    if (presents_seen == presents.load() && Clock::now() < last + frame)
-        std::this_thread::sleep_until(last + frame);
-    last = Clock::now();
-    presents_seen = presents.load();
-    const auto given = ++next_token;
+    const auto now = Clock::now();
+    std::uint64_t tick = 0;
+    Clock::time_point comes;
     {
-        const std::lock_guard records_lock(record_mutex);
-        auto &record = record_of(given);
-        record.wait_call = called;
-        record.wait_return = counter();
+        const std::lock_guard lock(clock_mutex);
+        const auto &clock = clock_at(now);
+        const auto last = last_tick(clock, type, now);
+        const auto waited = clock.events[type].waited;
+        tick = last > waited ? last : waited + 1;
+        comes = last > waited ? now : event_time(clock, type, tick);
     }
-    if (token)
-        *token = given;
-    return S_OK;
+    auto result = S_OK;
+    if (comes > now) {
+        const auto until =
+            timeout == INFINITE ? comes : std::min(comes, now + std::chrono::milliseconds(timeout));
+        const auto ended = wait_until(until, count ? list->objects : nullptr, count);
+        if (ended == WAIT_FAILED)
+            return E_INVALIDARG;
+        if (ended < count) {
+            if (list->signaled_index)
+                *list->signaled_index = ended;
+            return S_OK;
+        }
+        if (until < comes)
+            result = S_FALSE;
+    }
+    if (result == S_OK) {
+        const std::lock_guard lock(clock_mutex);
+        auto &waited = frame_clock.events[type].waited;
+        waited = std::max(waited, tick);
+    }
+    // a frame begun on a time-out takes no event: the next wait still ends on it
+    if (type == origin_event && (result == S_OK || flags & begin_on_timeout)) {
+        const auto given = ++frames_begun;
+        {
+            const std::lock_guard records_lock(record_mutex);
+            auto &record = record_of(given);
+            record.wait_call = called;
+            record.wait_return = counter();
+        }
+        if (token)
+            *token = given;
+    }
+    return result;
 }
 HRESULT STDMETHODCALLTYPE frame_statistics(ID3D12Device *, UINT64 token, UINT types, UINT *count,
                                            void *statistics) {
@@ -496,9 +656,9 @@ HRESULT STDMETHODCALLTYPE frame_statistics(ID3D12Device *, UINT64 token, UINT ty
         if (type >= 0x100 && !record.shown)
             continue; // not rendered, presented or displayed yet
         Entry entry{type, 0, {}};
-        if (type == 0x1) { // the frame interval: its length, period and flags
+        if (type == 0x1) { // the frame interval: LengthInMicroseconds, PeriodInIntervals
             put(entry, 0, static_cast<UINT32>(interval_microseconds.load()));
-            put(entry, 4, UINT32{1});
+            put(entry, 4, static_cast<UINT32>(period_intervals.load()));
         } else if (type == 0x2) { // the frame event: when it was waited for and came
             put(entry, 8, record.wait_call);
             put(entry, 16, record.wait_return);

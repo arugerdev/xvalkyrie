@@ -35,47 +35,6 @@ struct TitleMemory {
         return value;
     }
 };
-const std::uint32_t *words(std::uint64_t address) {
-    return reinterpret_cast<const std::uint32_t *>(address);
-}
-// a shader-visible heap (CreateDescriptorHeap, 14) and its CPU and GPU starts (9 and 10)
-struct Heap {
-    void *heap = nullptr;
-    std::uint64_t cpu = 0, gpu = 0;
-    explicit Heap(UINT count) {
-        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, count,
-                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE};
-        REQUIRE(title().call(device(), 14, &desc, &__uuidof(ID3D12DescriptorHeap), &heap) == S_OK);
-        cpu = title().call<std::uint64_t>(heap, 9);
-        gpu = title().call<std::uint64_t>(heap, 10);
-    }
-    ~Heap() { static_cast<IUnknown *>(heap)->Release(); }
-};
-// CreateComputePipelineState (11)
-ID3D12PipelineState *compute_pipeline(ID3D12RootSignature *signature, std::string_view source) {
-    auto *const code = compile(source, "cs_5_0");
-    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
-    desc.pRootSignature = signature;
-    desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-    ID3D12PipelineState *state = nullptr;
-    CHECK(title().call(device(), 11, &desc, &__uuidof(ID3D12PipelineState),
-                       reinterpret_cast<void **>(&state)) == S_OK);
-    code->Release();
-    REQUIRE(state);
-    return state;
-}
-D3D12_ROOT_PARAMETER root_view(D3D12_ROOT_PARAMETER_TYPE type, UINT shader_register) {
-    D3D12_ROOT_PARAMETER parameter{};
-    parameter.ParameterType = type;
-    parameter.Descriptor.ShaderRegister = shader_register;
-    return parameter;
-}
-D3D12_ROOT_PARAMETER table(const D3D12_DESCRIPTOR_RANGE *ranges, UINT count) {
-    D3D12_ROOT_PARAMETER parameter{};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameter.DescriptorTable = {count, ranges};
-    return parameter;
-}
 } // namespace
 
 TEST_CASE("constant buffer and root views of memory no buffer holds read a copy of it, or "

@@ -538,10 +538,13 @@ std::size_t placed_bytes(const D3D12_RESOURCE_DESC &desc, UINT tile_mode) {
 
 std::vector<Placement> pending; // placed where there is no memory yet
 void track_placement(ID3D12Resource *resource, const void *address,
-                     const D3D12_RESOURCE_DESC *layout) {
+                     const D3D12_RESOURCE_DESC *layout, DXGI_FORMAT format) {
     if (!resource || !address)
         return;
-    const auto desc = resource->GetDesc();
+    auto desc = resource->GetDesc();
+    // the texels are laid out in the title's memory as its format has them
+    if (format != DXGI_FORMAT_UNKNOWN)
+        desc.Format = format;
     if (layout && series_xg() && desc.SampleDesc.Count == 1 &&
         (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
          desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)) {
@@ -661,7 +664,7 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
         // the placement dirty for the next upload
         placement.dirty = false;
         protect(placement, PAGE_READONLY);
-        PlacementUpload upload{placement.d3d12};
+        PlacementUpload upload{placement.d3d12, {}, {}, placement.desc.Format};
         if (linear_subresources(placement, upload)) {
             placement.d3d12->AddRef();
             uploads.push_back(std::move(upload));

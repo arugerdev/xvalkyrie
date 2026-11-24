@@ -237,6 +237,9 @@ The method order of some console WinRT classes (`Windows.Kinect`,
 `Windows.Xbox.Management.Deployment.PackageTransferManager`, `Windows.Xbox.Input.Controller`)
 was checked against the interface descriptions of
 [WinDurango](https://github.com/WinDurango/WinDurango). No code of it is used here.
+The consoles' own DXGI formats go by the names
+[DirectXTex](https://github.com/microsoft/DirectXTex) (MIT) gives them in `DirectXTexP.h`. No
+code of it is used here.
 
 ## Legal
 

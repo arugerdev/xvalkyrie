@@ -9,6 +9,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +24,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <wrl/implements.h>
@@ -468,6 +471,99 @@ template <std::size_t Index> std::uint64_t STDMETHODCALLTYPE returned_in_rax(voi
     return value;
 }
 
+// The consoles' own DXGI formats, which the host has none of, by the names DirectXTex (MIT)
+// gives them in DirectXTexP.h
+constexpr auto XBOX_DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT = static_cast<DXGI_FORMAT>(116);
+constexpr auto XBOX_DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT = static_cast<DXGI_FORMAT>(117);
+constexpr auto XBOX_DXGI_FORMAT_D16_UNORM_S8_UINT = static_cast<DXGI_FORMAT>(118);
+constexpr auto XBOX_DXGI_FORMAT_R16_UNORM_X8_TYPELESS = static_cast<DXGI_FORMAT>(119);
+constexpr auto XBOX_DXGI_FORMAT_X16_TYPELESS_G8_UINT = static_cast<DXGI_FORMAT>(120);
+constexpr auto XBOX_DXGI_FORMAT_R10G10B10_SNORM_A2_UNORM = static_cast<DXGI_FORMAT>(189);
+constexpr auto XBOX_DXGI_FORMAT_R4G4_UNORM = static_cast<DXGI_FORMAT>(190);
+// What a format is used as, which decides what the host is given for it
+enum class FormatUse {
+    resource,
+    shader_view, // a shader resource view
+    target_view, // a render target or unordered access view
+    depth_view   // a depth stencil view
+};
+bool small_colour(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_B5G6R5_UNORM || format == DXGI_FORMAT_B5G5R5A1_UNORM ||
+           format == DXGI_FORMAT_B4G4R4A4_UNORM;
+}
+// Whether the host draws to a 16-bit colour and writes it from shaders, as the console does:
+// D3D12_FEATURE_FORMAT_SUPPORT, asked once a format
+bool host_draws(ID3D12Device *device, DXGI_FORMAT format) {
+    static std::atomic<int> answers[3]{}; // 1 yes, -1 no, 0 not asked yet
+    auto &answer = answers[format == DXGI_FORMAT_B5G6R5_UNORM     ? 0
+                           : format == DXGI_FORMAT_B5G5R5A1_UNORM ? 1
+                                                                  : 2];
+    if (const int known = answer.load())
+        return known > 0;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+    if (!device ||
+        FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof support)))
+        return false;
+    const bool draws = (support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) &&
+                       (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+                       (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+    answer = draws ? 1 : -1;
+    return draws;
+}
+// The host's format for one the title gives. The console's own are the host's nearest: its
+// 10-bit floats 16-bit ones, its signed 10-bit colour 16 bits a channel, R4G4 8 bits a
+// channel. Its 16-bit depth with 8-bit stencil is the host's 24-bit one, typeless for the
+// resource so that views can read either plane. A 16-bit colour drawn to or written from
+// shaders is 8 bits a channel where the host does neither with it (see host_draws): `flags`
+// say whether a resource is.
+DXGI_FORMAT host_format(ID3D12Device *device, DXGI_FORMAT format, FormatUse use,
+                        D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
+    // (as a number: the console's own are no values of the host's enumeration)
+    switch (static_cast<int>(format)) {
+    case XBOX_DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT:
+    case XBOX_DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case XBOX_DXGI_FORMAT_D16_UNORM_S8_UINT:
+    case XBOX_DXGI_FORMAT_R16_UNORM_X8_TYPELESS:
+    case XBOX_DXGI_FORMAT_X16_TYPELESS_G8_UINT:
+        return use == FormatUse::resource     ? DXGI_FORMAT_R24G8_TYPELESS
+               : use == FormatUse::depth_view ? DXGI_FORMAT_D24_UNORM_S8_UINT
+               : format == XBOX_DXGI_FORMAT_X16_TYPELESS_G8_UINT
+                   ? DXGI_FORMAT_X24_TYPELESS_G8_UINT
+                   : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case XBOX_DXGI_FORMAT_R10G10B10_SNORM_A2_UNORM:
+        return DXGI_FORMAT_R16G16B16A16_SNORM;
+    case XBOX_DXGI_FORMAT_R4G4_UNORM:
+        return DXGI_FORMAT_R8G8_UNORM;
+    case DXGI_FORMAT_B5G6R5_UNORM:
+    case DXGI_FORMAT_B5G5R5A1_UNORM:
+    case DXGI_FORMAT_B4G4R4A4_UNORM: {
+        const bool drawn =
+            use == FormatUse::target_view ||
+            (use == FormatUse::resource && (flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)));
+        return drawn && !host_draws(device, format) ? DXGI_FORMAT_R8G8B8A8_UNORM : format;
+    }
+    default:
+        return format;
+    }
+}
+// a resource's description with the host's format
+template <class Desc> void host_resource_format(ID3D12Device *device, Desc &desc) {
+    desc.Format = host_format(device, desc.Format, FormatUse::resource, desc.Flags);
+}
+// a clear value in the format of the host's view the resource is cleared through
+const D3D12_CLEAR_VALUE *host_clear_value(ID3D12Device *device, const D3D12_CLEAR_VALUE *clear,
+                                          D3D12_RESOURCE_FLAGS flags, D3D12_CLEAR_VALUE &host) {
+    if (!clear)
+        return nullptr;
+    host = *clear;
+    host.Format =
+        host_format(device, clear->Format,
+                    flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL ? FormatUse::depth_view
+                                                                    : FormatUse::target_view);
+    return &host;
+}
 // Methods that return a larger structure: the console's take the place for it first and the
 // object second, the desktop's C++ methods the other way round
 D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
@@ -476,6 +572,7 @@ resource_allocation_info(D3D12_RESOURCE_ALLOCATION_INFO *info, ID3D12Device *sel
     std::vector<D3D12_RESOURCE_DESC> host(descs, descs + (descs ? count : 0));
     for (auto &desc : host) {
         desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc.Flags & 0xff);
+        host_resource_format(self, desc);
         // the console's own layouts (0x100 and up) are the host's to choose
         if (desc.Layout >= 0x100)
             desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -675,6 +772,24 @@ HRESULT STDMETHODCALLTYPE check_feature_support(ID3D12Device *self, D3D12_FEATUR
                                                 void *data, UINT size) {
     using Check = HRESULT(STDMETHODCALLTYPE *)(void *, D3D12_FEATURE, void *, UINT);
     const auto check = original<Check>(self, 13);
+    // What a format of the console's own can do is what its stand-in on the host can (see
+    // host_format): the structures that name one begin with it
+    if ((feature == D3D12_FEATURE_FORMAT_SUPPORT || feature == D3D12_FEATURE_FORMAT_INFO ||
+         feature == D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS) &&
+        data && size >= sizeof(DXGI_FORMAT)) {
+        DXGI_FORMAT format;
+        std::memcpy(&format, data, sizeof format);
+        const auto host =
+            host_format(self, format,
+                        format == XBOX_DXGI_FORMAT_D16_UNORM_S8_UINT ? FormatUse::depth_view
+                                                                     : FormatUse::shader_view);
+        if (host != format) {
+            std::memcpy(data, &host, sizeof host);
+            const auto result = check(self, feature, data, size);
+            std::memcpy(data, &format, sizeof format);
+            return result;
+        }
+    }
     auto result = check(self, feature, data, size);
     if (result != E_INVALIDARG || !data)
         return result;
@@ -1650,18 +1765,77 @@ DXGI_FORMAT typed_format(DXGI_FORMAT format, bool srgb = false) {
         return format;
     }
 }
+// A view of all of a typeless texture (as the console's 16-bit depth with stencil is here) in
+// `format`, for a title that gives none: the host has no format for it otherwise
+D3D12_SHADER_RESOURCE_VIEW_DESC whole_shader_view(const D3D12_RESOURCE_DESC &of,
+                                                  DXGI_FORMAT format) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = format;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    const UINT slices = of.DepthOrArraySize;
+    if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        view.Texture3D.MipLevels = UINT_MAX;
+    } else if (of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) {
+        view.ViewDimension =
+            slices > 1 ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY : D3D12_SRV_DIMENSION_TEXTURE1D;
+        view.Texture1DArray = {0, UINT_MAX, 0, slices, 0};
+    } else if (of.SampleDesc.Count > 1) {
+        view.ViewDimension =
+            slices > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY : D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        view.Texture2DMSArray = {0, slices};
+    } else if (slices > 1) {
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray = {0, UINT_MAX, 0, slices, 0, 0};
+    } else {
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Texture2D.MipLevels = UINT_MAX;
+    }
+    return view;
+}
 void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, const void *desc,
                                   Handle handle) {
-    // The console views a multisampled texture as a plain one and a typeless one without a
-    // format; the host removes the device over either
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-    if (resource && desc) {
+    const auto of = resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
+    if (desc) {
         std::memcpy(&view, desc, sizeof view);
-        const auto of = resource->GetDesc();
-        if (view_format(resource, view.Format) != view.Format) {
-            view.Format = view_format(resource, view.Format);
+        // the console's own formats as the host has them (see host_format): the stencil of its
+        // depth is the second plane of the host's
+        if (const auto format = host_format(self, view.Format, FormatUse::shader_view);
+            format != view.Format) {
+            const UINT plane = format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ? 1 : 0;
+            if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+                view.Texture2D.PlaneSlice = plane;
+            else if (view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+                view.Texture2DArray.PlaneSlice = plane;
+            view.Format = format;
             desc = &view;
         }
+        // a 16-bit colour of a resource 8 bits a channel stand for: B5G6R5 has no alpha to
+        // read, which is 1
+        if (resource && small_colour(view.Format) && of.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+            if (view.Format == DXGI_FORMAT_B5G6R5_UNORM) {
+                const auto mapping = view.Shader4ComponentMapping;
+                const auto channel = [&](UINT component) {
+                    const auto from = D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(component, mapping);
+                    return from == D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3
+                               ? D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1
+                               : from;
+                };
+                view.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                    channel(0), channel(1), channel(2), channel(3));
+            }
+            view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            desc = &view;
+        }
+    } else if (resource && of.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+               typed_format(of.Format) != of.Format) {
+        view = whole_shader_view(of, typed_format(of.Format));
+        desc = &view;
+    }
+    // The console views a multisampled texture as a plain one and a typeless one without a
+    // format; the host removes the device over either
+    if (resource && desc) {
         if (of.SampleDesc.Count > 1 && view.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
             view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
             desc = &view;
@@ -1760,11 +1934,14 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
         mark_host(handle);
         return;
     }
+    // the console's own formats as the host has them (see host_format)
     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-    if (resource && desc) {
+    if (desc) {
         std::memcpy(&view, desc, sizeof view);
-        if (view_format(resource, view.Format) != view.Format) {
-            view.Format = view_format(resource, view.Format);
+        if (const auto format = view_format(
+                resource, host_format(self, view.Format, FormatUse::target_view));
+            format != view.Format) {
+            view.Format = format;
             desc = &view;
         }
     }
@@ -1879,20 +2056,59 @@ std::map<std::uint64_t, ID3D12Resource *> target_of;
 std::atomic<ID3D12Resource *> last_target{nullptr};
 std::map<std::uint64_t, std::string> view_text; // XV_D3D_LOST, under target_mutex
 std::vector<ID3D12Resource *> bound_targets;    // the first of each size, under target_mutex
+// the depth format a view of a typeless depth buffer reads it as, unknown for any other
+DXGI_FORMAT depth_view_format(DXGI_FORMAT resource) {
+    switch (resource) {
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case DXGI_FORMAT_R32_TYPELESS:
+        return DXGI_FORMAT_D32_FLOAT;
+    case DXGI_FORMAT_R16_TYPELESS:
+        return DXGI_FORMAT_D16_UNORM;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+// CreateRenderTargetView (20) and CreateDepthStencilView (21): the console's own formats as
+// the host has them (see host_format). A depth view of a typeless depth buffer (as the
+// console's 16-bit depth with stencil is here) without a format, or without a description,
+// views all of it in the depth format it stands for.
 template <std::size_t Index>
 void STDMETHODCALLTYPE create_target_view(ID3D12Device *self, ID3D12Resource *resource,
                                           const void *desc, Handle handle) {
-    // both descriptions begin with the format
-    std::uint8_t view[sizeof(D3D12_RENDER_TARGET_VIEW_DESC)];
-    static_assert(sizeof view >= sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC));
-    if (DXGI_FORMAT format{}; desc && (std::memcpy(&format, desc, sizeof format),
-                                       view_format(resource, format) != format)) {
-        std::memcpy(view, desc,
-                    Index == 20 ? sizeof(D3D12_RENDER_TARGET_VIEW_DESC)
-                                : sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC));
-        format = view_format(resource, format);
-        std::memcpy(view, &format, sizeof format);
-        desc = view;
+    using View = std::conditional_t<Index == 20, D3D12_RENDER_TARGET_VIEW_DESC,
+                                    D3D12_DEPTH_STENCIL_VIEW_DESC>;
+    View view{};
+    const auto depth = Index == 21 && resource ? depth_view_format(resource->GetDesc().Format)
+                                               : DXGI_FORMAT_UNKNOWN;
+    if (desc) {
+        std::memcpy(&view, desc, sizeof view);
+        view.Format = view_format(
+            resource, host_format(self, view.Format,
+                                  Index == 20 ? FormatUse::target_view : FormatUse::depth_view));
+        if (view.Format == DXGI_FORMAT_UNKNOWN)
+            view.Format = depth;
+        desc = &view;
+    } else if constexpr (Index == 21) {
+        if (depth != DXGI_FORMAT_UNKNOWN) {
+            const auto of = resource->GetDesc();
+            const bool many = of.SampleDesc.Count > 1;
+            view.Format = depth;
+            if (of.DepthOrArraySize > 1) {
+                view.ViewDimension = many ? D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY
+                                          : D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+                if (many)
+                    view.Texture2DMSArray = {0, of.DepthOrArraySize};
+                else
+                    view.Texture2DArray = {0, 0, of.DepthOrArraySize};
+            } else {
+                view.ViewDimension =
+                    many ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+            }
+            desc = &view;
+        }
     }
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, Index)(
         self, resource, desc, host_handle(handle));
@@ -2249,7 +2465,7 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
         track_placement(static_cast<ID3D12Resource *>(*resource),
                         reinterpret_cast<const void *>(address),
-                        console == Target::scarlett ? desc : nullptr);
+                        console == Target::scarlett ? desc : nullptr, desc->Format);
     return result;
 }
 // The state a D3D12_BARRIER_LAYOUT stands for, by the table of the two in the Enhanced
@@ -3002,7 +3218,7 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
             elements.assign(host.InputLayout.pInputElementDescs,
                             host.InputLayout.pInputElementDescs + host.InputLayout.NumElements);
             for (auto &element : elements)
-                if (element.Format == static_cast<DXGI_FORMAT>(189)) {
+                if (element.Format == XBOX_DXGI_FORMAT_R10G10B10_SNORM_A2_UNORM) {
                     element.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
                     if (element.SemanticName)
                         packed.push_back({element.SemanticName, element.SemanticIndex});
@@ -3010,6 +3226,10 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
             host.InputLayout.pInputElementDescs = elements.data();
         }
         host.PrimitiveTopologyType = host_topology_type(host.PrimitiveTopologyType);
+        // the formats it draws to, the host's (see host_format)
+        for (auto &format : host.RTVFormats)
+            format = host_format(self, format, FormatUse::target_view);
+        host.DSVFormat = host_format(self, host.DSVFormat, FormatUse::depth_view);
         const auto geometry = host.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
                                   ? modules::ShaderStage::geometry_points
                               : host.PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
@@ -3498,7 +3718,10 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
             host_desc.Width = (host_desc.Width + 255) & ~std::uint64_t{255};
         }
         host_rules(heap, host_desc.Flags, state);
+        host_resource_format(self, host_desc);
     }
+    D3D12_CLEAR_VALUE cleared{}, cleared_host{};
+    clear = host_clear_value(self, host_clear(clear, cleared), host_desc.Flags, cleared_host);
     // All of the console's memory is the CPU's as well: a title maps a buffer of the default
     // heap and writes to it. The host only maps what is in a heap the CPU can reach, so such
     // a buffer goes in one (unless it is written by the GPU, which those heaps do not take).
@@ -3517,8 +3740,6 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
                      "format %d flags 0x%x state 0x%x\n",
                      heap->Type, flags, desc->Dimension, desc->Width, desc->Height, desc->Format,
                      desc->Flags, state);
-    D3D12_CLEAR_VALUE cleared{};
-    clear = host_clear(clear, cleared);
     auto result = original<Create>(self, 27)(self, heap, flags, desc ? &host_desc : nullptr, state,
                                              clear, iid, resource);
     // a buffer the host does not make there is made where the title asked
@@ -4211,10 +4432,24 @@ bool copy_feedback_map(List *host, const D3D12_TEXTURE_COPY_LOCATION *target,
     }
     return true;
 }
+// A copy between a buffer and a texture whose format's stand-in on the host lays its texels
+// out otherwise (see host_format): the host has no such footprint, and the bytes would not be
+// its texels. The copy is not made.
+bool foreign_footprint(const D3D12_TEXTURE_COPY_LOCATION *footprint,
+                       const D3D12_TEXTURE_COPY_LOCATION *texture) {
+    if (!footprint || footprint->Type != D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT)
+        return false;
+    const auto format = footprint->PlacedFootprint.Footprint.Format;
+    return host_format(nullptr, format, FormatUse::shader_view) != format ||
+           (small_colour(format) && texture && texture->pResource &&
+            texture->pResource->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+}
 void STDMETHODCALLTYPE copy_texture_region(void *self, const D3D12_TEXTURE_COPY_LOCATION *target,
                                            UINT x, UINT y, UINT z,
                                            const D3D12_TEXTURE_COPY_LOCATION *source,
                                            const D3D12_BOX *box) {
+    if (foreign_footprint(target, source) || foreign_footprint(source, target))
+        return;
     auto *const host = host_of(self);
     if (!x && !y && !z && copy_feedback_map(host, target, source))
         return;
@@ -5748,6 +5983,70 @@ HRESULT STDMETHODCALLTYPE create_command_list(ID3D12Device *self, const UINT *de
     }
     return result;
 }
+// The title's texels in a format of the console's own whose stand-in lays them out otherwise
+// (see host_format), as the host's: a row of `width` of them. False for a format there is no
+// such way for.
+float small_float(std::uint32_t bits, int mantissa, int bias) {
+    // no sign, no infinity and no NaN; an exponent of 0 is a denormal
+    const auto fraction =
+        static_cast<float>(bits & ((1u << mantissa) - 1)) / static_cast<float>(1u << mantissa);
+    const auto exponent = static_cast<int>(bits >> mantissa);
+    return exponent ? std::ldexp(1.0f + fraction, exponent - bias) : std::ldexp(fraction, 1 - bias);
+}
+std::uint16_t half(float value) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &value, sizeof bits);
+    const std::uint32_t sign = bits >> 16 & 0x8000;
+    const int exponent = static_cast<int>(bits >> 23 & 0xff) - 112;
+    // nothing these formats hold is below the smallest normal half but 0
+    if (exponent <= 0)
+        return static_cast<std::uint16_t>(sign);
+    const std::uint32_t rounded =
+        (static_cast<std::uint32_t>(exponent) << 10 | (bits >> 13 & 0x3ff)) + (bits >> 12 & 1);
+    return static_cast<std::uint16_t>(sign | std::min<std::uint32_t>(rounded, 0x7bff));
+}
+bool convert_row(DXGI_FORMAT format, const std::uint8_t *source, std::uint8_t *target, UINT width) {
+    std::uint32_t texel = 0;
+    switch (static_cast<int>(format)) {
+    case XBOX_DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT:
+    case XBOX_DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT: {
+        // 7 bits of mantissa and 3 of exponent, or 6 and 4
+        const int mantissa = format == XBOX_DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT ? 7 : 6;
+        const int bias = format == XBOX_DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT ? 3 : 7;
+        for (UINT x = 0; x < width; ++x) {
+            std::memcpy(&texel, source + x * 4, 4);
+            const std::uint16_t texels[]{half(small_float(texel & 0x3ff, mantissa, bias)),
+                                         half(small_float(texel >> 10 & 0x3ff, mantissa, bias)),
+                                         half(small_float(texel >> 20 & 0x3ff, mantissa, bias)),
+                                         half(static_cast<float>(texel >> 30) / 3)};
+            std::memcpy(target + x * 8, texels, 8);
+        }
+        return true;
+    }
+    case XBOX_DXGI_FORMAT_R10G10B10_SNORM_A2_UNORM:
+        for (UINT x = 0; x < width; ++x) {
+            std::memcpy(&texel, source + x * 4, 4);
+            const auto channel = [&](int shift) {
+                const auto value = static_cast<std::int32_t>(texel << (22 - shift)) >> 22;
+                return static_cast<std::int16_t>(
+                    std::lround(std::max(static_cast<float>(value) / 511, -1.0f) * 32767));
+            };
+            const std::int16_t texels[]{channel(0), channel(10), channel(20),
+                                        static_cast<std::int16_t>(std::lround(
+                                            static_cast<float>(texel >> 30) / 3 * 32767))};
+            std::memcpy(target + x * 8, texels, 8);
+        }
+        return true;
+    case XBOX_DXGI_FORMAT_R4G4_UNORM:
+        for (UINT x = 0; x < width; ++x) {
+            target[x * 2] = static_cast<std::uint8_t>((source[x] & 15) * 17);
+            target[x * 2 + 1] = static_cast<std::uint8_t>((source[x] >> 4) * 17);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
 // The uploads of placement textures the title wrote, on a list of ours that runs before the
 // title's on the same queue. Textures are where the title keeps them between its own lists:
 // shader resources.
@@ -5818,6 +6117,12 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
     std::string what; // of each texture, should the host turn the list down
     for (auto &upload : uploads) {
         const auto desc = upload.resource->GetDesc();
+        // texels in a format of the console's own whose stand-in has another layout are
+        // converted; where there is no way to, the host's texture keeps what it has
+        if (upload.format != desc.Format && !convert_row(upload.format, nullptr, nullptr, 0)) {
+            upload.resource->Release();
+            continue;
+        }
         const auto count = static_cast<UINT>(upload.subresources.size());
         what += " [dimension " + std::to_string(desc.Dimension) + " " + std::to_string(desc.Width) +
                 "x" + std::to_string(desc.Height) + "x" + std::to_string(desc.DepthOrArraySize) +
@@ -5861,15 +6166,21 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
                 // each slice of a volume after the one before it, in both
                 const auto plane = std::size_t{pitch} * rows[i];
                 for (UINT slice = 0; slice < footprints[i].Footprint.Depth; ++slice)
-                    for (UINT row = 0;
-                         row < rows[i] &&
-                         slice * plane + std::size_t{row + 1} * pitch <= source.size();
-                         ++row)
-                        std::memcpy(static_cast<std::uint8_t *>(mapped) + footprints[i].Offset +
-                                        (std::size_t{slice} * rows[i] + row) *
-                                            footprints[i].Footprint.RowPitch,
-                                    source.data() + slice * plane + std::size_t{row} * pitch,
-                                    pitch);
+                    for (UINT line = 0;
+                         line < rows[i] &&
+                         slice * plane + std::size_t{line + 1} * pitch <= source.size();
+                         ++line) {
+                        auto *const to = static_cast<std::uint8_t *>(mapped) +
+                                         footprints[i].Offset +
+                                         (std::size_t{slice} * rows[i] + line) *
+                                             footprints[i].Footprint.RowPitch;
+                        const auto *const from = reinterpret_cast<const std::uint8_t *>(
+                            source.data() + slice * plane + std::size_t{line} * pitch);
+                        if (upload.format != desc.Format)
+                            convert_row(upload.format, from, to, footprints[i].Footprint.Width);
+                        else
+                            std::memcpy(to, from, pitch);
+                    }
             }
             buffer->Unmap(0, nullptr);
             D3D12_RESOURCE_BARRIER barrier{};
@@ -6002,8 +6313,9 @@ HRESULT STDMETHODCALLTYPE unknown_device_method(void *, void *first, void *secon
     std::fflush(stderr);
     return E_NOTIMPL;
 }
-// CreatePlacedResource (29) and CreateReservedResource (30): the console's states and flags
-D3D12_RESOURCE_DESC host_resource_desc(const D3D12_RESOURCE_DESC &desc) {
+// CreatePlacedResource (29) and CreateReservedResource (30): the console's states, flags and
+// formats
+D3D12_RESOURCE_DESC host_resource_desc(ID3D12Device *device, const D3D12_RESOURCE_DESC &desc) {
     auto host = desc;
     host.Flags = static_cast<D3D12_RESOURCE_FLAGS>(host.Flags & 0xff);
     host.Format = host_format(host.Format, true);
@@ -6012,6 +6324,7 @@ D3D12_RESOURCE_DESC host_resource_desc(const D3D12_RESOURCE_DESC &desc) {
         host.Format = target_format(host.Format);
     if (host.Layout >= 0x100)
         host.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    host_resource_format(device, host);
     return host;
 }
 HRESULT STDMETHODCALLTYPE create_placed_resource(ID3D12Device *self, ID3D12Heap *heap,
@@ -6024,9 +6337,9 @@ HRESULT STDMETHODCALLTYPE create_placed_resource(ID3D12Device *self, ID3D12Heap 
                                                 const D3D12_CLEAR_VALUE *, REFIID, void **);
     D3D12_RESOURCE_DESC host{};
     if (desc)
-        host = host_resource_desc(*desc);
-    D3D12_CLEAR_VALUE cleared{};
-    clear = host_clear(clear, cleared);
+        host = host_resource_desc(self, *desc);
+    D3D12_CLEAR_VALUE cleared{}, cleared_host{};
+    clear = host_clear_value(self, host_clear(clear, cleared), host.Flags, cleared_host);
     const auto result = original<Create>(self, 29)(self, heap, offset, desc ? &host : nullptr,
                                                    host_state(state), clear, iid, resource);
     if (SUCCEEDED(result) && resource && *resource)
@@ -6043,7 +6356,9 @@ HRESULT STDMETHODCALLTYPE create_reserved_resource(ID3D12Device *self,
                                      const D3D12_CLEAR_VALUE *, REFIID, void **);
     D3D12_RESOURCE_DESC host{};
     if (desc)
-        host = host_resource_desc(*desc);
+        host = host_resource_desc(self, *desc);
+    D3D12_CLEAR_VALUE cleared_host{};
+    clear = host_clear_value(self, clear, host.Flags, cleared_host);
     const auto result = original<Create>(self, 30)(self, desc ? &host : nullptr, host_state(state),
                                                    clear, iid, resource);
     if (SUCCEEDED(result) && resource && *resource)
@@ -6473,6 +6788,7 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_2(
             host_desc.Format = target_format(host_desc.Format);
         if (host_desc.Layout >= 0x100)
             host_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        host_resource_format(self, host_desc);
         if (host_desc.Format == 187 || host_desc.Format == 188) {
             host_desc.Format = static_cast<DXGI_FORMAT>(host_desc.Format + 2);
             host_desc.Alignment = 0; // the host has no small alignment for these
@@ -6494,8 +6810,8 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_2(
         state = D3D12_RESOURCE_STATE_GENERIC_READ;
     if (desc)
         host_rules(heap, host_desc.Flags, state);
-    D3D12_CLEAR_VALUE cleared{};
-    clear = host_clear(clear, cleared);
+    D3D12_CLEAR_VALUE cleared{}, cleared_host{};
+    clear = host_clear_value(self, host_clear(clear, cleared), host_desc.Flags, cleared_host);
     const auto result = original<Create>(self, 69)(self, heap, flags, desc ? &host_desc : nullptr,
                                                    state, clear, session, iid, resource);
     if (SUCCEEDED(result) && resource && *resource) {
@@ -6542,6 +6858,7 @@ void STDMETHODCALLTYPE copyable_footprints(ID3D12Device *self, const D3D12_RESOU
         if (host.Layout >= 0x100)
             host.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         host.Alignment = 0;
+        host_resource_format(self, host);
     }
     if (console == Target::durango && desc && count && count <= 16384) {
         // The Xbox One has rows and subresources at multiples of 1024 bytes
@@ -6853,6 +7170,33 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
         }
         host = {stream.size(), stream.data()};
         desc = &host;
+    } else if (desc && desc->pPipelineStateSubobjectStream) {
+        // an Xbox One stream is the host's as it is, but for its formats
+        const auto *bytes = static_cast<const std::uint8_t *>(desc->pPipelineStateSubobjectStream);
+        stream.assign(bytes, bytes + desc->SizeInBytes);
+        host = {stream.size(), stream.data()};
+        desc = &host;
+    }
+    // the formats it draws to, the host's (see host_format), in the host's numbering of the
+    // subobjects: D3D12_RT_FORMAT_ARRAY's eight formats, and the depth stencil format
+    for (std::size_t at = 0; desc == &host && at + 8 <= stream.size();) {
+        std::uint32_t type;
+        std::memcpy(&type, stream.data() + at, 4);
+        const std::size_t size = type < std::size(sizes)                          ? sizes[type]
+                                 : type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ? 24
+                                                                                  : 0;
+        if (!size || at + size > stream.size())
+            break;
+        const bool depth = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
+        if (depth || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS)
+            for (std::size_t slot = 0; slot < (depth ? 1u : 8u); ++slot) {
+                DXGI_FORMAT format;
+                std::memcpy(&format, stream.data() + at + 4 + slot * 4, sizeof format);
+                format = host_format(self, format,
+                                     depth ? FormatUse::depth_view : FormatUse::target_view);
+                std::memcpy(stream.data() + at + 4 + slot * 4, &format, sizeof format);
+            }
+        at += size;
     }
     const auto result = original<Create>(self, 47)(self, desc, iid, state);
     if (SUCCEEDED(result) && state && *state && uses) {

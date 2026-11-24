@@ -173,24 +173,76 @@ inline ID3D12RootSignature *root_signature(const D3D12_ROOT_SIGNATURE_DESC &desc
     return signature;
 }
 // a buffer as a Series title makes one (CreateCommittedResource, 27) and the address it has
-// for it (GetGPUVirtualAddress, 11): where its memory is for the CPU as well
-inline ID3D12Resource *buffer(UINT64 bytes, std::uint64_t &address) {
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+// for it (GetGPUVirtualAddress, 11): where its memory is for the CPU as well. One of the
+// default heap is written by shaders, one of the readback heap copied to.
+inline ID3D12Resource *buffer(UINT64 bytes, std::uint64_t &address,
+                              D3D12_HEAP_TYPE type = D3D12_HEAP_TYPE_DEFAULT) {
+    const D3D12_HEAP_PROPERTIES heap{type};
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = bytes;
     desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (type == D3D12_HEAP_TYPE_DEFAULT)
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     ID3D12Resource *made = nullptr;
     REQUIRE(title().call(device(), 27, &heap, D3D12_HEAP_FLAG_NONE, &desc,
-                         D3D12_RESOURCE_STATE_COMMON, static_cast<D3D12_CLEAR_VALUE *>(nullptr),
-                         &__uuidof(ID3D12Resource), reinterpret_cast<void **>(&made)) == S_OK);
+                         type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                          : D3D12_RESOURCE_STATE_COMMON,
+                         static_cast<D3D12_CLEAR_VALUE *>(nullptr), &__uuidof(ID3D12Resource),
+                         reinterpret_cast<void **>(&made)) == S_OK);
     address = title().call<std::uint64_t>(made, 11);
     MEMORY_BASIC_INFORMATION info{};
     REQUIRE(VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info));
     REQUIRE(info.State == MEM_COMMIT);
     return made;
+}
+inline const std::uint32_t *words(std::uint64_t address) {
+    return reinterpret_cast<const std::uint32_t *>(address);
+}
+// a heap of descriptors (CreateDescriptorHeap, 14) and its CPU and GPU starts (9 and 10),
+// shader-visible for views
+struct Heap {
+    void *heap = nullptr;
+    std::uint64_t cpu = 0, gpu = 0;
+    explicit Heap(UINT count,
+                  D3D12_DESCRIPTOR_HEAP_TYPE type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{type, count,
+                                              type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+                                                  ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+                                                  : D3D12_DESCRIPTOR_HEAP_FLAG_NONE};
+        REQUIRE(title().call(device(), 14, &desc, &__uuidof(ID3D12DescriptorHeap), &heap) == S_OK);
+        cpu = title().call<std::uint64_t>(heap, 9);
+        if (desc.Flags)
+            gpu = title().call<std::uint64_t>(heap, 10);
+    }
+    ~Heap() { static_cast<IUnknown *>(heap)->Release(); }
+};
+// CreateComputePipelineState (11)
+inline ID3D12PipelineState *compute_pipeline(ID3D12RootSignature *signature,
+                                             std::string_view source) {
+    auto *const code = compile(source, "cs_5_0");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = signature;
+    desc.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    ID3D12PipelineState *state = nullptr;
+    CHECK(title().call(device(), 11, &desc, &__uuidof(ID3D12PipelineState),
+                       reinterpret_cast<void **>(&state)) == S_OK);
+    code->Release();
+    REQUIRE(state);
+    return state;
+}
+inline D3D12_ROOT_PARAMETER root_view(D3D12_ROOT_PARAMETER_TYPE type, UINT shader_register) {
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = type;
+    parameter.Descriptor.ShaderRegister = shader_register;
+    return parameter;
+}
+inline D3D12_ROOT_PARAMETER table(const D3D12_DESCRIPTOR_RANGE *ranges, UINT count) {
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable = {count, ranges};
+    return parameter;
 }
 } // namespace d3d12x_test

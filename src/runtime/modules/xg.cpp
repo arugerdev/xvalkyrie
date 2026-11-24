@@ -28,6 +28,8 @@ FormatSize format_size(std::uint32_t format) {
         return {16, true};
     if (format == 85 || format == 86 || format == 115) // 5:6:5, 5:5:5:1, 4:4:4:4
         return {2, false};
+    if (format == 190) // the consoles' own R4G4
+        return {1, false};
     return {4, false}; // B8G8R8A8 and friends, and anything unlisted
 }
 

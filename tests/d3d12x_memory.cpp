@@ -250,3 +250,31 @@ TEST_CASE("a view of memory at an address reads a copy of it, and a descriptor t
     signature->Release();
     buffer->Release();
 }
+
+TEST_CASE("a texture placed in the title's memory has that memory's address") {
+    if (!device())
+        return;
+    const TitleMemory memory;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 64;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    // device slot 44, CreatePlacedResourceX, then the resource's GetGPUVirtualAddress (11)
+    const auto place = [&](std::uint64_t address) {
+        void *texture = nullptr;
+        REQUIRE(title().call(device(), 44, address, &desc, D3D12_RESOURCE_STATE_COMMON,
+                             static_cast<const D3D12_CLEAR_VALUE *>(nullptr),
+                             &__uuidof(ID3D12Resource), &texture) == S_OK);
+        REQUIRE(texture);
+        return static_cast<ID3D12Resource *>(texture);
+    };
+    auto *const first = place(memory.address());
+    auto *const second = place(memory.address(32768));
+    CHECK(title().call<std::uint64_t>(first, 11) == memory.address());
+    CHECK(title().call<std::uint64_t>(second, 11) == memory.address(32768));
+    first->Release();
+    second->Release();
+    CHECK(removed_reason() == S_OK);
+}

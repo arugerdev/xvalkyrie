@@ -728,10 +728,65 @@ void STDMETHODCALLTYPE unmap_resource(ID3D12Resource *self, UINT subresource,
     using Unmap = void(STDMETHODCALLTYPE *)(void *, UINT, const D3D12_RANGE *);
     original<Unmap>(self, 9)(self, subresource, range);
 }
-// GetGPUVirtualAddress (11): see track_buffer
+// Textures placed in the title's memory (CreatePlacedResourceX), with the address each is at and
+// the description the title gave. On the console a texture's GPU address is its memory: the
+// title gives that address back to free the pages it placed a texture in, and views of that
+// memory are views of that texture. An entry goes when its texture is destroyed
+// (ID3DDestructionNotifier), so nothing here holds a texture.
+struct PlacedTexture {
+    std::uint64_t address;
+    D3D12_RESOURCE_DESC desc;
+};
+std::mutex placed_texture_mutex;
+std::map<const void *, PlacedTexture> placed_textures;
+void forget_placed_texture(void *resource) {
+    const std::lock_guard lock(placed_texture_mutex);
+    placed_textures.erase(resource);
+}
+void note_placed_texture(ID3D12Resource *resource, std::uint64_t address,
+                         const D3D12_RESOURCE_DESC &desc) {
+    ID3DDestructionNotifier *notifier = nullptr;
+    // without a way to tell when it goes, it is not followed: its pointer may be another's later
+    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&notifier))) || !notifier)
+        return;
+    UINT id = 0;
+    const auto registered = notifier->RegisterDestructionCallback(
+        [](void *gone) { forget_placed_texture(gone); }, resource, &id);
+    notifier->Release();
+    if (FAILED(registered))
+        return;
+    const std::lock_guard lock(placed_texture_mutex);
+    placed_textures[resource] = {address, desc};
+}
+bool placed_texture_address(const void *resource, std::uint64_t &address) {
+    const std::lock_guard lock(placed_texture_mutex);
+    const auto found = placed_textures.find(resource);
+    if (found == placed_textures.end())
+        return false;
+    address = found->second.address;
+    return true;
+}
+// the texture placed at `address` that a title's description `of` describes, with a reference
+ID3D12Resource *texture_placed_at(std::uint64_t address, const D3D12_RESOURCE_DESC &of) {
+    const std::lock_guard lock(placed_texture_mutex);
+    for (const auto &[resource, placed] : placed_textures) {
+        const auto &d = placed.desc;
+        if (placed.address == address && d.Dimension == of.Dimension && d.Width == of.Width &&
+            d.Height == of.Height && d.DepthOrArraySize == of.DepthOrArraySize &&
+            d.MipLevels == of.MipLevels && d.Format == of.Format) {
+            auto *const texture = static_cast<ID3D12Resource *>(const_cast<void *>(resource));
+            texture->AddRef();
+            return texture;
+        }
+    }
+    return nullptr;
+}
+// GetGPUVirtualAddress (11): see track_buffer, and a placed texture's is where it was placed
 bool mapped_address(const void *resource, std::uint64_t &address);
 std::uint64_t STDMETHODCALLTYPE resource_address(ID3D12Resource *self) {
     if (std::uint64_t address = 0; mapped_address(self, address))
+        return address;
+    if (std::uint64_t address = 0; placed_texture_address(self, address))
         return address;
     const auto address = original<std::uint64_t(STDMETHODCALLTYPE *)(void *)>(self, 11)(self);
     // the host has no address for a texture; the console's is its memory
@@ -1273,8 +1328,12 @@ std::uint64_t gpu_address(std::uint64_t address) {
 }
 void track_buffer(ID3D12Resource *resource, bool mapped = false) {
     const auto desc = resource->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // made where a released buffer was: that one's mapped address is not this one's
+        const std::lock_guard lock(buffer_mutex);
+        mapped_start.erase(resource);
         return;
+    }
     auto start = resource->GetGPUVirtualAddress();
     void *memory = nullptr;
     const D3D12_RANGE nothing_read{0, 0};
@@ -2459,6 +2518,9 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     const auto result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state,
                                                   clear, iid, resource);
+    if (SUCCEEDED(result) && resource && *resource && desc && address &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        note_placed_texture(static_cast<ID3D12Resource *>(*resource), address, *desc);
     // a texture the title fills in its memory: the host's copy follows it
     if (SUCCEEDED(result) && resource && *resource && desc &&
         !(desc->Flags &
@@ -2624,6 +2686,11 @@ ID3D12Resource *texture_at(ID3D12Device *self, std::uint64_t address,
             return found->second.resource;
         found->second.resource->Release();
         memory_textures.erase(found);
+    }
+    // the texture the title placed there, if the view is of one like it
+    if (auto *const placed = texture_placed_at(address, *of)) {
+        memory_textures[address] = {placed, *of};
+        return placed;
     }
     ID3D12Resource *resource = nullptr;
     if (const auto result = create_placed_resource_x(self, address, of, D3D12_RESOURCE_STATE_COMMON,

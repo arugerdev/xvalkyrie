@@ -15,6 +15,7 @@
 // after windows.h, which it needs
 #include <shellapi.h>
 #include <shlobj.h>
+#include <timeapi.h>
 
 namespace xv::host {
 namespace {
@@ -369,6 +370,25 @@ void ManualEvent::reset() {
 bool ManualEvent::wait(std::stop_token stop) {
     std::unique_lock lock(mutex_);
     return changed_.wait(lock, stop, [this] { return signaled_; });
+}
+
+// timeBeginPeriod and timeEndPeriod, and the process power throttling that would ignore the
+// request (SetProcessInformation, ProcessPowerThrottling), in Microsoft's Windows reference
+TimerResolution::TimerResolution(std::uint32_t milliseconds) {
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    throttling.StateMask = 0; // the request is always honoured
+    // fails on hosts before Windows 11, which do not ignore it
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+                          sizeof throttling);
+    if (timeBeginPeriod(milliseconds) == TIMERR_NOERROR)
+        milliseconds_ = milliseconds;
+}
+// The throttling setting stays: it only concerns requests, and this one ends here.
+TimerResolution::~TimerResolution() {
+    if (milliseconds_)
+        timeEndPeriod(milliseconds_);
 }
 
 NativeModule::NativeModule(const std::filesystem::path &path) {

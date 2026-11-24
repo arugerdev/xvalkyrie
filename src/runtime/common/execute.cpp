@@ -1,6 +1,7 @@
 #include "backends/audio/audio.hpp"
 #include "formats/pe/inspect.hpp"
 #include "host/files.hpp"
+#include "host/threading.hpp"
 #include "loader/image.hpp"
 #include "runtime/common/runtime.hpp"
 #include "runtime/common/static_tls.hpp"
@@ -1258,6 +1259,11 @@ std::uint32_t execute(const std::filesystem::path &path, std::span<const std::ui
         AddVectoredExceptionHandler(0, &first_chance);
     set_breakpoints(reinterpret_cast<std::uint8_t *>(state.base));
 #endif
+    // A console ends a wait within about a millisecond of its time, and titles pace themselves
+    // on that with short waits (an audio mixer that sleeps 2 ms between blocks). Their Sleep and
+    // waits are the host's, as are ours that keep the frame's events, so for as long as the
+    // title runs this process gets millisecond timers.
+    const host::TimerResolution console_timers(1);
     std::fflush(nullptr);
     const auto thread = CreateThread(nullptr, 0, guest_thread, &start, 0, nullptr);
     if (!thread) {

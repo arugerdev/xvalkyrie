@@ -3457,9 +3457,15 @@ void report_messages() {
     auto *const queue = debug_messages.load();
     if (!queue)
         return;
+    // one thread at a time: another one's clearing would take away the messages this one counted
+    static std::mutex reporting;
+    const std::lock_guard lock(reporting);
     for (UINT64 i = 0, count = queue->GetNumStoredMessages(); i < count; ++i) {
         SIZE_T size = 0;
         queue->GetMessage(i, nullptr, &size);
+        // nothing there to read: the size is left at 0 when the call fails
+        if (size < sizeof(D3D12_MESSAGE))
+            continue;
         std::vector<std::uint8_t> buffer(size);
         auto *const message = reinterpret_cast<D3D12_MESSAGE *>(buffer.data());
         if (SUCCEEDED(queue->GetMessage(i, message, &size)) &&

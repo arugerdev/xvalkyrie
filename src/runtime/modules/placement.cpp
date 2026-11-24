@@ -378,9 +378,11 @@ void upload_placements(ID3D11DeviceContext *context) {
             placements.erase(found);
             continue;
         }
-        upload(context, found->second);
+        // watched again before it is read: a write while it is read is not missed, it makes
+        // the placement dirty for the next upload
         found->second.dirty = false;
         protect(found->second, PAGE_READONLY);
+        upload(context, found->second);
     }
     dirty = std::move(kept);
 }
@@ -655,13 +657,15 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
             placements.erase(found);
             continue;
         }
+        // watched again before it is read: a write while it is read is not missed, it makes
+        // the placement dirty for the next upload
+        placement.dirty = false;
+        protect(placement, PAGE_READONLY);
         PlacementUpload upload{placement.d3d12};
         if (linear_subresources(placement, upload)) {
             placement.d3d12->AddRef();
             uploads.push_back(std::move(upload));
         }
-        placement.dirty = false;
-        protect(placement, PAGE_READONLY);
     }
     dirty = std::move(kept);
     return uploads;

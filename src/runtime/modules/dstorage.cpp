@@ -290,11 +290,13 @@ HRESULT read(const Request &request) {
         return result;
     if (!options.zlib_decompress)
         return write_destination(request, data, request.source_size);
+    // A stream that goes on past DestinationSize fills it: the console's decompression stops
+    // where its output ends, and a title asks for the start of a longer stream that way.
     std::vector<std::uint8_t> plain;
-    if (!inflate_zlib({data, request.source_size}, plain) ||
-        plain.size() > request.destination_size)
+    if (!inflate_zlib({data, request.source_size}, plain))
         return E_FAIL;
-    return write_destination(request, plain.data(), plain.size());
+    return write_destination(request, plain.data(),
+                             std::min<std::size_t>(plain.size(), request.destination_size));
 }
 
 class Queue final : public Object<QueueInterface> {

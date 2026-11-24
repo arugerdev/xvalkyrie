@@ -285,6 +285,29 @@ TEST_CASE("a zlib request inflates into physical pages, the array's order being 
     CHECK(std::memcmp(pages.address + page, data.data() + 2 * page, 100) == 0);
 }
 
+TEST_CASE("a zlib stream longer than the destination fills it, and one that is not zlib fails") {
+    const auto data = pattern(3000, 4);
+    const auto packed = stored_zlib(data);
+    std::vector<std::uint8_t> out(1001, 0xcc);
+    MemoryQueue queue;
+    Request request{source_memory | zlib_decompress,
+                    out.data(),
+                    0,
+                    1000,
+                    const_cast<std::uint8_t *>(packed.data()),
+                    0,
+                    static_cast<UINT32>(packed.size())};
+    CHECK(queue.run(request).failures == 0);
+    CHECK(std::memcmp(out.data(), data.data(), 1000) == 0);
+    CHECK(out[1000] == 0xcc);
+    // raw deflate, without the zlib header
+    request.source = const_cast<std::uint8_t *>(packed.data() + 2);
+    request.source_size -= 2;
+    const auto record = queue.run(request);
+    CHECK(record.failures == 1);
+    CHECK(record.first == E_FAIL);
+}
+
 TEST_CASE("a page the title does not hold fails the request, and nothing is written") {
     ULONG_PTR count = 1, number = 0;
     auto *const allocate = reinterpret_cast<Allocate *>(xmem("XMemAllocatePhysicalPages"));

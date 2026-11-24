@@ -1370,6 +1370,13 @@ class Translator {
     }
     std::string active() { return "(" + s(126) + " != 0u)"; }
     void line(const std::string &text) { body_ += indent_ + text + "\n"; }
+    // a word as it is now, for an instruction that may write the registers it is read from
+    // before it has read all it needs
+    std::string keep(const std::string &value) {
+        const auto id = "x" + std::to_string(temporaries_++);
+        line("uint " + id + " = " + value + ";");
+        return id;
+    }
     // a write to a vector register, which only the lanes of EXEC do
     void set_v(std::uint32_t reg, const std::string &whole) {
         const auto value = placed_ ? place(reg, whole) : whole;
@@ -2303,20 +2310,26 @@ class Translator {
         std::string where = hex(offset);
         if (indexed)
             where = "(" + operand(ins, index) + " + " + where + ")";
+        // Several words may go to the registers their address is in: it is kept before the
+        // first is written.
         if (starts(name, "s_load_dword")) {
             const auto words = words_of("s_load_dword");
             const auto from = known_[base];
             if (from.kind == Known::code) {
                 // constants kept with the code, after its last instruction
                 uses_data_ = true;
+                auto address = s(base) + " + " + where;
+                if (words > 1)
+                    address = keep(address);
                 for (std::uint32_t n = 0; n < words; ++n)
-                    set_s(data + n, "code_word(" + s(base) + " + " + where + " + " +
-                                        std::to_string(4 * n) + "u)");
+                    set_s(data + n, "code_word(" + address + " + " + std::to_string(4 * n) + "u)");
                 return;
             }
             if (from.kind == Known::root && from.part == 0) {
                 // read through the address of a root descriptor: the buffer's own words
                 auto resource = resource_of(base);
+                if (indexed && words > 1)
+                    where = keep(where);
                 for (std::uint32_t n = 0; n < words; ++n)
                     set_s(data + n,
                           read_word(resource, "0u", where, indexed ? ~0u : offset, 4 * n));
@@ -2352,6 +2365,8 @@ class Translator {
         if (starts(name, "s_buffer_load_dword")) {
             const auto words = words_of("s_buffer_load_dword");
             const auto resource = resource_of(base);
+            if (indexed && words > 1)
+                where = keep(where);
             for (std::uint32_t n = 0; n < words; ++n)
                 set_s(data + n, read_word(resource, "0u", where, indexed ? ~0u : offset, 4 * n));
             return;
@@ -2836,13 +2851,17 @@ class Translator {
             const auto unit = name == "wrxchg2st64" ? 4 * 64 : 4;
             touch_shared(true);
             address();
+            // both words are exchanged before either is returned: the first may go to the
+            // register the second is taken from
+            std::string before[2];
             for (std::uint32_t which = 0; which < 2; ++which) {
-                const auto before = "x" + std::to_string(temporaries_++);
-                line("uint " + before + " = 0u;");
+                before[which] = "x" + std::to_string(temporaries_++);
+                line("uint " + before[which] + " = 0u;");
                 line(guard + atomic("swap", shared_word(at, offsets[which] * unit), v(data[which]),
-                                    "", before));
-                set_v(destination + which, before);
+                                    "", before[which]));
             }
+            for (std::uint32_t which = 0; which < 2; ++which)
+                set_v(destination + which, before[which]);
             return;
         }
         struct Operation {
@@ -3995,13 +4014,17 @@ class Translator {
             if (name == "image_get_lod") {
                 if (stage_ != Stage::pixel)
                     give_up("image_get_lod outside a pixel shader");
+                // both levels are found before either is written: they may go to the
+                // registers of the address
+                const auto levels = "x" + std::to_string(temporaries_++);
+                line("float2 " + levels + " = float2(" + texture_name + ".CalculateLevelOfDetail(" +
+                     sampler + ", " + where + "), " + texture_name +
+                     ".CalculateLevelOfDetailUnclamped(" + sampler + ", " + where + "));");
                 std::uint32_t reg = data;
                 if (mask & 1)
-                    set_v(reg++, u(texture_name + ".CalculateLevelOfDetail(" + sampler + ", " +
-                                   where + ")"));
+                    set_v(reg++, u(levels + ".x"));
                 if (mask & 2)
-                    set_v(reg++, u(texture_name + ".CalculateLevelOfDetailUnclamped(" + sampler +
-                                   ", " + where + ")"));
+                    set_v(reg++, u(levels + ".y"));
                 return;
             }
             const auto &object = texture_name;

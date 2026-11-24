@@ -1,6 +1,7 @@
 #include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/console_shader_rdna.hpp"
 #include <catch2/catch.hpp>
+#include <cctype>
 #include <cstring>
 #include <d3dcompiler.h>
 #include <initializer_list>
@@ -28,6 +29,23 @@ std::size_t count(const std::string &text, const std::string &what) {
         ++found;
     return found;
 }
+// what the last statement that writes the register `reg` gives it
+std::string last_set(const std::string &source, const std::string &reg) {
+    const auto at = source.rfind(" " + reg + " = ");
+    REQUIRE(at != std::string::npos);
+    const auto from = at + reg.size() + 4;
+    return source.substr(from, source.find(';', from) - from);
+}
+// whether `text` reads the register `reg`
+bool reads(const std::string &text, const std::string &reg) {
+    for (auto at = text.find(reg); at != std::string::npos; at = text.find(reg, at + 1)) {
+        const auto after = at + reg.size();
+        if ((!at || !std::isalnum(static_cast<unsigned char>(text[at - 1]))) &&
+            (after == text.size() || !std::isdigit(static_cast<unsigned char>(text[after]))))
+            return true;
+    }
+    return false;
+}
 
 std::optional<std::string> pixel_move(std::uint32_t move, std::uint32_t selectors, std::string &why,
                                       bool &needs_sm6) {
@@ -48,6 +66,45 @@ std::optional<std::string> pixel_move(std::uint32_t move, std::uint32_t selector
                               {},
                               {{"SV_Target", 0, 3, 4, true, 0, 15, 0}}};
     return rdna::translate(ShaderStage::pixel, shader, &why, nullptr, &needs_sm6);
+}
+// The translation of a pixel shader of these words, which the host's compiler must take.
+// Before them, as console_shader_probe has for a compute shader: a descriptor of the first
+// table in s[12:19] and a sampler of the second in s[24:27].
+std::string pixel_translated(std::initializer_list<std::uint32_t> words) {
+    std::vector<std::uint32_t> code = {
+        0xf40c0304, 0xfa000000, // s_load_dwordx8 s[12:19], s[8:9], 0
+        0xbe940309,             // s_mov_b32 s20, s9
+        0xf408060a, 0xfa000000, // s_load_dwordx4 s[24:27], s[20:21], 0
+    };
+    code.insert(code.end(), words);
+    code.push_back(end_program);
+    constexpr std::size_t region = 0x140, header = 0x28;
+    std::vector<std::uint8_t> file(region + header + 4 * code.size());
+    const auto put = [&](std::size_t offset, std::uint32_t value) {
+        std::memcpy(file.data() + offset, &value, sizeof value);
+    };
+    std::memcpy(file.data(), "FSSM", 4);
+    put(0xc0, region);
+    put(0xc8, static_cast<std::uint32_t>(header + 4 * code.size()));
+    std::memcpy(file.data() + region + header, code.data(), 4 * code.size());
+    // console_shader_probe's root signature: the header and two tables, of shader resources
+    // without end from t0 and of sixteen samplers from s0
+    static constexpr std::uint32_t root[] = {
+        1, 2,  24, 0,   48, 0, 0, 0, 48, 0, 0, 76, // header, parameters
+        1, 56, 0,  ~0u, 0,  0, 0,                  // shader resources
+        1, 84, 3,  16,  0,  0, 0,                  // samplers
+    };
+    const rdna::Shader shader{file,
+                              {reinterpret_cast<const std::uint8_t *>(root), sizeof root},
+                              {},
+                              {{"SV_Target", 0, 3, 4, true, 0, 15, 0}}};
+    std::string why;
+    const auto source = rdna::translate(ShaderStage::pixel, shader, &why);
+    INFO(why);
+    REQUIRE(source);
+    INFO(*source);
+    CHECK(console_shader_errors(ShaderStage::pixel, *source).empty());
+    return *source;
 }
 } // namespace
 
@@ -155,6 +212,41 @@ TEST_CASE("a register that holds one of two descriptors is used as each") {
     CHECK(source.find("c5 = 8u;") != std::string::npos);
     CHECK(source.find("t1_0.Load(") != std::string::npos);
     CHECK(source.find("t2_0.Load(") != std::string::npos);
+}
+
+TEST_CASE("a load into the registers of its address reads every word from the address given") {
+    // buffer_load_dwordx4 v[1:4], v[1:2], s[12:15], 0 idxen offen
+    const auto buffer = translated({0xe0383000, 0x80030101});
+    for (const auto *reg : {"v1", "v2", "v3", "v4"}) {
+        const auto value = last_set(buffer, reg);
+        INFO(reg << " = " << value);
+        CHECK_FALSE(reads(value, "v1"));
+        CHECK_FALSE(reads(value, "v2"));
+    }
+    // s_buffer_load_dwordx2 s[0:1], s[12:15], s0 offset:0x10
+    const auto scalar = translated({0xf4240006, 0x00000010});
+    CHECK_FALSE(reads(last_set(scalar, "s1"), "s0"));
+    // s_getpc_b64 s[0:1]; s_load_dwordx2 s[0:1], s[0:1], 0xc; s_endpgm; and the two words it
+    // reads, 0xc bytes from the s_load_dwordx2
+    const auto code =
+        translated({0xbe801f00, 0xf4040000, 0xfa00000c, end_program, 0x3f800000, 0x40000000});
+    CHECK(code.find("code_word(") != std::string::npos);
+    CHECK_FALSE(reads(last_set(code, "s1"), "s0"));
+}
+
+TEST_CASE("an exchange of two words of a group's memory returns them once both are taken") {
+    // ds_wrxchg2_rtn_b32 v[3:4], v1, v2, v3 offset1:1: the first returned goes to v3
+    const auto source = translated({shared(0x2e) | 1 << 8, 1 | 2 << 8 | 3 << 16 | 3 << 24});
+    CHECK(count(source, "InterlockedExchange(lds[") == 2);
+    CHECK(source.find("], v3, ") < source.rfind(" v3 = "));
+}
+
+TEST_CASE("both levels of detail are found before either is written") {
+    // image_get_lod v[0:1], v[0:1], s[12:19], s[24:27] dmask:0x3 dim:SQ_RSRC_IMG_2D;
+    // exp mrt0 v0, v1, off, off done vm
+    const auto source = pixel_translated({0xf1800308, 0x00c30000, 0xf8001803, 0x00000100});
+    CHECK(source.find("CalculateLevelOfDetailUnclamped(") != std::string::npos);
+    CHECK_FALSE(reads(last_set(source, "v1"), "v0"));
 }
 
 TEST_CASE("a rectangle list's fourth corner comes from a geometry shader") {

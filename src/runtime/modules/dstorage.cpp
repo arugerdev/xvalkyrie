@@ -2,9 +2,11 @@
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/inflate.hpp"
 #include "runtime/modules/kernel.hpp"
+#include "runtime/modules/memory.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +26,7 @@
 // fence once everything before them is done. Here a queue does its work when it is
 // submitted, on the thread that submits it, in order. Reads may be inflated (zlib); the
 // console's texture compression (BCPack) is not known here, and such a request fails.
+// Sources and destinations may be the title's memory or its physical pages.
 namespace xv::runtime::modules {
 namespace {
 constexpr GUID file_iid{
@@ -98,20 +101,46 @@ struct QueueInfo1 {
     UINT16 empty_slots, until_submit;
 };
 static_assert(sizeof(QueueDesc) == 24 && offsetof(QueueDesc1, options) == 24);
+// DSTORAGE_REQUEST_OPTIONS and DSTORAGE_REQUEST, with the members Microsoft's DirectStorage
+// reference for the GDK gives them
+struct RequestOptions {
+    UINT64 zlib_decompress : 1; // RFC 1950
+    UINT64 bcpack_mode : 4;     // DSTORAGE_BCPACK_MODE: 0 none, else the BC number
+    UINT64 swizzle_mode : 16;
+    UINT64 destination_is_physical_pages : 1;
+    UINT64 source_type : 1;              // DSTORAGE_REQUEST_SOURCE_FILE (0) or _MEMORY (1)
+    UINT64 source_is_physical_pages : 1; // with a memory source
+    UINT64 reserved : 40;
+};
+constexpr UINT64 source_memory = 1;
 struct Request {
-    UINT64 options; // bit 0 zlib, bits 1 to 4 BCPack, bit 21 destination in pages, bit 22
-                    // source in memory, bit 23 source in pages
-    void *destination;
-    UINT64 destination_page_offset; // 16 bits of it, in a union as large as two pointers
+    RequestOptions options;
+    // Destination, or DestinationPageArray and DestinationPageOffset: a page number per 64 KiB
+    // and where in the first page the data starts
+    union {
+        void *destination;
+        const ULONG_PTR *destination_page_array;
+    };
+    UINT64 destination_page_offset; // UINT16, in a union as large as two pointers
     UINT32 destination_size;
-    void *source; // the file, or the memory
-    UINT64 file_offset;
+    // File and FileOffset, Source, or SourcePageArray and SourcePageOffset
+    union {
+        void *source;
+        const ULONG_PTR *source_page_array;
+    };
+    UINT64 file_offset; // or SourcePageOffset (UINT16)
     UINT32 source_size, intermediate_size;
-    UINT64 tag;
+    UINT64 tag; // CancellationTag
     const char *name;
 };
-static_assert(offsetof(Request, destination_size) == 24 && offsetof(Request, source) == 32 &&
-              offsetof(Request, source_size) == 48 && offsetof(Request, tag) == 56);
+static_assert(sizeof(RequestOptions) == 8 && offsetof(Request, destination_size) == 24 &&
+              offsetof(Request, source) == 32 && offsetof(Request, source_size) == 48 &&
+              offsetof(Request, tag) == 56);
+// a request from a file holds the file (IDStorageFileX) until it is done
+IUnknown *file_of(const Request &request) {
+    return request.options.source_type == source_memory ? nullptr
+                                                        : static_cast<IUnknown *>(request.source);
+}
 struct ErrorRecord {
     UINT32 failures;
     HRESULT first;
@@ -190,58 +219,82 @@ class Status final : public Object<StatusInterface> {
     std::vector<Entry> entries_;
 };
 
+HRESULT read_file(const Request &request, void *target) {
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(request.file_offset);
+    at.OffsetHigh = static_cast<DWORD>(request.file_offset >> 32);
+    DWORD done = 0;
+    if (!ReadFile(static_cast<FileInterface *>(request.source)->GetHandle(), target,
+                  request.source_size, &done, &at) ||
+        done != request.source_size)
+        return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF);
+    return S_OK;
+}
+// where a request's data comes from: a file, the title's memory or its physical pages
+HRESULT read_source(const Request &request, std::vector<std::uint8_t> &buffer,
+                    const std::uint8_t *&data) {
+    if (request.options.source_type != source_memory) {
+        buffer.resize(request.source_size);
+        data = buffer.data();
+        return read_file(request, buffer.data());
+    }
+    if (request.options.source_is_physical_pages) {
+        buffer.resize(request.source_size);
+        data = buffer.data();
+        return copy_physical_pages(request.source_page_array, request.file_offset & 0xffff,
+                                   buffer.data(), buffer.size(), false)
+                   ? S_OK
+                   : E_INVALIDARG;
+    }
+    data = static_cast<const std::uint8_t *>(request.source);
+    return S_OK;
+}
+// where it goes: the title's memory or its physical pages
+HRESULT write_destination(const Request &request, const std::uint8_t *data, std::size_t size) {
+    if (request.options.destination_is_physical_pages)
+        return copy_physical_pages(request.destination_page_array,
+                                   request.destination_page_offset & 0xffff,
+                                   const_cast<std::uint8_t *>(data), size, true)
+                   ? S_OK
+                   : E_INVALIDARG;
+    prepare_title_write(request.destination, size);
+    std::memcpy(request.destination, data, size);
+    return S_OK;
+}
+
+// The swizzle mode is not done here: the data is written as it was read.
 HRESULT read(const Request &request) {
-    constexpr UINT64 zlib = 1, bcpack = 0xf << 1, destination_pages = 1ull << 21,
-                     from_memory = 1ull << 22, source_pages = 1ull << 23;
-    if (request.options & (bcpack | destination_pages | source_pages)) {
+    const auto &options = request.options;
+    if (options.bcpack_mode) {
         if (static std::atomic<bool> shown{false}; !shown.exchange(true))
             std::fprintf(stderr,
-                         "[Runtime] DirectStorage: a request with options 0x%llx (texture "
-                         "compression or physical pages), which is not done\n",
-                         request.options);
+                         "[Runtime] DirectStorage: a request with BCPack (BC%u), which is not "
+                         "done\n",
+                         static_cast<unsigned>(options.bcpack_mode));
         return E_NOTIMPL;
     }
     if (!request.destination || !request.source)
         return E_INVALIDARG;
-    const bool inflated = request.options & zlib;
+    // without decompression the sizes are the same; with it the result is larger
+    if (!options.zlib_decompress && request.source_size > request.destination_size)
+        return E_INVALIDARG;
+    // a file read straight to the title's memory, when nothing comes in between
+    if (!options.zlib_decompress && options.source_type != source_memory &&
+        !options.destination_is_physical_pages) {
+        prepare_title_write(request.destination, request.source_size);
+        return read_file(request, request.destination);
+    }
     std::vector<std::uint8_t> packed;
     const std::uint8_t *data = nullptr;
-    if (request.options & from_memory) {
-        data = static_cast<const std::uint8_t *>(request.source);
-    } else {
-        // read straight to where it goes unless it has to be inflated first
-        auto *const target = inflated ? (packed.resize(request.source_size), packed.data())
-                                      : static_cast<std::uint8_t *>(request.destination);
-        if (!inflated) {
-            if (request.source_size > request.destination_size)
-                return E_INVALIDARG;
-            prepare_title_write(target, request.source_size);
-        }
-        OVERLAPPED at{};
-        at.Offset = static_cast<DWORD>(request.file_offset);
-        at.OffsetHigh = static_cast<DWORD>(request.file_offset >> 32);
-        DWORD done = 0;
-        if (!ReadFile(static_cast<FileInterface *>(request.source)->GetHandle(), target,
-                      request.source_size, &done, &at) ||
-            done != request.source_size)
-            return HRESULT_FROM_WIN32(GetLastError() ? GetLastError() : ERROR_HANDLE_EOF);
-        if (!inflated)
-            return S_OK;
-        data = packed.data();
-    }
-    prepare_title_write(request.destination, request.destination_size);
-    if (!inflated) {
-        if (request.source_size > request.destination_size)
-            return E_INVALIDARG;
-        std::memcpy(request.destination, data, request.source_size);
-        return S_OK;
-    }
+    if (const auto result = read_source(request, packed, data); FAILED(result))
+        return result;
+    if (!options.zlib_decompress)
+        return write_destination(request, data, request.source_size);
     std::vector<std::uint8_t> plain;
     if (!inflate_zlib({data, request.source_size}, plain) ||
         plain.size() > request.destination_size)
         return E_FAIL;
-    std::memcpy(request.destination, plain.data(), plain.size());
-    return S_OK;
+    return write_destination(request, plain.data(), plain.size());
 }
 
 class Queue final : public Object<QueueInterface> {
@@ -258,8 +311,8 @@ class Queue final : public Object<QueueInterface> {
         {
             const std::lock_guard lock(mutex_);
             // the file is held until the request is done
-            if (!(request->options & 1ull << 22) && request->source)
-                static_cast<IUnknown *>(request->source)->AddRef();
+            if (auto *const file = file_of(*request))
+                file->AddRef();
             pending_.emplace_back(*request);
         }
         submit_when_full();
@@ -339,11 +392,11 @@ class Queue final : public Object<QueueInterface> {
                     std::fprintf(stderr,
                                  "[Runtime] DirectStorage request: options 0x%llx, %u bytes at "
                                  "%llu to %u bytes (intermediate %u): 0x%08lx\n",
-                                 request->options, request->source_size, request->file_offset,
-                                 request->destination_size, request->intermediate_size,
-                                 static_cast<unsigned long>(result));
-                if (!(request->options & 1ull << 22) && request->source)
-                    static_cast<IUnknown *>(request->source)->Release();
+                                 std::bit_cast<UINT64>(request->options), request->source_size,
+                                 request->file_offset, request->destination_size,
+                                 request->intermediate_size, static_cast<unsigned long>(result));
+                if (auto *const file = file_of(*request))
+                    file->Release();
                 if (FAILED(result)) {
                     if (SUCCEEDED(since_mark))
                         since_mark = result;
@@ -370,8 +423,8 @@ class Queue final : public Object<QueueInterface> {
             auto *const request = std::get_if<Request>(&entry);
             if (!request || (request->tag & mask) != value)
                 return false;
-            if (!(request->options & 1ull << 22) && request->source)
-                static_cast<IUnknown *>(request->source)->Release();
+            if (auto *const file = file_of(*request))
+                file->Release();
             return true;
         });
     }

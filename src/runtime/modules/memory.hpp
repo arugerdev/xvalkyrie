@@ -22,5 +22,10 @@ void *commit_title_memory(void *address, std::size_t size);
 HRESULT WINAPI allocate_graphics_memory(SIZE_T size, UINT64 alignment, UINT64 address, UINT flags,
                                         void **result);
 HRESULT WINAPI free_graphics_memory(void *address);
+// Copies `size` bytes to (`write`) or from `data` and the title's physical pages `pages`, by
+// the numbers XMemAllocatePhysicalPages gave them, from `offset` into the first: the pages
+// need not be mapped. False if one is not a page the title holds.
+bool copy_physical_pages(const ULONG_PTR *pages, std::size_t offset, std::uint8_t *data,
+                         std::size_t size, bool write);
 } // namespace modules
 } // namespace xv::runtime

@@ -1,5 +1,6 @@
 #include "runtime/modules/memory.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/placement.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -52,6 +53,8 @@ struct Physical {
     bool check = std::getenv("XV_MEM_CHECK");
     std::multimap<ULONG_PTR, std::uintptr_t> where;
     int told = 0;
+    std::multimap<ULONG_PTR, std::uintptr_t> mapped_at; // where each page is mapped
+    std::uint8_t *view = nullptr; // the whole section, made when the host first needs it
 };
 Physical &physical() {
     static Physical state;
@@ -89,6 +92,11 @@ bool take_pages(Physical &state, std::uintptr_t count, std::uintptr_t run, ULONG
         state.used[pages[j]] = false;
     return false;
 }
+// the page a title names by the number of its first frame, where there is one
+bool page_of(const Physical &state, ULONG_PTR frame, ULONG_PTR *number) {
+    *number = frame / frames;
+    return *number < state.used.size();
+}
 void release_page(Physical &state, ULONG_PTR number) {
     if (state.check && state.where.contains(number) && state.told++ < 200) {
         std::fprintf(stderr, "[Memory] page %llu is given back while mapped at %llx%c",
@@ -115,6 +123,11 @@ void unmap(Physical &state, Reservation &reservation, std::uintptr_t address) {
     }
     if (view->second.owned)
         release_page(state, view->second.page);
+    for (auto [at, end] = state.mapped_at.equal_range(view->second.page); at != end; ++at)
+        if (at->second == address) {
+            state.mapped_at.erase(at);
+            break;
+        }
     reservation.views.erase(view);
 }
 bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULONG_PTR number,
@@ -142,6 +155,7 @@ bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULON
         }
         state.where.emplace(number, address);
     }
+    state.mapped_at.emplace(number, address);
     return true;
 }
 void *reserve(void *address, std::uintptr_t size, DWORD type) {
@@ -572,5 +586,52 @@ void install_xmem(Registry &registry) {
         for (const auto &[known, function] : functions)
             if (std::string_view(known) == name)
                 registry.add_api(name, function);
+}
+bool copy_physical_pages(const ULONG_PTR *pages, std::size_t offset, std::uint8_t *data,
+                         std::size_t size, bool write) {
+    if (!size)
+        return true;
+    if (!pages || offset >= page)
+        return false;
+    auto &state = physical();
+    // each page's place in the view, and where the title has it mapped
+    std::vector<std::pair<std::uint8_t *, std::vector<std::uintptr_t>>> spans;
+    {
+        const std::lock_guard lock(state.mutex);
+        if (!state.section)
+            return false;
+        if (!state.view)
+            state.view = static_cast<std::uint8_t *>(MapViewOfFile3(
+                state.section, nullptr, nullptr, 0, physical_size, 0, PAGE_READWRITE, nullptr, 0));
+        if (!state.view)
+            return false;
+        for (std::size_t index = 0, left = offset + size; left; ++index) {
+            const auto number = pages[index];
+            if (number >= state.used.size() || !state.used[number])
+                return false;
+            auto *const at = state.view + number * page;
+            if (!VirtualAlloc(at, page, MEM_COMMIT, PAGE_READWRITE))
+                return false;
+            std::vector<std::uintptr_t> addresses;
+            if (write)
+                for (auto [it, end] = state.mapped_at.equal_range(number); it != end; ++it)
+                    addresses.push_back(it->second);
+            spans.emplace_back(at, std::move(addresses));
+            left -= std::min<std::size_t>(left, page);
+        }
+    }
+    for (std::size_t index = 0, done = 0; done < size; ++index) {
+        const auto first = index ? 0 : offset;
+        const auto here = std::min<std::size_t>(size - done, page - first);
+        const auto &[at, addresses] = spans[index];
+        for (const auto address : addresses)
+            prepare_title_write(reinterpret_cast<const void *>(address + first), here);
+        if (write)
+            std::memcpy(at + first, data + done, here);
+        else
+            std::memcpy(data + done, at + first, here);
+        done += here;
+    }
+    return true;
 }
 } // namespace xv::runtime::modules

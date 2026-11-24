@@ -3686,14 +3686,24 @@ HRESULT STDMETHODCALLTYPE queue_query(void *self, REFIID iid, void **object) {
 ULONG STDMETHODCALLTYPE queue_add_ref(void *self) {
     return ++static_cast<QueueProxy *>(self)->references;
 }
+void note_queue_wait(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value);
+void forget_queue(ID3D12CommandQueue *queue);
 ULONG STDMETHODCALLTYPE queue_release(void *self) {
     auto *const proxy = static_cast<QueueProxy *>(self);
     const auto left = --proxy->references;
     if (left == 0) {
+        forget_queue(proxy->host);
         proxy->host->Release();
         delete proxy;
     }
     return left;
+}
+// Wait (15): the host's, noted for order_queues
+HRESULT STDMETHODCALLTYPE queue_wait(void *self, ID3D12Fence *fence, UINT64 value) {
+    const auto result = queue_host(self)->Wait(fence, value);
+    if (SUCCEEDED(result))
+        note_queue_wait(queue_host(self), fence, value);
+    return result;
 }
 void STDMETHODCALLTYPE queue_execute(void *self, UINT count, ID3D12CommandList *const *lists) {
     execute_command_lists(queue_host(self), count, lists);
@@ -3734,6 +3744,7 @@ std::array<Slot, 48> queue_vtable_of(std::index_sequence<Index...>) {
     vtable[1] = reinterpret_cast<Slot>(&queue_add_ref);
     vtable[2] = reinterpret_cast<Slot>(&queue_release);
     vtable[10] = reinterpret_cast<Slot>(&queue_execute);
+    vtable[15] = reinterpret_cast<Slot>(&queue_wait);
     // The later layout's 35 (33 here, see queue_by_layout): ExecuteCommandListsX(count,
     // lists, a value, flags), which a title of the later kits submits all its lists with
     vtable[33] = reinterpret_cast<Slot>(&queue_execute);
@@ -4012,6 +4023,7 @@ struct ListProxy {
     D3D12_VERTEX_BUFFER_VIEW vertices{};       // XV_D3D_LOST: the title's first stream, set last
     UINT vertex_calls = 0;
     bool legacy_barriers = false; // Barrier as on a host without enhanced barriers
+    bool waits_memory = false;    // it has a Wait32BitValueX or Wait64BitValueX
     RootArgument &argument(UINT parameter) {
         if (graphics_arguments.size() <= parameter)
             graphics_arguments.resize(std::min<std::size_t>(parameter, 63) + 1);
@@ -4815,6 +4827,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->heap_uses = state ? heap_uses(state) : nullptr;
     list->graphics_arguments.clear();
     list->ours_bound = false;
+    list->waits_memory = false;
     const auto result = host_of(self)->Reset(allocator, state);
     if (static std::atomic<int> shown{0};
         std::getenv("XV_D3D_LOST") && (FAILED(result) || shown < 80) && shown++ < 200) {
@@ -5726,6 +5739,7 @@ void STDMETHODCALLTYPE clear_uav_float(void *self, D3D12_GPU_DESCRIPTOR_HANDLE g
                                                  count, rects);
 }
 void STDMETHODCALLTYPE ignored_list_method(void *) {}
+void STDMETHODCALLTYPE flush_pipeline_x(void *self, UINT, std::uint64_t, std::uint64_t);
 template <std::size_t... Index>
 std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     std::array<Slot, list_slots> vtable{reinterpret_cast<Slot>(&list_method<Index>)...};
@@ -5766,9 +5780,8 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[52] = reinterpret_cast<Slot>(&clear_render_target);
     vtable[53] = reinterpret_cast<Slot>(&clear_uav_uint);
     vtable[54] = reinterpret_cast<Slot>(&clear_uav_float);
-    // FlushPipelineX and OMSetDepthBoundsX: cache flushes the host makes itself, and a depth
-    // bounds test no host pipeline here enables
-    vtable[67] = reinterpret_cast<Slot>(&ignored_list_method);
+    vtable[67] = reinterpret_cast<Slot>(&flush_pipeline_x);
+    // OMSetDepthBoundsX: a depth bounds test no host pipeline here enables
     vtable[68] = reinterpret_cast<Slot>(&ignored_list_method);
     // what tunes the console's GPU and changes no picture: occlusion query and hierarchical
     // stencil controls, NopX, KickoffX, shader limits and compression state
@@ -5922,6 +5935,32 @@ void STDMETHODCALLTYPE write_buffer_immediate(
                                modes ? host_modes.data() : nullptr);
     list->Release();
 }
+// FlushPipelineX(flags, address, size): on the console the GPU finishes the work before it and
+// flushes the caches the flags name, which a title may use where a desktop title has a
+// barrier. Here it is a global barrier from all work and its writes to all work after
+// (enhanced_barriers), whatever the flags: their values are the console header's own, and a
+// flush of everything is never less than the one asked for. A global barrier has only the
+// accesses no texture layout stands for (the Enhanced Barriers spec): what a texture's layout
+// changes for is the title's own texture barrier.
+void STDMETHODCALLTYPE flush_pipeline_x(void *self, UINT, std::uint64_t, std::uint64_t) {
+    constexpr auto written = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS |
+                             D3D12_BARRIER_ACCESS_STREAM_OUTPUT | D3D12_BARRIER_ACCESS_COPY_DEST;
+    constexpr auto read = written | D3D12_BARRIER_ACCESS_VERTEX_BUFFER |
+                          D3D12_BARRIER_ACCESS_CONSTANT_BUFFER | D3D12_BARRIER_ACCESS_INDEX_BUFFER |
+                          D3D12_BARRIER_ACCESS_SHADER_RESOURCE |
+                          D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT | D3D12_BARRIER_ACCESS_COPY_SOURCE;
+    const D3D12_GLOBAL_BARRIER all{D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_SYNC_ALL, written, read};
+    D3D12_BARRIER_GROUP group{D3D12_BARRIER_TYPE_GLOBAL, 1};
+    group.pGlobalBarriers = &all;
+    enhanced_barriers(self, 1, &group);
+}
+// Wait32BitValueX and Wait64BitValueX (address, value, ...): on the console the GPU waits until
+// the memory at the address compares as asked with the value, which work of another queue
+// writes. The host's GPU has no such wait: a submission with one waits instead for the work
+// the other queues were given before it (see order_queues).
+void STDMETHODCALLTYPE wait_memory(void *self) {
+    static_cast<ListProxy *>(self)->waits_memory = true;
+}
 // the slots where the two consoles' lists differ
 void configure_lists() {
     map_list_slots();
@@ -5931,8 +5970,7 @@ void configure_lists() {
     list_vtable[63] = reinterpret_cast<Slot>(&fill_memory_128);
     list_vtable[69] = reinterpret_cast<Slot>(&write_32_bottom_of_pipe);
     list_vtable[70] = reinterpret_cast<Slot>(&write_64_bottom_of_pipe);
-    // Wait32BitValueX and Wait64BitValueX
-    list_vtable[71] = list_vtable[72] = reinterpret_cast<Slot>(&ignored_list_method);
+    list_vtable[71] = list_vtable[72] = reinterpret_cast<Slot>(&wait_memory);
     list_vtable[88] = list_vtable[90] = reinterpret_cast<Slot>(&write_32);
     list_vtable[89] = reinterpret_cast<Slot>(&write_64_top_of_pipe);
     const auto ignore = [](std::initializer_list<std::size_t> slots) {
@@ -6407,6 +6445,93 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
     queue->Signal(uploader.fence, ++uploader.value);
     device->Release();
 }
+// The order of the queues' work for the console's waits on memory (wait_memory). Each queue
+// signals a fence of ours after each submission. A submission with a list that waits on
+// memory first waits, on the GPU, for each other queue's work up to its last submission, or
+// up to the first wait of its own (Wait, or one made here) that is not over yet: work after
+// such a wait may itself wait for this queue, and the two would wait for each other forever.
+struct QueueOrder {
+    ID3D12Fence *fence = nullptr;
+    UINT64 submitted = 0; // the fence's value after the last submission
+    struct Pending {
+        UINT64 after; // the submissions before it
+        ID3D12Fence *fence;
+        UINT64 value;
+    };
+    std::deque<Pending> waits;
+};
+std::mutex order_mutex;
+std::map<ID3D12CommandQueue *, QueueOrder> queue_orders;
+// how far the queue's work goes with nothing left to wait for (order_mutex held)
+UINT64 free_until(QueueOrder &order) {
+    while (!order.waits.empty() &&
+           order.waits.front().fence->GetCompletedValue() >= order.waits.front().value) {
+        order.waits.front().fence->Release();
+        order.waits.pop_front();
+    }
+    return order.waits.empty() ? order.submitted : order.waits.front().after;
+}
+void note_wait(QueueOrder &order, ID3D12Fence *fence, UINT64 value) {
+    if (fence->GetCompletedValue() >= value)
+        return;
+    fence->AddRef();
+    order.waits.push_back({order.submitted, fence, value});
+}
+void note_queue_wait(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value) {
+    if (!fence)
+        return;
+    const std::lock_guard lock(order_mutex);
+    note_wait(queue_orders[queue], fence, value);
+}
+void forget_queue(ID3D12CommandQueue *queue) {
+    const std::lock_guard lock(order_mutex);
+    const auto found = queue_orders.find(queue);
+    if (found == queue_orders.end())
+        return;
+    for (const auto &pending : found->second.waits)
+        pending.fence->Release();
+    if (found->second.fence)
+        found->second.fence->Release();
+    queue_orders.erase(found);
+}
+// before the queue is given the lists: the other queues' work first, if one waits on memory
+void order_before(ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *lists) {
+    bool waits = false;
+    {
+        const std::lock_guard lock(proxy_mutex);
+        for (UINT i = 0; i < count && !waits; ++i)
+            waits =
+                list_proxies.contains(lists[i]) &&
+                static_cast<const ListProxy *>(static_cast<const void *>(lists[i]))->waits_memory;
+    }
+    if (!waits)
+        return;
+    const std::lock_guard lock(order_mutex);
+    auto &own = queue_orders[queue];
+    for (auto &[other, order] : queue_orders) {
+        if (other == queue || !order.fence)
+            continue;
+        if (const auto until = free_until(order);
+            until && SUCCEEDED(queue->Wait(order.fence, until)))
+            note_wait(own, order.fence, until);
+    }
+}
+// after: the queue's fence of ours moves on
+void order_after(ID3D12CommandQueue *queue) {
+    const std::lock_guard lock(order_mutex);
+    auto &order = queue_orders[queue];
+    if (!order.fence) {
+        ID3D12Device *device = nullptr;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))))
+            return;
+        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&order.fence));
+        device->Release();
+        if (!order.fence)
+            return;
+    }
+    if (SUCCEEDED(queue->Signal(order.fence, order.submitted + 1)))
+        ++order.submitted;
+}
 // ID3D12CommandQueue::ExecuteCommandLists: the host's lists for the title's proxies
 void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT count,
                                              ID3D12CommandList *const *lists) {
@@ -6428,7 +6553,9 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
         std::fprintf(stderr, "%c", 10);
         std::fflush(stderr);
     }
+    order_before(self, count, lists);
     self->ExecuteCommandLists(count, host.data());
+    order_after(self);
     // the submission the host drops the device at
     if (static std::atomic<bool> told{false}; !told.load())
         if (auto *const device = d3d12_device.load();

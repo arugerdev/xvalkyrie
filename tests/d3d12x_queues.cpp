@@ -1,0 +1,143 @@
+#include "d3d12x_title.hpp"
+
+#include <cstdint>
+
+// What orders the GPU's work on the console without a fence: FlushPipelineX in a list, and
+// Wait32BitValueX / Wait64BitValueX, a wait for a value another queue's work writes in memory.
+// The host has no wait on memory: a list with one runs after what the other queues were given
+// before it, up to a wait of theirs that is not over.
+namespace {
+using namespace d3d12x_test;
+
+// The later kits' layout of queues and lists, set by the title's first Signal at the queue's
+// slot 16 (see queue_by_layout): every list method from 59 on is two slots further, and so are
+// the queue's Signal (16) and Wait (17).
+constexpr std::uint32_t queue_signal = 16, queue_wait = 17, flush_pipeline = 69, wait_32 = 73;
+ID3D12Fence *fence() {
+    ID3D12Fence *made = nullptr;
+    REQUIRE(SUCCEEDED(device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&made))));
+    return made;
+}
+void later_layout() {
+    static auto *const marker = fence();
+    CHECK(title().call(queue(), queue_signal, marker, std::uint64_t{1}) == S_OK);
+}
+// the title's compute queue (CreateCommandQueue, 8), and a list of its own type
+struct Compute {
+    void *queue = nullptr, *list = nullptr;
+    ID3D12CommandAllocator *allocator = nullptr;
+    Compute() {
+        const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_COMPUTE};
+        REQUIRE(title().call(device(), 8, &desc, &__uuidof(ID3D12CommandQueue), &queue) == S_OK);
+        REQUIRE(title().call(device(), 9, D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                             &__uuidof(ID3D12CommandAllocator),
+                             reinterpret_cast<void **>(&allocator)) == S_OK);
+        REQUIRE(title().call(device(), 12, 0u, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator,
+                             static_cast<ID3D12PipelineState *>(nullptr),
+                             &__uuidof(ID3D12GraphicsCommandList), &list) == S_OK);
+    }
+    ~Compute() {
+        static_cast<IUnknown *>(list)->Release();
+        allocator->Release();
+        static_cast<IUnknown *>(queue)->Release();
+    }
+};
+// a list with nothing in it, closed and given to the title's direct queue
+void submit_nothing(Work &work) {
+    CHECK(title().call(work.list, 9) == S_OK);
+    void *const lists[]{work.list};
+    title().call<void>(queue(), 10, 1u, lists);
+}
+bool reaches(ID3D12Fence *fence, UINT64 value, DWORD milliseconds) {
+    auto *const event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    REQUIRE(SUCCEEDED(fence->SetEventOnCompletion(value, event)));
+    const bool reached = WaitForSingleObject(event, milliseconds) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    return reached;
+}
+// a compute list that waits on memory, given to its queue, which then signals `done`
+void wait_on_memory(Compute &compute, ID3D12Fence *done) {
+    static std::uint32_t value = 1;
+    title().call<void>(compute.list, wait_32, reinterpret_cast<std::uint64_t>(&value),
+                       std::uint64_t{1}, 0u, 0u);
+    CHECK(title().call(compute.list, 9) == S_OK);
+    void *const lists[]{compute.list};
+    title().call<void>(compute.queue, 10, 1u, lists);
+    CHECK(title().call(compute.queue, queue_signal, done, std::uint64_t{1}) == S_OK);
+}
+} // namespace
+
+TEST_CASE("a list that waits on memory runs after the work other queues were given before it") {
+    if (!device())
+        return;
+    later_layout();
+    auto *const held = fence();
+    auto *const done = fence();
+    // the direct queue is held by a wait the title did not make, then given a list
+    auto *const direct = xv::runtime::modules::d3d12x::direct_queue();
+    REQUIRE(direct);
+    REQUIRE(SUCCEEDED(direct->Wait(held, 1)));
+    Work work;
+    submit_nothing(work);
+    Compute compute;
+    wait_on_memory(compute, done);
+    CHECK_FALSE(reaches(done, 1, 300));
+    REQUIRE(SUCCEEDED(held->Signal(1)));
+    CHECK(reaches(done, 1, 10000));
+    CHECK(removed_reason() == S_OK);
+    done->Release();
+    held->Release();
+}
+
+TEST_CASE("a list that waits on memory does not wait past another queue's wait not yet over") {
+    if (!device())
+        return;
+    later_layout();
+    auto *const held = fence();
+    auto *const done = fence();
+    // the title's own Wait: what the direct queue is given after it may wait for the compute
+    // queue, which therefore does not wait for it
+    CHECK(title().call(queue(), queue_wait, held, std::uint64_t{1}) == S_OK);
+    Work work;
+    submit_nothing(work);
+    Compute compute;
+    wait_on_memory(compute, done);
+    CHECK(reaches(done, 1, 10000));
+    REQUIRE(SUCCEEDED(held->Signal(1)));
+    auto *const direct = xv::runtime::modules::d3d12x::direct_queue();
+    auto *const idle = fence();
+    REQUIRE(SUCCEEDED(direct->Signal(idle, 1)));
+    CHECK(reaches(idle, 1, 10000));
+    CHECK(removed_reason() == S_OK);
+    idle->Release();
+    done->Release();
+    held->Release();
+}
+
+TEST_CASE("FlushPipelineX orders a list's work as a barrier does") {
+    if (!device())
+        return;
+    later_layout();
+    std::uint64_t output = 0;
+    auto *const results = buffer(4096, output);
+    const D3D12_ROOT_PARAMETER parameters[]{root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const signature = root_signature({1, parameters});
+    auto *const add = compute_pipeline(signature, R"(
+        RWByteAddressBuffer output : register(u0);
+        [numthreads(1, 1, 1)] void main() { output.Store(0, output.Load(0) + 1u); })");
+    Work work;
+    work.record(33, signature);
+    work.record(25, add);
+    work.record(45, 0u, output);
+    for (int i = 0; i < 4; ++i) {
+        work.record(14, 1u, 1u, 1u);
+        // flags, address, size: the flags' values are the console's own
+        work.record(flush_pipeline, 0xffffffffu, std::uint64_t{0}, std::uint64_t{0});
+    }
+    work.run();
+    CHECK(removed_reason() == S_OK);
+    CHECK(words(output)[0] == 4);
+    add->Release();
+    signature->Release();
+    results->Release();
+}

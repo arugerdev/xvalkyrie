@@ -2903,13 +2903,24 @@ class Translator {
     void emit_shared(const Ins &ins) {
         const auto name = ins.name;
         const auto offset = ins.w0 & 0xffff;
-        const auto source = (ins.w1 >> 8) & 0xff, destination = ins.w1 >> 24;
+        // a swizzle has no data operand: the value it moves is in its address field (LLVM's
+        // AMDGPU DS_1A_RET form)
+        const auto source = ins.w1 & 0xff, destination = ins.w1 >> 24;
         if (name != "ds_swizzle_b32") {
             emit_group_memory(ins);
             return;
         }
-        if (stage_ != Stage::pixel || !(offset >> 15 & 1))
-            give_up("ds_swizzle_b32 that is not between the pixels of a quad");
+        // The two modes of the offset, as AMD's RDNA ISA guides and LLVM's AMDGPU assembler
+        // describe them: bit 15 set, each lane of four takes the lane of its quad that two bits
+        // of the low byte name; bit 15 clear, lane ((lane & and) | or) ^ xor of its 32, with
+        // the three masks in bits 0, 5 and 10. Other values with bit 15 set are other modes.
+        const bool quad = offset >> 15 & 1;
+        if (quad && (offset & 0x7f00))
+            give_up("ds_swizzle_b32 in a mode other than a quad's or a mask's");
+        if (stage_ != Stage::pixel || !quad) {
+            emit_swizzle(offset, v(source), destination);
+            return;
+        }
         const auto id = "x" + std::to_string(temporaries_++);
         if (const auto lane = offset & 3; (offset & 0xff) == lane * 0x55) {
             // Every pixel takes the same one's value, which is how a shader takes
@@ -2937,6 +2948,31 @@ class Translator {
         set_v(destination,
               u(id + " + ((float)(" + id + "q & 1u) - (float)(quad & 1u)) * ddx_fine(" + id +
                 ") + ((float)(" + id + "q >> 1) - (float)(quad >> 1)) * ddy_fine(" + id + ")"));
+    }
+    // A swizzle anywhere but between the pixels of a quad: a read of the lane of the wave the
+    // offset names, within the lane's 32 (a host wave has at least that many lanes where it
+    // has 32 or 64, as AMD's and NVIDIA's do). A compute shader takes its wave as the one
+    // lane it is run for (see emit_lanes), and its swizzle does too: the lane's own value
+    // where lane 0 reads lane 0, else the nothing the lanes around it hold.
+    void emit_swizzle(std::uint32_t offset, const std::string &value, std::uint32_t destination) {
+        const bool quad = offset >> 15 & 1;
+        const auto and_mask = offset & 0x1f, or_mask = (offset >> 5) & 0x1f,
+                   xor_mask = (offset >> 10) & 0x1f;
+        if (stage_ == Stage::compute) {
+            const bool own = quad ? (offset & 3) == 0 : (or_mask ^ xor_mask) == 0;
+            set_v(destination, own ? value : std::string("0u"));
+            return;
+        }
+        needs_sm6_ = true;
+        const auto id = "x" + std::to_string(temporaries_++);
+        const auto lane = id + "lane";
+        line("uint " + lane + " = WaveGetLaneIndex();");
+        const auto target = quad ? "(" + lane + " & ~3u) | ((" + hex(offset & 0xff) + " >> ((" +
+                                       lane + " & 3u) * 2u)) & 3u)"
+                                 : "(" + lane + " & ~31u) | (((" + lane + " & " + hex(and_mask) +
+                                       ") | " + hex(or_mask) + ") ^ " + hex(xor_mask) + ")";
+        line("uint " + id + " = WaveReadLaneAt(" + value + ", " + target + ");");
+        set_v(destination, id);
     }
     void emit_vop1(std::string_view name, std::uint32_t destination, const std::string &a) {
         std::string value;

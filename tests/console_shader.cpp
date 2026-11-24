@@ -69,8 +69,10 @@ std::optional<std::string> pixel_move(std::uint32_t move, std::uint32_t selector
 }
 // The translation of a pixel shader of these words, which the host's compiler must take.
 // Before them, as console_shader_probe has for a compute shader: a descriptor of the first
-// table in s[12:19] and a sampler of the second in s[24:27].
-std::string pixel_translated(std::initializer_list<std::uint32_t> words) {
+// table in s[12:19] and a sampler of the second in s[24:27]. With `needs_sm6`, whether it
+// takes Shader Model 6, and then the older compiler is not asked.
+std::string pixel_translated(std::initializer_list<std::uint32_t> words,
+                             bool *needs_sm6 = nullptr) {
     std::vector<std::uint32_t> code = {
         0xf40c0304, 0xfa000000, // s_load_dwordx8 s[12:19], s[8:9], 0
         0xbe940309,             // s_mov_b32 s20, s9
@@ -99,11 +101,12 @@ std::string pixel_translated(std::initializer_list<std::uint32_t> words) {
                               {},
                               {{"SV_Target", 0, 3, 4, true, 0, 15, 0}}};
     std::string why;
-    const auto source = rdna::translate(ShaderStage::pixel, shader, &why);
+    const auto source = rdna::translate(ShaderStage::pixel, shader, &why, nullptr, needs_sm6);
     INFO(why);
     REQUIRE(source);
     INFO(*source);
-    CHECK(console_shader_errors(ShaderStage::pixel, *source).empty());
+    if (!needs_sm6)
+        CHECK(console_shader_errors(ShaderStage::pixel, *source).empty());
     return *source;
 }
 } // namespace
@@ -293,4 +296,37 @@ TEST_CASE("a pixel DPP8 move can rearrange the four lanes of each quad") {
     CHECK_FALSE(needs_sm6);
     CHECK_FALSE(pixel_move(0x7e3002ea, 0x9f50d114, why, needs_sm6)); // fetch inactive lanes
     CHECK_FALSE(needs_sm6);
+}
+
+TEST_CASE("a swizzle outside a pixel quad reads the lane its offset names") {
+    // ds_swizzle_b32 v3, v2 offset:swizzle(SWAP,16), the value in its address field; exp mrt0
+    // v3, off, off, off done
+    bool needs_sm6 = false;
+    const auto source =
+        pixel_translated({0xd8d4401f, 0x03000002, 0xf8001801, 0x00000003}, &needs_sm6);
+    CHECK(needs_sm6);
+    CHECK(source.find("WaveReadLaneAt(v2, ") != std::string::npos);
+    CHECK(source.find("& ~31u) | (((") != std::string::npos);
+    CHECK(source.find("0x00000010u)") != std::string::npos);
+}
+
+TEST_CASE("a swizzle in a compute shader takes its wave as the one lane it is run for") {
+    // ds_swizzle_b32 v1, v2 offset:swizzle(SWAP,16); ds_swizzle_b32 v3, v2
+    // offset:swizzle(BROADCAST,32,0); ds_swizzle_b32 v4, v2 offset:swizzle(QUAD_PERM,1,0,3,2);
+    // ds_swizzle_b32 v5, v2 offset:swizzle(QUAD_PERM,0,0,0,0)
+    const auto source = translated({0xd8d4401f, 0x01000002, 0xd8d40000, 0x03000002, 0xd8d480b1,
+                                    0x04000002, 0xd8d48000, 0x05000002});
+    CHECK(source.find("WaveReadLaneAt(") == std::string::npos);
+    CHECK(last_set(source, "v1") == "0u");
+    CHECK(last_set(source, "v3") == "v2");
+    CHECK(last_set(source, "v4") == "0u");
+    CHECK(last_set(source, "v5") == "v2");
+    // an offset with bit 15 and more set is a mode the translator does not know
+    CHECK_FALSE(console_shader_probe(std::vector<std::uint32_t>{0xd8d4e01f, 0x03000004}).empty());
+}
+
+TEST_CASE("a swizzle between the pixels of a quad reads the register in its address field") {
+    // ds_swizzle_b32 v3, v2 offset:swizzle(QUAD_PERM,0,0,0,0); exp mrt0 v3, off, off, off done
+    const auto source = pixel_translated({0xd8d48000, 0x03000002, 0xf8001801, 0x00000003});
+    CHECK(source.find("= asfloat(v2);") != std::string::npos);
 }

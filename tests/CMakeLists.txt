@@ -1,7 +1,7 @@
 add_executable(xv_tests tests.cpp pe_directories.cpp loader_image.cpp xvd.cpp pri.cpp gameruntime.cpp dstorage.cpp
-  console_shader.cpp memory.cpp timers.cpp placement.cpp frame_events.cpp)
+  console_shader.cpp memory.cpp timers.cpp placement.cpp frame_events.cpp d3d12x.cpp)
 target_link_libraries(xv_tests PRIVATE xv_options xv_pe xv_core xv_catch xv_xvd xv_pri xv_loader
-  xv_runtime_common xv_runtime_modules d3dcompiler)
+  xv_runtime_common xv_runtime_modules d3dcompiler d3d12 dxgi)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME fixture COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/corpus/generate.py"
   --all "${CMAKE_CURRENT_BINARY_DIR}")

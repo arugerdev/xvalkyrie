@@ -21,6 +21,10 @@ void set_adapter_wrapper(AdapterWrapper wrapper);
 ID3D12CommandQueue *direct_queue();
 // a Direct3D 12 resource handed to the title: the console's methods where they differ
 void console_d3d12_resource(void *resource);
+// The console's command list on a host one, as the device makes it for the title, with a
+// reference of its own to the host's. Without `enhanced_barriers` its Barrier is as on a host
+// that has none. Exposed for the tests.
+void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barriers = true);
 // why the host's device stopped, and what its debug layer said, to the log
 void report_failure();
 // a texture's first subresource, copied to the CPU through the title's direct queue

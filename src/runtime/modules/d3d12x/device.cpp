@@ -2217,13 +2217,14 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
                         console == Target::scarlett ? desc : nullptr);
     return result;
 }
-// The later kits' CreatePlacedResourceX (device slot 133) and CreateCommittedResource (127)
-// take a D3D12_RESOURCE_DESC1 and a D3D12_BARRIER_LAYOUT where the first took a state: -1
-// (undefined) for a buffer. The other layouts are taken as the states they stand for. A
-// title that calls them has the later layouts of queues and lists as well, and may record
-// lists before any call of a queue shows it.
-D3D12_RESOURCE_STATES layout_state(UINT layout, const void *caller) {
-    later_queue = true;
+// The state a D3D12_BARRIER_LAYOUT stands for, by the table of the two in the Enhanced
+// Barriers spec (Microsoft's DirectX-Specs); the layouts of one kind of queue as the general
+// ones, the compute queue's shader resource without pixel shaders. 30 has no name in later
+// headers, and 31 is DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE, which earlier ones
+// do not have. UNDEFINED (-1) and what no header names are COMMON.
+D3D12_RESOURCE_STATES legacy_state(UINT layout) {
+    constexpr auto shader_resource =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     static constexpr D3D12_RESOURCE_STATES states[]{
         D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -2231,33 +2232,81 @@ D3D12_RESOURCE_STATES layout_state(UINT layout, const void *caller) {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_DEPTH_WRITE,
         D3D12_RESOURCE_STATE_DEPTH_READ,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        shader_resource,
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
         D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
-        D3D12_RESOURCE_STATE_RESOLVE_DEST};
+        D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE,
+        D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+        D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+        D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ,
+        D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE,
+        D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
+        D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+        // the direct queue's
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        shader_resource,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        // the compute queue's
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        // 30, then 31
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+    };
+    return layout < std::size(states) ? states[layout] : D3D12_RESOURCE_STATE_COMMON;
+}
+// The later kits' CreatePlacedResourceX (device slot 133) and CreateCommittedResource (127)
+// take a D3D12_RESOURCE_DESC1 and a D3D12_BARRIER_LAYOUT where the first took a state: -1
+// (undefined) for a buffer. The other layouts are taken as the states they stand for. A
+// title that calls them has the later layouts of queues and lists as well, and may record
+// lists before any call of a queue shows it.
+D3D12_RESOURCE_STATES layout_state(UINT layout, const void *caller) {
+    later_queue = true;
     if (static std::atomic<int> shown{0}; layout != ~0u && shown++ < 8) {
         std::fprintf(stderr, "[Runtime] a resource created with layout %u from %s\n", layout,
                      detail::guest_location(caller).c_str());
         std::fflush(stderr);
     }
-    return layout < std::size(states) ? states[layout] : D3D12_RESOURCE_STATE_COMMON;
+    return legacy_state(layout);
+}
+// A texture made in a layout is in the state it stands for until a barrier moves it: an
+// enhanced barrier from UNDEFINED starts there (see enhanced_barriers).
+void remember_state(ID3D12Resource *resource, D3D12_RESOURCE_STATES state);
+HRESULT made_in_layout(HRESULT result, const D3D12_RESOURCE_DESC *desc, UINT layout,
+                       void **resource) {
+    if (SUCCEEDED(result) && desc && desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+        resource && *resource)
+        remember_state(static_cast<ID3D12Resource *>(*resource), legacy_state(layout));
+    return result;
 }
 HRESULT STDMETHODCALLTYPE create_placed_resource_x_layout(ID3D12Device *self, std::uint64_t address,
                                                           const D3D12_RESOURCE_DESC *desc,
                                                           UINT layout,
                                                           const D3D12_CLEAR_VALUE *clear,
                                                           REFIID iid, void **resource) {
-    return create_placed_resource_x(self, address, desc, layout_state(layout, _ReturnAddress()),
-                                    clear, iid, resource);
+    return made_in_layout(create_placed_resource_x(self, address, desc,
+                                                   layout_state(layout, _ReturnAddress()), clear,
+                                                   iid, resource),
+                          desc, layout, resource);
 }
 // the arguments of the desktop's CreateCommittedResource3
 HRESULT STDMETHODCALLTYPE create_committed_resource_layout(
     ID3D12Device *self, const D3D12_HEAP_PROPERTIES *heap, D3D12_HEAP_FLAGS flags,
     const D3D12_RESOURCE_DESC *desc, UINT layout, const D3D12_CLEAR_VALUE *clear, void *, UINT,
     const DXGI_FORMAT *, REFIID iid, void **resource) {
-    const auto result = create_committed_resource(
-        self, heap, flags, desc, layout_state(layout, _ReturnAddress()), clear, iid, resource);
+    const auto result = made_in_layout(
+        create_committed_resource(self, heap, flags, desc, layout_state(layout, _ReturnAddress()),
+                                  clear, iid, resource),
+        desc, layout, resource);
     // A display target's memory is taken through the title's allocation hooks on the
     // console, in 64 KiB pages (bits 14 and 15 of the attributes: 2); a title that keeps a
     // pool for them checks how much of it went. The host's resource has no use for it.
@@ -3510,6 +3559,7 @@ struct ListProxy {
     bool ours_bound = false;                   // the host's list has heap_signature
     D3D12_VERTEX_BUFFER_VIEW vertices{};       // XV_D3D_LOST: the title's first stream, set last
     UINT vertex_calls = 0;
+    bool legacy_barriers = false; // Barrier as on a host without enhanced barriers
     RootArgument &argument(UINT parameter) {
         if (graphics_arguments.size() <= parameter)
             graphics_arguments.resize(std::min<std::size_t>(parameter, 63) + 1);
@@ -3539,7 +3589,8 @@ List *host_of(void *self) { return static_cast<ListProxy *>(self)->host; }
 // and 2 at 104 to 110. Xbox Series has two more methods of its own first (to 104), then
 // those at 105 to 111 and ID3D12GraphicsCommandList3 to 6 at 112 to 128, with four console
 // methods among them (122, 123, 126, 128). The host has all of them from 60 on, in the
-// desktop's order.
+// desktop's order. A title built with a later kit has console methods past 128, and
+// ID3D12GraphicsCommandList7's Barrier among them at 144 (see enhanced_barriers).
 constexpr std::size_t host_list_slots = 60, list_slots = 160, unmapped = ~std::size_t{0};
 std::array<std::size_t, list_slots> list_map{};
 void map_list_slots() {
@@ -3612,8 +3663,8 @@ HRESULT STDMETHODCALLTYPE list_query(void *self, REFIID iid, void **object) {
                        ID3D12GraphicsCommandList>(host_iid);
     if (!ours &&
         is_any<ID3D12GraphicsCommandList1, ID3D12GraphicsCommandList2, ID3D12GraphicsCommandList3,
-               ID3D12GraphicsCommandList4, ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6>(
-            host_iid)) {
+               ID3D12GraphicsCommandList4, ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6,
+               ID3D12GraphicsCommandList7>(host_iid)) {
         IUnknown *later = nullptr;
         if (SUCCEEDED(host_of(self)->QueryInterface(host_iid, reinterpret_cast<void **>(&later)))) {
             later->Release();
@@ -3764,8 +3815,9 @@ D3D12_RESOURCE_STATES host_state(D3D12_RESOURCE_STATES state) {
     state &= ~static_cast<D3D12_RESOURCE_STATES>(0x100000);
     return state & structure && state != structure ? state & ~structure : state;
 }
-// The state the title left each render target in, by its last transition: the console shows
-// a resource whatever its state, the host copies it out of one it has to be told
+// The state the title left each render target in, by its last transition (and each texture
+// its enhanced barriers moved): the console shows a resource whatever its state, the host
+// copies it out of one it has to be told
 std::mutex state_mutex;
 std::map<ID3D12Resource *, D3D12_RESOURCE_STATES> target_states;
 void STDMETHODCALLTYPE resource_barrier(void *self, UINT count,
@@ -3807,6 +3859,195 @@ void STDMETHODCALLTYPE resource_barrier(void *self, UINT count,
                 host_of(self)->ResourceBarrier(static_cast<UINT>(at - first), host.data() + first);
             first = at;
         }
+}
+void remember_state(ID3D12Resource *resource, D3D12_RESOURCE_STATES state) {
+    const std::lock_guard lock(state_mutex);
+    target_states[resource] = state;
+}
+// ID3D12GraphicsCommandList7::Barrier(group count, groups), the enhanced barriers of
+// Microsoft's d3d12.h and of the Enhanced Barriers spec (DirectX-Specs), which a title built
+// with a later kit makes its transitions with. A group is global, texture or buffer barriers;
+// each says what work waits for what (sync), how memory was used and will be (access), and
+// for a texture its layout before and after, of which subresources.
+//
+// The title's textures are the host's in the states their layouts stand for (layout_state),
+// and the host takes no enhanced barrier on a texture in a state other than COMMON (the
+// spec's rule for the two kinds together). So a texture's change of layout is a transition
+// as ResourceBarrier makes them, between the states the two layouts stand for, with no pixel
+// shader state on a list of another queue than the direct one. Where the layout before is
+// UNDEFINED, the state is the one the texture's last transition left it in. The halves of a
+// split barrier are its begin and its end, and DISCARD is the texture's discard once there.
+//
+// What only orders work (a global or a buffer barrier, a texture's with no change of layout)
+// is the host's enhanced barrier where it has them (D3D12_FEATURE_D3D12_OPTIONS12), global
+// for a texture, with only the bits the desktop's headers name, for the whole of a buffer
+// (the only range the host takes). Elsewhere it is an unordered access barrier, on the
+// resource or on all, which the spec gives as the legacy meaning of a global barrier.
+bool host_has_enhanced_barriers(List *host) {
+    static const bool has = [host] {
+        ID3D12Device *device = nullptr;
+        if (FAILED(host->GetDevice(IID_PPV_ARGS(&device))))
+            return false;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS12 options{};
+        const bool found = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12,
+                                                                 &options, sizeof options)) &&
+                           options.EnhancedBarriersSupported;
+        device->Release();
+        return found;
+    }();
+    return has;
+}
+constexpr auto known_sync = static_cast<D3D12_BARRIER_SYNC>(0x81f0ffff);
+constexpr auto known_access = static_cast<D3D12_BARRIER_ACCESS>(0x807fffff);
+// The subresources of a range as legacy barriers name them: each index, or
+// D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES alone for all. A range of no mip levels is one
+// index already (all of them at 0xffffffff, as in a legacy barrier).
+std::vector<UINT> range_subresources(ID3D12Resource *resource,
+                                     const D3D12_BARRIER_SUBRESOURCE_RANGE &range) {
+    if (!range.NumMipLevels)
+        return {range.IndexOrFirstMipLevel};
+    const auto desc = resource->GetDesc();
+    const UINT mips = std::max<UINT>(desc.MipLevels, 1);
+    const UINT slices = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                            ? 1
+                            : std::max<UINT>(desc.DepthOrArraySize, 1);
+    UINT planes = 1;
+    if (ID3D12Device *device = nullptr; SUCCEEDED(resource->GetDevice(IID_PPV_ARGS(&device)))) {
+        D3D12_FEATURE_DATA_FORMAT_INFO info{desc.Format};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof info)))
+            planes = std::max<UINT>(info.PlaneCount, 1);
+        device->Release();
+    }
+    const auto end = [](UINT first, UINT count, UINT limit) {
+        return static_cast<UINT>(std::min<std::uint64_t>(std::uint64_t{first} + count, limit));
+    };
+    const UINT mip_end = end(range.IndexOrFirstMipLevel, range.NumMipLevels, mips);
+    const UINT slice_end = end(range.FirstArraySlice, range.NumArraySlices, slices);
+    const UINT plane_end = end(range.FirstPlane, range.NumPlanes, planes);
+    if (!range.IndexOrFirstMipLevel && mip_end == mips && !range.FirstArraySlice &&
+        slice_end == slices && !range.FirstPlane && plane_end == planes)
+        return {D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES};
+    std::vector<UINT> indices;
+    for (UINT plane = range.FirstPlane; plane < plane_end; ++plane)
+        for (UINT slice = range.FirstArraySlice; slice < slice_end; ++slice)
+            for (UINT mip = range.IndexOrFirstMipLevel; mip < mip_end; ++mip)
+                indices.push_back(mip + (slice + plane * slices) * mips);
+    return indices;
+}
+void STDMETHODCALLTYPE enhanced_barriers(void *self, UINT32 count,
+                                         const D3D12_BARRIER_GROUP *groups) {
+    auto *const host = host_of(self);
+    ID3D12GraphicsCommandList7 *enhanced = nullptr;
+    if (!static_cast<ListProxy *>(self)->legacy_barriers && host_has_enhanced_barriers(host))
+        host->QueryInterface(IID_PPV_ARGS(&enhanced));
+    std::vector<D3D12_RESOURCE_BARRIER> legacy;
+    std::vector<std::pair<ID3D12Resource *, UINT>> discards;
+    std::vector<D3D12_GLOBAL_BARRIER> globals;
+    std::vector<D3D12_BUFFER_BARRIER> buffers;
+    // work before and work after in order, for one resource or for all
+    const auto order = [&](ID3D12Resource *resource, D3D12_BARRIER_SYNC sync_before,
+                           D3D12_BARRIER_SYNC sync_after, D3D12_BARRIER_ACCESS access_before,
+                           D3D12_BARRIER_ACCESS access_after) {
+        sync_before &= known_sync;
+        sync_after &= known_sync;
+        if (sync_before == D3D12_BARRIER_SYNC_NONE || sync_after == D3D12_BARRIER_SYNC_NONE)
+            return;
+        if (enhanced) {
+            const D3D12_GLOBAL_BARRIER known{sync_before, sync_after, access_before & known_access,
+                                             access_after & known_access};
+            if (resource && resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                buffers.push_back({known.SyncBefore, known.SyncAfter, known.AccessBefore,
+                                   known.AccessAfter, resource, 0, UINT64_MAX});
+            else
+                globals.push_back(known);
+            return;
+        }
+        if (sync_after == D3D12_BARRIER_SYNC_SPLIT)
+            return;
+        D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_UAV};
+        if (resource && resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+            barrier.UAV.pResource = resource;
+        legacy.push_back(barrier);
+    };
+    const bool direct = host->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const auto state = [direct](D3D12_RESOURCE_STATES of) {
+        return direct ? of : of & ~D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    };
+    const auto texture = [&](const D3D12_TEXTURE_BARRIER &of) {
+        constexpr auto undefined = D3D12_BARRIER_LAYOUT_UNDEFINED;
+        // with no layout after, what was there is not wanted: the texture stays as it is
+        if (of.LayoutAfter == undefined) {
+            if (of.LayoutBefore == undefined)
+                order(of.pResource, of.SyncBefore, of.SyncAfter, of.AccessBefore, of.AccessAfter);
+            return;
+        }
+        const auto before = state(of.LayoutBefore == undefined
+                                      ? tracked_state(of.pResource, D3D12_RESOURCE_STATE_COMMON)
+                                      : legacy_state(of.LayoutBefore));
+        const auto after = state(legacy_state(of.LayoutAfter));
+        const bool begins = of.SyncAfter == D3D12_BARRIER_SYNC_SPLIT;
+        constexpr auto discardable = D3D12_RESOURCE_STATE_RENDER_TARGET |
+                                     D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        const bool discard = !begins && of.Flags & D3D12_TEXTURE_BARRIER_FLAG_DISCARD &&
+                             of.LayoutBefore == undefined &&
+                             after & (direct ? discardable : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // the same state before and after: only work to order, unordered access with no
+        // enhanced barriers
+        if (before == after && (enhanced || after == D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+            order(of.pResource, of.SyncBefore, of.SyncAfter, of.AccessBefore, of.AccessAfter);
+        if (before == after && !discard)
+            return;
+        const auto subresources = range_subresources(of.pResource, of.Subresources);
+        for (const auto subresource : subresources) {
+            if (before == after)
+                break;
+            D3D12_RESOURCE_BARRIER barrier{D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
+            barrier.Flags = begins ? D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY
+                            : of.SyncBefore == D3D12_BARRIER_SYNC_SPLIT
+                                ? D3D12_RESOURCE_BARRIER_FLAG_END_ONLY
+                                : D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrier.Transition = {of.pResource, subresource, before, after};
+            legacy.push_back(barrier);
+        }
+        if (!begins)
+            remember_state(of.pResource, after);
+        if (discard)
+            for (const auto subresource : subresources)
+                discards.emplace_back(of.pResource, subresource);
+    };
+    for (UINT32 group = 0; groups && group < count; ++group) {
+        const auto &of = groups[group];
+        for (UINT32 i = 0; of.pGlobalBarriers && i < of.NumBarriers; ++i)
+            if (of.Type == D3D12_BARRIER_TYPE_GLOBAL) {
+                const auto &barrier = of.pGlobalBarriers[i];
+                order(nullptr, barrier.SyncBefore, barrier.SyncAfter, barrier.AccessBefore,
+                      barrier.AccessAfter);
+            } else if (of.Type == D3D12_BARRIER_TYPE_TEXTURE && of.pTextureBarriers[i].pResource) {
+                texture(of.pTextureBarriers[i]);
+            } else if (of.Type == D3D12_BARRIER_TYPE_BUFFER && of.pBufferBarriers[i].pResource) {
+                const auto &barrier = of.pBufferBarriers[i];
+                order(barrier.pResource, barrier.SyncBefore, barrier.SyncAfter,
+                      barrier.AccessBefore, barrier.AccessAfter);
+            }
+    }
+    resource_barrier(self, static_cast<UINT>(legacy.size()), legacy.data());
+    for (const auto &[resource, subresource] : discards) {
+        D3D12_DISCARD_REGION region{0, nullptr, subresource, 1};
+        host->DiscardResource(
+            resource, subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ? nullptr : &region);
+    }
+    if (!enhanced)
+        return;
+    D3D12_BARRIER_GROUP made[2]{{D3D12_BARRIER_TYPE_GLOBAL}, {D3D12_BARRIER_TYPE_BUFFER}};
+    made[0].NumBarriers = static_cast<UINT32>(globals.size());
+    made[0].pGlobalBarriers = globals.data();
+    made[1].NumBarriers = static_cast<UINT32>(buffers.size());
+    made[1].pBufferBarriers = buffers.data();
+    const auto *const first = globals.empty() ? made + 1 : made;
+    if (const auto groups_made = static_cast<UINT32>(!globals.empty() + !buffers.empty()))
+        enhanced->Barrier(groups_made, first);
+    enhanced->Release();
 }
 // CopyTextureRegion from a buffer at an offset the host does not take: the console reads a
 // texture's data from anywhere in a buffer, the host from multiples of 512 bytes. The data
@@ -5188,6 +5429,8 @@ void configure_lists() {
     list_vtable[113] = reinterpret_cast<Slot>(&begin_render_pass);
     // SetPredicationBufferX: nothing is drawn by a predicate here
     ignore({85});
+    // ID3D12GraphicsCommandList7::Barrier, in the lists of a title built with a later kit
+    list_vtable[144] = reinterpret_cast<Slot>(&enhanced_barriers);
 }
 // XV_D3D_LOST: every method of a list looks whether the host still has the device
 template <std::size_t Index>
@@ -6705,6 +6948,17 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
 } // namespace
 
 void console_d3d12_resource(void *resource) { console_resource(resource); }
+void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barriers) {
+    static const bool configured = [] {
+        configure_lists();
+        return true;
+    }();
+    static_cast<void>(configured);
+    host->AddRef();
+    auto *const list = static_cast<ListProxy *>(make_list_proxy(host));
+    list->legacy_barriers = !enhanced_barriers;
+    return list;
+}
 void report_failure() {
     auto *const device = d3d12_device.load();
     if (!device)

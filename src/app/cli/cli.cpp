@@ -268,8 +268,7 @@ std::optional<int> run(int argc, wchar_t **argv) {
             stage == runtime::modules::ShaderStage::mesh ? runtime::modules::HostShaderModel::sm6
                                                          : runtime::modules::HostShaderModel::sm5);
         std::cout << made.size() << " bytes, "
-                  << runtime::modules::host_shader_note(stage,
-                                                        host::read_snapshot(file, 64 << 20))
+                  << runtime::modules::host_shader_note(stage, host::read_snapshot(file, 64 << 20))
                   << '\n';
         return made.empty() ? 1 : 0;
     }

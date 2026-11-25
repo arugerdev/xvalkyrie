@@ -521,8 +521,10 @@ class Translator {
                 const std::uint32_t reg = file[entry + 16] + user_offset(), slot = file[entry + 17];
                 if (type == 4)
                     continue;
-                if (reg < user_first() ||
-                    reg + (type == 0 ? count : type == 1 ? 2 : 1) > user_first() + 24)
+                if (reg < user_first() || reg + (type == 0   ? count
+                                                 : type == 1 ? 2
+                                                             : 1) >
+                                              user_first() + 24)
                     give_up("user registers the host's shader is not given");
                 if (type == 1) {
                     // A root view: the host's signature has one of each kind in space 201,
@@ -1471,10 +1473,9 @@ class Translator {
         } else if (stage_ == Stage::mesh) {
             // the wave's place in the group in bits 24 to 27 of s3, and the group's number in
             // v5, as many times the most of its lanes, vertices and primitives as it is
-            prologue_ += "    " + s(3) + " = (xv_flat / " + std::to_string(mesh_wave_) +
-                         "u) << 24;\n";
-            const auto stride =
-                std::max({mesh_threads_, mesh_vertices_, mesh_primitives_});
+            prologue_ +=
+                "    " + s(3) + " = (xv_flat / " + std::to_string(mesh_wave_) + "u) << 24;\n";
+            const auto stride = std::max({mesh_threads_, mesh_vertices_, mesh_primitives_});
             prologue_ += "    " + v(5) + " = xv_group.x * " + std::to_string(stride) + "u;\n";
         }
     }
@@ -2181,7 +2182,7 @@ class Translator {
             if (const auto whole = heap_parameter_.find(known.value);
                 whole != heap_parameter_.end()) {
                 // one of a heap itself, by its byte offset there, which may be known now
-                resource.type = whole->second == 2 ? 3u
+                resource.type = whole->second == 2                   ? 3u
                                 : facts_.written.count(known.origin) ? 1u
                                                                      : 0u;
                 if (known.dynamic < 0) {
@@ -2271,9 +2272,9 @@ class Translator {
                 }
         }
         give_up(std::string("a store to something that is not an unordered access view (") +
-                (resource.root    ? "a root view"
-                 : resource.heap  ? (heap_parameter_.count(resource.parameter) ? "of the heap"
-                                                                                : "of a table")
+                (resource.root ? "a root view"
+                 : resource.heap
+                     ? (heap_parameter_.count(resource.parameter) ? "of the heap" : "of a table")
                  : resource.loaded ? "of a table's ranges"
                                    : "bound") +
                 ", type " + std::to_string(resource.type) + ")");
@@ -2309,9 +2310,10 @@ class Translator {
             }
             declared_[name] = type;
             uses_heap_ = needs_sm6_ = true;
-            prologue_ += "    " + type + " " + name + " = " +
-                         (resource.type == 3 ? "SamplerDescriptorHeap[" : "ResourceDescriptorHeap[") +
-                         std::to_string(resource.reg) + "u];\n";
+            prologue_ +=
+                "    " + type + " " + name + " = " +
+                (resource.type == 3 ? "SamplerDescriptorHeap[" : "ResourceDescriptorHeap[") +
+                std::to_string(resource.reg) + "u];\n";
             return name;
         }
         if (resource.heap) {
@@ -2439,8 +2441,9 @@ class Translator {
                     "nothing known", "a constant",     "a table",   "a descriptor",
                     "a root view",   "its own code",   "conflicts", "lanes",
                     "root memory",   "vertex streams", "a stream"};
-                give_up(std::string("a load from memory that is not a descriptor of a table (from ") +
-                        kinds[from.kind] + (from.maybe ? ", on some ways" : "") + ")");
+                give_up(
+                    std::string("a load from memory that is not a descriptor of a table (from ") +
+                    kinds[from.kind] + (from.maybe ? ", on some ways" : "") + ")");
             }
             // where in the table is only known when the shader runs
             if (indexed)
@@ -3736,8 +3739,9 @@ class Translator {
             value = "((" + x[0] + " & " + x[1] + ") | (~" + x[0] + " & " + x[2] + "))";
         else if (name == "v_cvt_pk_u8_f32")
             // the float as a byte, into the byte of the third source the second names
-            value = "((" + x[2] + " & ~(0xffu << ((" + x[1] + " & 3u) * 8u))) | ((uint)round(clamp(" +
-                    fx(0) + ", 0.0, 255.0)) << ((" + x[1] + " & 3u) * 8u)))";
+            value = "((" + x[2] + " & ~(0xffu << ((" + x[1] +
+                    " & 3u) * 8u))) | ((uint)round(clamp(" + fx(0) + ", 0.0, 255.0)) << ((" + x[1] +
+                    " & 3u) * 8u)))";
         else if (name == "v_mad_i32_i24")
             value = "(uint)((((int)(" + x[0] + " << 8)) >> 8) * (((int)(" + x[1] +
                     " << 8)) >> 8)) + " + x[2];
@@ -3781,10 +3785,10 @@ class Translator {
             // a mesh shader's lanes are the group's threads in order: the lanes of the mask
             // in the half the instruction counts that come before this one
             const auto lane = "(xv_flat & " + std::to_string(mesh_wave_ - 1) + "u)";
-            const auto below = name == "v_mbcnt_lo_u32_b32"
-                                   ? "(" + lane + " >= 32u ? 0xffffffffu : (1u << " + lane +
-                                         ") - 1u)"
-                                   : "(" + lane + " <= 32u ? 0u : (1u << (" + lane + " - 32u)) - 1u)";
+            const auto below =
+                name == "v_mbcnt_lo_u32_b32"
+                    ? "(" + lane + " >= 32u ? 0xffffffffu : (1u << " + lane + ") - 1u)"
+                    : "(" + lane + " <= 32u ? 0u : (1u << (" + lane + " - 32u)) - 1u)";
             value = "(" + x[1] + " + countbits(" + x[0] + " & " + below + "))";
         } else if (starts(name, "v_mbcnt_"))
             value = x[1]; // no lane of the wave comes before this one
@@ -4330,8 +4334,7 @@ class Translator {
         const bool store = starts(name, "tbuffer_store_format_");
         if ((!store && !starts(name, "tbuffer_load_format_")) || name.find("d16") != name.npos)
             give_up(std::string(name));
-        const auto components =
-            static_cast<std::uint32_t>(name.size() - (store ? 21 : 20));
+        const auto components = static_cast<std::uint32_t>(name.size() - (store ? 21 : 20));
         const auto typed = typed_format((ins.w0 >> 19) & 0x7f);
         if (!typed || components < 1 || components > 4)
             give_up(std::string(name) + " of buffer format " +
@@ -4374,10 +4377,12 @@ class Translator {
             const auto bits = typed->bits[c];
             const auto source = word[at / 32];
             const auto mask = bits == 32 ? std::string("0xffffffffu") : hex((1u << bits) - 1);
-            const auto raw = "((" + source + " >> " + std::to_string(at % 32) + "u) & " + mask + ")";
-            const auto extended = bits == 32 ? "(int)" + raw
-                                             : "((int)(" + raw + " << " + std::to_string(32 - bits) +
-                                                   "u) >> " + std::to_string(32 - bits) + ")";
+            const auto raw =
+                "((" + source + " >> " + std::to_string(at % 32) + "u) & " + mask + ")";
+            const auto extended = bits == 32
+                                      ? "(int)" + raw
+                                      : "((int)(" + raw + " << " + std::to_string(32 - bits) +
+                                            "u) >> " + std::to_string(32 - bits) + ")";
             const auto top = std::to_string((1u << (bits - 1)) - 1) + ".0";
             std::string value;
             switch (typed->kind) {
@@ -4697,9 +4702,9 @@ class Translator {
                     for (std::size_t i = 0; i < outputs.size(); ++i)
                         if (outputs[i].reg == row &&
                             _stricmp(outputs[i].name.c_str(), "SV_Position"))
-                            write(i, static_cast<std::uint32_t>(std::countr_zero(
-                                         static_cast<unsigned>(outputs[i].mask ? outputs[i].mask
-                                                                               : 1)))),
+                            write(i,
+                                  static_cast<std::uint32_t>(std::countr_zero(static_cast<unsigned>(
+                                      outputs[i].mask ? outputs[i].mask : 1)))),
                                 written = true;
             for (const auto &[parameter, row] : mesh_outputs_)
                 if ((parameter & 0x7f) == target - 32 && parameter & 0x80)
@@ -4860,8 +4865,7 @@ class Translator {
             // what it leaves unexported is nothing: every primitive starts culled (its
             // corners all the first vertex) and every vertex zero.
             text += structure("Output", shader_.outputs, false, "");
-            text += "[outputtopology(\"triangle\")] [numthreads(" +
-                    std::to_string(mesh_threads_) +
+            text += "[outputtopology(\"triangle\")] [numthreads(" + std::to_string(mesh_threads_) +
                     ", 1, 1)]\nvoid main(uint xv_flat : SV_GroupIndex, uint3 xv_group : "
                     "SV_GroupID, out vertices Output xv_verts[" +
                     std::to_string(mesh_vertices_) + "], out indices uint3 xv_prims[" +

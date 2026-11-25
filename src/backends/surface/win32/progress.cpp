@@ -47,9 +47,9 @@ void paint(HWND window, ProgressWindow::State &state) {
     if (total) {
         auto filled = bar;
         InflateRect(&filled, -scaled(state, 2), -scaled(state, 2));
-        filled.right = filled.left + static_cast<LONG>(static_cast<double>(filled.right - filled.left) *
-                                                       static_cast<double>(done) /
-                                                       static_cast<double>(total));
+        filled.right =
+            filled.left + static_cast<LONG>(static_cast<double>(filled.right - filled.left) *
+                                            static_cast<double>(done) / static_cast<double>(total));
         FillRect(dc, &filled, GetSysColorBrush(COLOR_HIGHLIGHT));
     }
     EndPaint(window, &paint);
@@ -114,18 +114,18 @@ void run(ProgressWindow::State &state) {
     RECT area{};
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
     const int outer_width = frame.right - frame.left, outer_height = frame.bottom - frame.top;
-    const auto window = CreateWindowExW(
-        0, class_name, state.caption.c_str(), style,
-        area.left + (area.right - area.left - outer_width) / 2,
-        area.top + (area.bottom - area.top - outer_height) / 2, outer_width, outer_height, nullptr,
-        nullptr, description.hInstance, nullptr);
+    const auto window =
+        CreateWindowExW(0, class_name, state.caption.c_str(), style,
+                        area.left + (area.right - area.left - outer_width) / 2,
+                        area.top + (area.bottom - area.top - outer_height) / 2, outer_width,
+                        outer_height, nullptr, nullptr, description.hInstance, nullptr);
     if (!window)
         return;
     SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
-    const auto start = CreateWindowExW(0, L"BUTTON", L"Start now", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                       width - margin - button, height - margin - line, button,
-                                       line, window, reinterpret_cast<HMENU>(IDCANCEL),
-                                       description.hInstance, nullptr);
+    const auto start =
+        CreateWindowExW(0, L"BUTTON", L"Start now", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        width - margin - button, height - margin - line, button, line, window,
+                        reinterpret_cast<HMENU>(IDCANCEL), description.hInstance, nullptr);
     SendMessageW(start, WM_SETFONT, reinterpret_cast<WPARAM>(state.font), TRUE);
     SetTimer(window, timer, 200, nullptr);
     ShowWindow(window, SW_SHOW);

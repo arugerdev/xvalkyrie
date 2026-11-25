@@ -8,7 +8,9 @@
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="XValkyrie" />
+      <Directory Id="INSTALLFOLDER" Name="XValkyrie">
+        <Directory Id="D3D12FOLDER" Name="D3D12" />
+      </Directory>
     </StandardDirectory>
 
     <ComponentGroup Id="Program" Directory="INSTALLFOLDER">
@@ -23,6 +25,13 @@
       </Component>
       <Component>
         <File Source="$(Source)\THIRD-PARTY.md" KeyPath="yes" />
+      </Component>
+      <!-- the Agility SDK's runtime, where xvboot looks for it -->
+      <Component Directory="D3D12FOLDER">
+        <File Source="$(Source)\D3D12\D3D12Core.dll" KeyPath="yes" />
+      </Component>
+      <Component Directory="D3D12FOLDER">
+        <File Id="AgilityLicense" Source="$(Source)\D3D12\LICENSE.txt" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

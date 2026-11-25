@@ -29,6 +29,9 @@ jobs:
         run: |
           New-Item -ItemType Directory stage | Out-Null
           Copy-Item build/Release/xvalkyrie.exe, build/Release/xvboot.exe, LICENSE, THIRD-PARTY.md, README.md stage
+          # the Agility SDK's runtime, where xvboot looks for it
+          New-Item -ItemType Directory stage/D3D12 | Out-Null
+          Copy-Item build/Release/D3D12/D3D12Core.dll, build/Release/D3D12/LICENSE.txt stage/D3D12
           Compress-Archive -Path stage/* -DestinationPath $env:PORTABLE
       - name: Installer
         shell: pwsh

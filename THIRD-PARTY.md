@@ -80,8 +80,9 @@ ProggyClean (MIT, Tristan Grimmer), Dear ImGui's built-in font.
 
 The build fetches the NuGet package `Microsoft.Direct3D.D3D12` 1.620.2 and copies its
 `D3D12Core.dll` to `D3D12\` next to `xvboot.exe`, which uses it in place of an older
-Direct3D 12 runtime of the system when it is there. It is not part of the source and not
-in the release archives; the package's `LICENSE.txt` has its terms.
+Direct3D 12 runtime of the system when it is there. It is not part of the source; the
+release archive and installer carry it in `D3D12\`, which the package's list of
+distributable files allows, with the package's `LICENSE.txt` beside it.
 
 ## Ported code (GPL-3.0-or-later)
 

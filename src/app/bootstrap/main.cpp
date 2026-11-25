@@ -15,8 +15,9 @@
 // and where it is from here (the build puts it in D3D12 next to this executable). A folder
 // of its own, as Microsoft asks: next to the executable a newer system's runtime would
 // find it by name and take it for its own.
-// The version is not constant: where that file is not there (it is not part of a release),
-// it is set to 0 before anything loads d3d12.dll, which then keeps to the system's runtime.
+// The version is not constant: where that file is not there (a copy of xvboot without its
+// folder), it is set to 0 before anything loads d3d12.dll, which then keeps to the system's
+// runtime.
 extern "C" {
 __declspec(dllexport) unsigned int D3D12SDKVersion = XV_AGILITY_VERSION;
 __declspec(dllexport) extern const char *D3D12SDKPath = ".\\D3D12\\";

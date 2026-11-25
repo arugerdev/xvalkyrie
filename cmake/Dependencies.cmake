@@ -52,5 +52,8 @@ function(xv_deploy_agility target)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${xv_agility_SOURCE_DIR}/build/native/bin/x64/D3D12Core.dll"
       "$<TARGET_FILE_DIR:${target}>/D3D12/D3D12Core.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${xv_agility_SOURCE_DIR}/LICENSE.txt"
+      "$<TARGET_FILE_DIR:${target}>/D3D12/LICENSE.txt"
     VERBATIM)
 endfunction()

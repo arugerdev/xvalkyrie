@@ -73,22 +73,22 @@ the states mean are in [COMPATIBILITY.md](COMPATIBILITY.md).
     <th>Fortnite</th>
     <th>Unicorn Overlord</th>
     <th>Minecraft Preview</th>
-    <th>XDefiant</th>
     <th>Psychonauts 2</th>
+    <th>"The Game"</th>
   </tr>
   <tr>
     <td><img src="docs/img/compat/fortnite.webp" alt="Fortnite" width="170"></td>
     <td><img src="docs/img/compat/unicorn-overlord.webp" alt="Unicorn Overlord" width="170"></td>
     <td><img src="docs/img/compat/minecraft.webp" alt="Minecraft Preview" width="170"></td>
-    <td><img src="docs/img/compat/xdefiant.png" alt="XDefiant" width="170"></td>
     <td><img src="docs/img/compat/psychonauts-2.webp" alt="Psychonauts 2" width="170"></td>
+    <td><img src="docs/img/compat/the-game.webp" alt="&quot;The Game&quot;" width="170"></td>
   </tr>
   <tr>
     <td align="center">Menu</td>
     <td align="center">Playable</td>
     <td align="center">Playable</td>
-    <td align="center">Boots</td>
     <td align="center">Intro</td>
+    <td align="center">Menu</td>
   </tr>
 </table>
 

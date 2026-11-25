@@ -1791,6 +1791,30 @@ void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
     tables_of[signature] = std::move(tables);
 }
 
+UINT element_bytes(DXGI_FORMAT format);
+// The bytes of an element of a buffer view: its structure's, a word for a raw one, its
+// format's otherwise; 0 for a format a buffer has no elements of
+template <class View> UINT view_element(const View &view) {
+    // D3D12_BUFFER_SRV_FLAG_RAW and D3D12_BUFFER_UAV_FLAG_RAW
+    return view.Buffer.StructureByteStride            ? view.Buffer.StructureByteStride
+           : static_cast<UINT>(view.Buffer.Flags) & 1 ? 4
+                                                      : element_bytes(view.Format);
+}
+// A buffer view reaches no further than the end of its buffer: the host drops the device over
+// one that does, or over one of no elements, where the console's view goes on into the memory
+// after the buffer. What is past the end reads 0 and takes no writes. False when nothing of
+// the view is in the buffer.
+template <class View> bool fit_buffer_view(ID3D12Resource *resource, View &view) {
+    const std::uint64_t element = view_element(view);
+    if (!resource || !element)
+        return true;
+    const auto elements = resource->GetDesc().Width / element;
+    if (view.Buffer.FirstElement >= elements)
+        return false;
+    view.Buffer.NumElements = static_cast<UINT>(
+        std::min<std::uint64_t>(view.Buffer.NumElements, elements - view.Buffer.FirstElement));
+    return view.Buffer.NumElements != 0;
+}
 // A descriptor the title wrote, made on the host as what the table it is bound in says it is.
 // A buffer descriptor (V#) has a 48-bit address, the stride in bits 48-61 and the record
 // count in its third dword.
@@ -1959,9 +1983,12 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
             view.Buffer = {offset / element, static_cast<UINT>(size / element),
                            structured ? stride : 0,
                            structured ? D3D12_BUFFER_SRV_FLAG_NONE : D3D12_BUFFER_SRV_FLAG_RAW};
-            original<void(STDMETHODCALLTYPE *)(void *, void *, const void *,
-                                               D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 18)(
-                device, resource, &view, host);
+            if (!fit_buffer_view(resource, view))
+                view_nothing(true);
+            else
+                original<void(STDMETHODCALLTYPE *)(void *, void *, const void *,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 18)(
+                    device, resource, &view, host);
         } else {
             D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
             view.Format = structured ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
@@ -1969,9 +1996,12 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
             view.Buffer = {offset / element, static_cast<UINT>(size / element),
                            structured ? stride : 0, 0,
                            structured ? D3D12_BUFFER_UAV_FLAG_NONE : D3D12_BUFFER_UAV_FLAG_RAW};
-            original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *,
-                                               D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 19)(
-                device, resource, nullptr, &view, host);
+            if (!fit_buffer_view(resource, view))
+                view_nothing(true);
+            else
+                original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 19)(
+                    device, resource, nullptr, &view, host);
         }
     }
     set_mark(heap, at);
@@ -2083,15 +2113,14 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
     if (desc) {
         host = *desc;
         // the console takes a view of any size; the host wants multiples of 256 bytes, and
-        // removes the device over one that is not
+        // removes the device over one that is not. No more than the buffer has, as for the
+        // other views (see fit_buffer_view), where it has 256 bytes.
         ID3D12Resource *buffer = nullptr;
         std::uint64_t offset = 0, room = 0;
-        const auto rounded = (host.SizeInBytes + 255u) & ~255u;
-        if (rounded != host.SizeInBytes)
-            host.SizeInBytes = buffer_at(host.BufferLocation, buffer, offset, room) &&
-                                       room < rounded && room >= 256
-                                   ? static_cast<UINT>(room & ~255ull)
-                                   : rounded;
+        host.SizeInBytes = (host.SizeInBytes + 255u) & ~255u;
+        if (buffer_at(host.BufferLocation, buffer, offset, room) && room < host.SizeInBytes &&
+            room >= 256)
+            host.SizeInBytes = static_cast<UINT>(room & ~255ull);
         // On the Series console the view may be of any memory the title has, a buffer or
         // not, and start anywhere: the host drops the device over an address that is in no
         // buffer of its own. Such constants are copied to where the host takes them, as
@@ -2238,6 +2267,7 @@ D3D12_SHADER_RESOURCE_VIEW_DESC whole_shader_view(const D3D12_RESOURCE_DESC &of,
     }
     return view;
 }
+template <class View> const View *null_view(View &view, const D3D12_RESOURCE_DESC *of);
 void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, const void *desc,
                                   Handle handle) {
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
@@ -2295,6 +2325,13 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
             typed_format(of.Format) != of.Format) {
             view.Format = typed_format(of.Format);
             desc = &view;
+        }
+        if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            desc = &view;
+            if (!fit_buffer_view(resource, view)) {
+                resource = nullptr;
+                desc = null_view(view, nullptr);
+            }
         }
     }
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, 18)(
@@ -2388,6 +2425,13 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
             format != view.Format) {
             view.Format = format;
             desc = &view;
+        }
+    }
+    if (resource && desc && view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+        desc = &view;
+        if (!fit_buffer_view(resource, view)) {
+            resource = counter = nullptr;
+            desc = null_view(view, nullptr);
         }
     }
     if (static const bool checking = std::getenv("XV_D3D_LOST") != nullptr; checking) {
@@ -3031,6 +3075,10 @@ HRESULT STDMETHODCALLTYPE create_committed_resource_layout(
 // by the memory's GPU address (and the counter's), and where the descriptor goes. The
 // buffer here that holds the address is the one viewed.
 UINT element_bytes(DXGI_FORMAT format) {
+    // the 16-bit colours, and the 32-bit ones blue first (B8G8R8A8_UNORM to B8G8R8X8_UNORM_SRGB)
+    if (format == DXGI_FORMAT_B5G6R5_UNORM || format == DXGI_FORMAT_B5G5R5A1_UNORM ||
+        format == DXGI_FORMAT_B4G4R4A4_UNORM)
+        return 2;
     const int f = format;
     return f >= 1 && f <= 4     ? 16
            : f >= 5 && f <= 8   ? 12
@@ -3038,6 +3086,7 @@ UINT element_bytes(DXGI_FORMAT format) {
            : f >= 23 && f <= 43 ? 4
            : f >= 48 && f <= 59 ? 2
            : f >= 60 && f <= 64 ? 1
+           : f >= 87 && f <= 93 ? 4
                                 : 0;
 }
 void view_at(const char *what, const D3D12_RESOURCE_DESC *of, UINT dimension, std::uint64_t address,
@@ -3204,6 +3253,8 @@ void structured_view(ID3D12Device *device, std::uint64_t slot, std::uint32_t str
     made.Buffer.NumElements = static_cast<UINT>(bytes / stride);
     made.Buffer.StructureByteStride = stride;
     made.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    if (!fit_buffer_view(view.resource, made))
+        return;
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(device, 18)(
         device, view.resource, &made, Handle{slot});
     wrote_slot(slot);
@@ -5969,8 +6020,15 @@ void trace_address(const char *method, std::uint64_t address) {
 }
 // On the Series console vertices and indices may lie in any memory the title has, as its
 // root descriptors may (see ring_copy): what is in no buffer here is copied into the ring as
-// it is when it is bound, all of it.
-std::uint64_t geometry_address(const char *what, std::uint64_t address, std::uint64_t bytes) {
+// it is when it is bound, all of it. `bytes` becomes no more than the buffer here or the copy
+// has: the host's GPU reads past a buffer's end into whatever follows it, or faults.
+std::uint64_t within_buffer(std::uint64_t address, std::uint64_t bytes) {
+    ID3D12Resource *resource = nullptr;
+    std::uint64_t offset = 0, room = 0;
+    return buffer_at(address, resource, offset, room) ? std::min(bytes, room) : bytes;
+}
+std::uint64_t geometry_address(const char *what, std::uint64_t address, UINT &bytes) {
+    bytes = static_cast<UINT>(within_buffer(address, bytes));
     if (!address || console != Target::scarlett) {
         check_address(what, address, bytes);
         return gpu_address(address);
@@ -5988,7 +6046,9 @@ std::uint64_t geometry_address(const char *what, std::uint64_t address, std::uin
     const auto readable = readable_bytes(reinterpret_cast<const void *>(address), bytes);
     const auto copy =
         readable ? ring_copy(reinterpret_cast<const void *>(address), readable, readable) : 0;
-    if (!copy)
+    if (copy)
+        bytes = static_cast<UINT>(readable);
+    else
         check_address(what, address, bytes);
     // memory the host's GPU cannot see and has no copy of is 0: no buffer, whose reads give 0
     return copy ? copy : gpu_address(address);
@@ -6237,7 +6297,10 @@ void STDMETHODCALLTYPE so_set_targets(void *self, UINT start, UINT count,
             const auto location = gpu_address(view.BufferLocation),
                        filled = gpu_address(view.BufferFilledSizeLocation);
             view = (location || !view.BufferLocation) && (filled || !view.BufferFilledSizeLocation)
-                       ? D3D12_STREAM_OUTPUT_BUFFER_VIEW{location, view.SizeInBytes, filled}
+                       ? D3D12_STREAM_OUTPUT_BUFFER_VIEW{location,
+                                                         within_buffer(view.BufferLocation,
+                                                                       view.SizeInBytes),
+                                                         filled}
                        : D3D12_STREAM_OUTPUT_BUFFER_VIEW{};
         }
     }

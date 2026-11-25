@@ -8937,9 +8937,10 @@ ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state) {
         return state;
     if (deferred->ready.load(std::memory_order_acquire))
         return deferred->host;
+    // One thread: the host's driver holds a lock of its own while it compiles, which the
+    // title's threads that make resources wait on, and more threads would hold it longer.
     static const bool started = [] {
-        for (auto threads = std::max(std::thread::hardware_concurrency() / 4, 2u); threads--;)
-            std::thread(make_pipelines).detach();
+        std::thread(make_pipelines).detach();
         return true;
     }();
     static_cast<void>(started);

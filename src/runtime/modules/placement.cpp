@@ -1,5 +1,6 @@
 #include "runtime/modules/placement.hpp"
 #include "runtime/common/runtime.hpp"
+#include "runtime/modules/memory.hpp"
 #include "runtime/modules/xg.hpp"
 #include <algorithm>
 #include <atomic>
@@ -57,8 +58,12 @@ void protect(std::uintptr_t start, std::uintptr_t end, DWORD protection) {
         at = region_end;
     }
 }
+// the placement's memory at every address the title sees it at: a physical page may be mapped
+// at several, and a write through any of them is one to the placement
 void protect(const Placement &placement, DWORD protection) {
     protect(placement.start, placement.end, protection);
+    for (const auto &[start, end] : other_views(placement.start, placement.end))
+        protect(start, end, protection);
 }
 bool writable(std::uintptr_t address) {
     MEMORY_BASIC_INFORMATION info{};
@@ -76,18 +81,25 @@ LONG CALLBACK written(EXCEPTION_POINTERS *exception) {
     const std::lock_guard lock(mutex);
     bool ours = false;
     // the ones whose pages hold the address: they start at most `largest` before it
-    for (auto at = placements.upper_bound(page_up(address + 1)); at != placements.begin();) {
-        auto &placement = (--at)->second;
-        if (page_down(placement.start) + largest + page < address)
-            break;
-        if (address >= page_down(placement.start) && address < page_up(placement.end)) {
-            ours = true;
-            if (!placement.dirty)
-                dirty.push_back(placement.start);
-            placement.dirty = true;
-            protect(placement, PAGE_READWRITE);
+    const auto mark = [&](std::uintptr_t written) {
+        for (auto at = placements.upper_bound(page_up(written + 1)); at != placements.begin();) {
+            auto &placement = (--at)->second;
+            if (page_down(placement.start) + largest + page < written)
+                break;
+            if (written >= page_down(placement.start) && written < page_up(placement.end)) {
+                ours = true;
+                if (!placement.dirty)
+                    dirty.push_back(placement.start);
+                placement.dirty = true;
+                protect(placement, PAGE_READWRITE);
+            }
         }
-    }
+    };
+    mark(address);
+    // or a placement's memory seen at another address of its physical page
+    if (!ours)
+        for (const auto &[start, end] : other_views(address, address + 1))
+            mark(start);
     // going on is only right if the write can now happen; otherwise it faults again forever
     if (ours && !writable(address))
         protect(address, address + 1, PAGE_READWRITE);
@@ -573,6 +585,13 @@ void track_placement(ID3D12Resource *resource, const void *address,
         if (!bytes)
             return;
         const std::lock_guard lock(mutex);
+        // a texture placed where one waited is in its place
+        std::erase_if(pending, [&](Placement &waiting) {
+            if (waiting.start != start)
+                return false;
+            release(waiting);
+            return true;
+        });
         // memory the title has not committed yet: looked at again whenever work is
         // submitted, and followed from when it is there
         if (!readable(start, bytes)) {
@@ -667,8 +686,13 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
             kept.push_back(start);
             continue;
         }
+        // memory whose pages the title has unmapped: a texture of a heap it maps pages into
+        // waits for them again, one of memory it has let go of is done with
         if (!readable(placement.start, placement.end - placement.start)) {
-            release(placement);
+            if (placement.series)
+                pending.push_back(placement);
+            else
+                release(placement);
             placements.erase(found);
             continue;
         }

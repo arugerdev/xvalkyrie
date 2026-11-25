@@ -3,6 +3,7 @@
 #include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
+#include "runtime/modules/memory.hpp"
 #include "runtime/modules/placement.hpp"
 #include "runtime/modules/xg.hpp"
 #include <algorithm>
@@ -25,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -4145,6 +4147,57 @@ D3D12_COMMAND_QUEUE_DESC *STDMETHODCALLTYPE queue_get_desc(void *self,
     auto *const host = queue_host(self);
     return reinterpret_cast<Get>((*reinterpret_cast<Slot **>(host))[18])(host, desc);
 }
+// slot 29: CopyPageMappingsBatchX(count, batches, pool, pool pages, flags). A title maps
+// physical pages into a pool of its memory and has the GPU map them into a heap it reserved:
+// each batch is the runs of pages from a destination on, each run of the pool's pages from
+// `start` on (0), of its page `start` over and over (1), unmapped (2) or left as it is (3).
+// Done at once, which work submitted before it has seen to here.
+struct PageRun {
+    UINT kind, start, count;
+};
+struct PageBatch {
+    std::uint64_t destination;
+    UINT count;
+    const PageRun *runs;
+};
+HRESULT STDMETHODCALLTYPE queue_copy_page_mappings(void *, UINT count, const PageBatch *batches,
+                                                   std::uint64_t pool, UINT pool_pages, UINT) {
+    constexpr std::uint64_t page = 1 << 16;
+    if (count && !batches)
+        return E_INVALIDARG;
+    bool mapped = true;
+    for (const auto &batch : std::span(batches, count)) {
+        auto at = batch.destination;
+        for (const auto &run : std::span(batch.runs, batch.runs ? batch.count : 0)) {
+            const auto bytes = std::uint64_t{run.count} * page;
+            const auto source = pool + std::uint64_t{run.start} * page;
+            const auto inside = [&](std::uint64_t pages) {
+                return std::uint64_t{run.start} + pages <= pool_pages;
+            };
+            switch (run.kind) {
+            case 0:
+                mapped = inside(run.count) && map_alias(at, source, bytes) && mapped;
+                break;
+            case 1:
+                for (UINT i = 0; i < run.count; ++i)
+                    mapped = inside(1) && map_alias(at + i * page, source, page) && mapped;
+                break;
+            case 2:
+                map_alias(at, 0, bytes);
+                break;
+            default:
+                break;
+            }
+            at += bytes;
+        }
+    }
+    if (static std::atomic<bool> shown{false}; !mapped && !shown.exchange(true)) {
+        std::fprintf(stderr, "[Runtime] a GPU page mapping from the pool at %llx failed\n",
+                     static_cast<unsigned long long>(pool));
+        std::fflush(stderr);
+    }
+    return S_OK;
+}
 // slot 30: PresentX. The console shows the title's own resources; there is no swap chain.
 HRESULT STDMETHODCALLTYPE queue_present_x(void *self, UINT planes, const void *plane_parameters,
                                           const void *present_parameters) {
@@ -4178,6 +4231,7 @@ std::array<Slot, 48> queue_vtable_of(std::index_sequence<Index...>) {
         vtable[ignored] = reinterpret_cast<Slot>(&ignored_queue_method);
     vtable[23] = reinterpret_cast<Slot>(&queue_signal_x);
     vtable[26] = reinterpret_cast<Slot>(&queue_get_desc);
+    vtable[29] = reinterpret_cast<Slot>(&queue_copy_page_mappings);
     vtable[30] = reinterpret_cast<Slot>(&queue_present_x);
     // SetHDRToneMapperX: the picture goes to the host's display as the title made it
     vtable[31] = reinterpret_cast<Slot>(&ignored_queue_method);

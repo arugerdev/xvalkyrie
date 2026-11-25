@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
+#include <vector>
 #include <windows.h>
 
 // Console memory: reservations in the console's page sizes, and the title's physical pages,
@@ -27,5 +29,14 @@ HRESULT WINAPI free_graphics_memory(void *address);
 // need not be mapped. False if one is not a page the title holds.
 bool copy_physical_pages(const ULONG_PTR *pages, std::size_t offset, std::uint8_t *data,
                          std::size_t size, bool write);
+// Where else the title sees the memory of [start, end): for each of its physical pages that is
+// mapped at other addresses as well, those ranges, as many bytes as the part of [start, end)
+// the page holds. Empty for memory that is no physical page of the title's.
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> other_views(std::uintptr_t start,
+                                                                   std::uintptr_t end);
+// The physical pages the title has mapped at [from, from + size) mapped at `to` as well, in
+// place of what is there, as the console's GPU maps its pages; `from` 0 leaves `to` unmapped.
+// False if `to` is not in a reservation of physical pages or a page at `from` is not mapped.
+bool map_alias(std::uintptr_t to, std::uintptr_t from, std::uintptr_t size);
 } // namespace modules
 } // namespace xv::runtime

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <vector>
 #include <windows.h>
@@ -633,5 +634,60 @@ bool copy_physical_pages(const ULONG_PTR *pages, std::size_t offset, std::uint8_
         done += here;
     }
     return true;
+}
+bool map_alias(std::uintptr_t to, std::uintptr_t from, std::uintptr_t size) {
+    auto &state = physical();
+    bool mapped = true;
+    {
+        const std::lock_guard lock(state.mutex);
+        for (std::uintptr_t offset = 0; offset < size; offset += page) {
+            const auto at = (to + offset) & ~(page - 1);
+            std::uintptr_t base = 0;
+            auto *const target = reservation_at(state, at, &base);
+            if (!target) {
+                mapped = false;
+                continue;
+            }
+            std::optional<ULONG_PTR> shown;
+            if (from) {
+                const auto source = (from + offset) & ~(page - 1);
+                if (auto *const pool = reservation_at(state, source, &base))
+                    if (const auto view = pool->views.find(source); view != pool->views.end())
+                        shown = view->second.page;
+            }
+            if (!shown) {
+                unmap(state, *target, at);
+                mapped = mapped && !from;
+                continue;
+            }
+            if (const auto now = target->views.find(at);
+                now != target->views.end() && now->second.page == *shown)
+                continue;
+            mapped = map(state, *target, at, *shown, PAGE_READWRITE, false) && mapped;
+        }
+    }
+    // what a texture placed there shows has changed
+    prepare_title_write(reinterpret_cast<const void *>(to), size);
+    return mapped;
+}
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> other_views(std::uintptr_t start,
+                                                                   std::uintptr_t end) {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> views;
+    auto &state = physical();
+    const std::lock_guard lock(state.mutex);
+    for (auto at = start & ~(page - 1); at < end; at += page) {
+        std::uintptr_t base = 0;
+        auto *const reservation = reservation_at(state, at, &base);
+        if (!reservation)
+            continue;
+        const auto view = reservation->views.find(at);
+        if (view == reservation->views.end())
+            continue;
+        const auto first = std::max(start, at), last = std::min(end, at + page);
+        for (auto [it, stop] = state.mapped_at.equal_range(view->second.page); it != stop; ++it)
+            if (it->second != at)
+                views.emplace_back(it->second + (first - at), it->second + (last - at));
+    }
+    return views;
 }
 } // namespace xv::runtime::modules

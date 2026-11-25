@@ -734,6 +734,18 @@ void *scratch_memory(ID3D12Resource *self) {
     }
     return scratch.memory;
 }
+} // namespace
+std::vector<ID3D12Resource *> written_textures() {
+    const std::lock_guard lock(scratch_mutex);
+    std::vector<ID3D12Resource *> textures;
+    for (const auto &[texture, scratch] : scratch_maps)
+        if (scratch.memory && texture->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            texture->AddRef();
+            textures.push_back(texture);
+        }
+    return textures;
+}
+namespace {
 // Before a direct queue runs lists: each texture whose memory of ours (scratch_memory) the
 // title wrote since the last time gets that memory copied in, on that queue, first.
 void upload_scratch(ID3D12CommandQueue *queue) {
@@ -1832,10 +1844,12 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
         }
     };
     // a descriptor the title cleared is a null one, whose reads give 0: the host's slot may
-    // hold anything until it is made so
+    // hold anything until it is made so. What decodes to nothing is left unmarked, as it may
+    // be no descriptor at all: a range of the title's signature runs past the descriptors it
+    // wrote, into what it keeps after them (7952987A: a draw's constants right after its
+    // table), which the mark would overwrite. It is decoded again when it is read again.
     if ((first == 0 && words[2] == 0 && words[3] == 0) || null_buffer(words)) {
         view_nothing(false);
-        set_mark(heap, at);
         return;
     }
     const std::uint64_t address = first & 0xffff'ffff'ffffull;
@@ -1849,7 +1863,6 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
         if (type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV && words[3] >> 28 != 0)
             return;
         view_nothing(true);
-        set_mark(heap, at);
         return;
     }
     if (type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
@@ -1980,6 +1993,20 @@ struct CopyingFor {
 std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
                         std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
                         std::uint64_t *offset = nullptr);
+// how much of `bytes` from `address` on is memory the process can read, over as many regions
+// of it as there are
+std::uint64_t readable_bytes(const void *address, std::uint64_t bytes) {
+    const auto start = reinterpret_cast<std::uint64_t>(address);
+    std::uint64_t readable = 0;
+    while (readable < bytes) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void *>(start + readable), &info, sizeof info) ||
+            info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            break;
+        readable = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - start;
+    }
+    return std::min(readable, bytes);
+}
 void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc,
                                   Handle handle) {
     D3D12_CONSTANT_BUFFER_VIEW_DESC host{};
@@ -5574,6 +5601,22 @@ void prepare_draw(ListProxy *list) {
 // XV_D3D_PROBE: draws per render target
 std::mutex draw_mutex;
 std::map<ID3D12Resource *, std::uint64_t> draws_into;
+// XV_CAPTURE: each draw of the frame kept, with what it draws
+void capture_call(void *self, const char *method, UINT count, UINT instances, UINT first,
+                  INT base) {
+    if (!capturing())
+        return;
+    const auto *const list = static_cast<ListProxy *>(self);
+    std::fprintf(
+        stderr,
+        "[Capture] %s %u x%u from %u base %d, topology %u, pipeline %p%s, target %p, "
+        "vertices %llx (%u bytes, stride %u), indices %llx (%u bytes, format %d)\n",
+        method, count, instances, first, base, list->topology, static_cast<void *>(list->pipeline),
+        list->heap_uses ? " (heaps)" : "", static_cast<void *>(list->target),
+        static_cast<unsigned long long>(list->vertices.BufferLocation), list->vertices.SizeInBytes,
+        list->vertices.StrideInBytes, static_cast<unsigned long long>(list->indices.BufferLocation),
+        list->indices.SizeInBytes, list->indices.Format);
+}
 void count_draw(void *self) {
     capture_draw(static_cast<ListProxy *>(self)->target);
     static const bool probing = std::getenv("XV_D3D_PROBE") != nullptr;
@@ -5718,6 +5761,7 @@ void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances,
     if (static_cast<ListProxy *>(self)->no_pipeline)
         return;
     count_draw(self);
+    capture_call(self, "DrawInstanced", vertices, instances, first, 0);
     lost_draw(self, "DrawInstanced", vertices);
     auto *const list = static_cast<ListProxy *>(self);
     prepare_draw(list);
@@ -5761,6 +5805,7 @@ void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT ins
     if (static_cast<ListProxy *>(self)->no_pipeline)
         return;
     count_draw(self);
+    capture_call(self, "DrawIndexedInstanced", indices, instances, first, base);
     lost_draw(self, "DrawIndexedInstanced", indices);
     prepare_draw(static_cast<ListProxy *>(self));
     if (static std::atomic<bool> shown{false};
@@ -5802,15 +5847,7 @@ std::uint64_t geometry_address(const char *what, std::uint64_t address, std::uin
             return address;
     }
     // as much of it as is memory
-    std::uint64_t readable = 0;
-    while (readable < bytes) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<void *>(address + readable), &info, sizeof info) ||
-            info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-            break;
-        readable = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - address;
-    }
-    readable = std::min(readable, bytes);
+    const auto readable = readable_bytes(reinterpret_cast<const void *>(address), bytes);
     const auto copy =
         readable ? ring_copy(reinterpret_cast<const void *>(address), readable, readable) : 0;
     if (!copy)
@@ -5897,17 +5934,13 @@ std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t m
     next = (at + bytes + 255) & ~255ull;
     // A list's copy is made when a queue is given the list, each time it is, as the title
     // has the memory then: titles record their lists first and fill what they draw with
-    // after. Memory the title has let go of by then is left as it was.
+    // after. Memory the title has let go of by then is left as it was; a copy may span many
+    // regions of memory, as the title's vertices do.
     if (copying_for) {
         const auto *const from = static_cast<const std::uint8_t *>(source);
         auto *const to = memory + at;
         when_run(copying_for, [from, to, bytes] {
-            MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(from, &info, sizeof info) && info.State == MEM_COMMIT &&
-                !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
-                from + bytes <=
-                    static_cast<const std::uint8_t *>(info.BaseAddress) + info.RegionSize)
-                std::memcpy(to, from, bytes);
+            std::memcpy(to, from, static_cast<std::size_t>(readable_bytes(from, bytes)));
         });
     }
     std::memcpy(memory + at, source, bytes);
@@ -5948,14 +5981,9 @@ std::uint64_t unseen_root_address(bool written) {
 std::uint64_t root_address(std::uint64_t address) {
     if (const auto host = gpu_address(address); host || !address)
         return host;
-    MEMORY_BASIC_INFORMATION info{};
-    if (VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) &&
-        info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
-        const auto region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
-        if (const auto copy =
-                ring_copy(reinterpret_cast<const void *>(address), region_end - address))
+    if (const auto readable = readable_bytes(reinterpret_cast<const void *>(address), most_copied))
+        if (const auto copy = ring_copy(reinterpret_cast<const void *>(address), readable))
             return copy;
-    }
     return unseen_root_address(false);
 }
 // A root UAV of memory the host's GPU cannot see writes where nothing reads

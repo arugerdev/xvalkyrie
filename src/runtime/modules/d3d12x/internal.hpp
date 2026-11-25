@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <d3d12.h>
+#include <vector>
 
 // What the console's device and queue have for showing frames, which the host does with a
 // swap chain: present.cpp.
@@ -15,6 +16,8 @@ bool capturing();
 void capture_bound(ID3D12Resource *resource, bool depth);
 void capture_draw(ID3D12Resource *target);
 void capture_frame(ID3D12Resource *picture);
+// the textures the title writes through memory of ours (scratch_memory), a reference each
+std::vector<ID3D12Resource *> written_textures();
 // ID3D12CommandQueue::PresentX on the host's queue
 HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_parameters,
                   const void *present_parameters);

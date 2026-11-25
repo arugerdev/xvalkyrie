@@ -16,6 +16,8 @@
 // in XV_CAPTURE_DIR (the temporary folder without it), in the order the title first bound
 // each, with a line of the log each: size, format, draws, average colour and how much of it
 // is not black. What a frame is made of, pass by pass, to find the first that goes wrong.
+// The textures the title writes through memory are kept too, and each draw of those frames
+// is a line of the log (device.cpp's capture_call).
 namespace xv::runtime::modules::d3d12x {
 namespace {
 struct Captured {
@@ -123,6 +125,7 @@ bool pixel(DXGI_FORMAT format, const std::uint8_t *in, std::uint8_t *out) {
         return true;
     }
     case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_A8_UNORM:
     case DXGI_FORMAT_R8_TYPELESS:
         out[0] = out[1] = out[2] = in[0], out[3] = 255;
         return true;
@@ -159,6 +162,7 @@ unsigned bytes_per_pixel(DXGI_FORMAT format) {
     case DXGI_FORMAT_R16_TYPELESS:
         return 2;
     case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_A8_UNORM:
     case DXGI_FORMAT_R8_TYPELESS:
         return 1;
     default:
@@ -270,6 +274,14 @@ void capture_frame(ID3D12Resource *picture) {
     }
     if (picture)
         save(picture, tracked_state(picture, D3D12_RESOURCE_STATE_PRESENT), frame, "presented", 0);
+    // and the textures the title writes through memory, as the host has them now
+    index = 0;
+    for (auto *const texture : written_textures()) {
+        char name[32];
+        std::snprintf(name, sizeof name, "written%02d", index++);
+        save(texture, tracked_state(texture, D3D12_RESOURCE_STATE_COMMON), frame, name, 0);
+        texture->Release();
+    }
     std::fflush(stderr);
 }
 } // namespace xv::runtime::modules::d3d12x

@@ -12,9 +12,9 @@
 namespace {
 using namespace d3d12x_test;
 
-// The later kits' layout of queues and lists, set by the title's first Signal at the queue's
-// slot 16 (see queue_by_layout): every list method from 59 on is two slots further, and so are
-// the queue's Signal (16) and Wait (17).
+// The later kits' layout of queues and lists, which the title's first Signal at the queue's
+// slot 16 shows (see queue_by_layout): every list method from 59 on is two slots further, and so
+// are the queue's Signal (16) and Wait (17).
 constexpr std::uint32_t queue_signal = 16, queue_wait = 17, copy_memory = 62, fill_32 = 63,
                         flush_pipeline = 69, wait_32 = 73, write_32 = 90;
 ID3D12Fence *fence() {
@@ -22,10 +22,13 @@ ID3D12Fence *fence() {
     REQUIRE(SUCCEEDED(device()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&made))));
     return made;
 }
-void later_layout() {
-    static auto *const marker = fence();
-    CHECK(title().call(queue(), queue_signal, marker, std::uint64_t{1}) == S_OK);
-}
+// that layout, for as long as a test holds it
+struct LaterLayout : LayoutsShown {
+    LaterLayout() {
+        static auto *const marker = fence();
+        CHECK(title().call(queue(), queue_signal, marker, std::uint64_t{1}) == S_OK);
+    }
+};
 // the title's compute queue (CreateCommandQueue, 8), and a list of its own type
 struct Compute {
     void *queue = nullptr, *list = nullptr;
@@ -74,7 +77,7 @@ void wait_on_memory(Compute &compute, ID3D12Fence *done) {
 TEST_CASE("a list that waits on memory runs after the work other queues were given before it") {
     if (!device())
         return;
-    later_layout();
+    const LaterLayout layout;
     auto *const held = fence();
     auto *const done = fence();
     // the direct queue is held by a wait the title did not make, then given a list
@@ -96,7 +99,7 @@ TEST_CASE("a list that waits on memory runs after the work other queues were giv
 TEST_CASE("a list that waits on memory does not wait past another queue's wait not yet over") {
     if (!device())
         return;
-    later_layout();
+    const LaterLayout layout;
     auto *const held = fence();
     auto *const done = fence();
     // the title's own Wait: what the direct queue is given after it may wait for the compute
@@ -121,7 +124,7 @@ TEST_CASE("a list that waits on memory does not wait past another queue's wait n
 TEST_CASE("FlushPipelineX orders a list's work as a barrier does") {
     if (!device())
         return;
-    later_layout();
+    const LaterLayout layout;
     std::uint64_t output = 0;
     auto *const results = buffer(4096, output);
     const D3D12_ROOT_PARAMETER parameters[]{root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
@@ -149,7 +152,7 @@ TEST_CASE("FlushPipelineX orders a list's work as a barrier does") {
 TEST_CASE("a pipeline is made for the host when a list is first given it, of what it was made of") {
     if (!device())
         return;
-    later_layout();
+    const LaterLayout layout;
     std::uint64_t output = 0;
     auto *const results = buffer(4096, output);
     const D3D12_ROOT_PARAMETER parameters[]{root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
@@ -198,7 +201,7 @@ TEST_CASE("a pipeline is made for the host when a list is first given it, of wha
 TEST_CASE("a list's copies, fills and values in memory are done when it runs, in its order") {
     if (!device())
         return;
-    later_layout();
+    const LaterLayout layout;
     auto *const memory = static_cast<std::uint32_t *>(
         VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     REQUIRE(memory);

@@ -1,3 +1,5 @@
+// Catch2's listener interfaces, for DebugLayer
+#define CATCH_CONFIG_EXTERNAL_INTERFACES
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
@@ -28,15 +30,24 @@ struct Warp {
     // the host's messages, where it has the debug layer
     ID3D12InfoQueue *messages = nullptr;
 };
+// The host's debug layer, where it has one, for every device the tests make: turning it on
+// removes the devices made before, so it is on before the first test, whatever their order
+struct DebugLayer : Catch::TestEventListenerBase {
+    using TestEventListenerBase::TestEventListenerBase;
+    void testRunStarting(const Catch::TestRunInfo &) override {
+        if (ID3D12Debug *debug = nullptr; SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+            debug->EnableDebugLayer();
+            debug->Release();
+        }
+    }
+};
+CATCH_REGISTER_LISTENER(DebugLayer)
+
 Warp &warp() {
     static Warp made = [] {
         static Registry registry;
         modules::d3d12x::install(registry, "d3d12_xs.dll", xv::Target::scarlett);
         Warp warp;
-        if (ID3D12Debug *debug = nullptr; SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
-            debug->EnableDebugLayer();
-            debug->Release();
-        }
         IDXGIFactory4 *factory = nullptr;
         IDXGIAdapter *adapter = nullptr;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&

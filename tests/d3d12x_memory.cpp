@@ -177,12 +177,11 @@ TEST_CASE("WriteBufferImmediate writes the title's own memory itself") {
     buffer->Release();
 }
 
-// This one leaves the module with the later kits' layout of queues and lists, which views of
-// memory at an address show: it comes last.
 TEST_CASE("a view of memory at an address reads a copy of it, and a descriptor the title "
           "writes reads nothing there") {
     if (!device())
         return;
+    const LayoutsShown layouts; // a view at an address is a later kit's (see view_at)
     const TitleMemory memory;
     std::uint64_t output = 0;
     auto *const buffer = d3d12x_test::buffer(4096, output);
@@ -252,10 +251,205 @@ TEST_CASE("a view of memory at an address reads a copy of it, and a descriptor t
     buffer->Release();
 }
 
+// The host drops the device over a buffer view that reaches past the end of its buffer, or
+// has no elements: a title's view near the end of a large buffer stops at the end, and reads
+// past it give 0.
+TEST_CASE("a buffer view near the end of a large buffer reaches no further than the buffer") {
+    if (!device())
+        return;
+    const LayoutsShown layouts; // a view at an address is a later kit's (see view_at)
+    constexpr std::uint64_t size = 64 << 20;
+    std::uint64_t output = 0, end = 0;
+    auto *const buffer = d3d12x_test::buffer(4096, output);
+    auto *const large = d3d12x_test::buffer(size, end);
+    end += size;
+    for (std::uint64_t at = end - 4096; at < end; at += 4)
+        std::memcpy(reinterpret_cast<void *>(at), &pattern, 4);
+    const D3D12_DESCRIPTOR_RANGE ranges[]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
+                                          {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 3}};
+    const D3D12_ROOT_PARAMETER parameters[]{table(ranges, 2),
+                                            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const signature = root_signature({2, parameters});
+    auto *const pipeline = compute_pipeline(signature, R"(
+        ByteAddressBuffer at_address : register(t0);
+        ByteAddressBuffer of_resource : register(t1);
+        ByteAddressBuffer written_by_title : register(t2);
+        RWByteAddressBuffer output : register(u0);
+        RWByteAddressBuffer near_end : register(u1);
+        [numthreads(1, 1, 1)] void main() {
+            output.Store4(0, at_address.Load4(48));
+            output.Store4(16, at_address.Load4(64));
+            output.Store4(32, of_resource.Load4(48));
+            output.Store4(48, of_resource.Load4(64));
+            output.Store4(64, written_by_title.Load4(0));
+            for (uint i = 0; i < 16; ++i)
+                near_end.Store(i * 4, 100 + i);
+            output.Store(80, 1u);
+        })");
+    const Heap heap(4);
+    D3D12_RESOURCE_DESC of{};
+    of.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    of.Width = 4096;
+    of.Height = of.DepthOrArraySize = of.MipLevels = 1;
+    of.SampleDesc.Count = 1;
+    of.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // device slot 70: 1024 words of memory 64 bytes before the buffer's end
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::uint64_t address;
+    } shader_view{{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                   D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING},
+                  end - 64};
+    shader_view.view.Buffer = {0, 1024, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    title().call<void>(device(), 70, &of, &shader_view, heap.cpu);
+    // CreateShaderResourceView (18) of the buffer itself, from the same word on
+    auto of_buffer = shader_view.view;
+    of_buffer.Buffer.FirstElement = (size - 64) / 4;
+    title().call<void>(device(), 18, large, &of_buffer, heap.cpu + 32);
+    // a buffer descriptor (V#) the title writes itself, 2 bytes before the end: not one word
+    // of it is in the buffer
+    const std::array<std::uint32_t, 4> descriptor{
+        static_cast<std::uint32_t>(end - 2), static_cast<std::uint32_t>((end - 2) >> 32) & 0xffff,
+        64, 0x00000fac};
+    std::memcpy(reinterpret_cast<void *>(heap.cpu + 64), descriptor.data(), sizeof descriptor);
+    // device slot 71: 64 words to write, 32 bytes before the end
+    struct {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view;
+        std::uint64_t address, counter;
+    } access_view{{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER}, end - 32, 0};
+    access_view.view.Buffer = {0, 64, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    title().call<void>(device(), 71, &of, &access_view, heap.cpu + 96);
+    CHECK(removed_reason() == S_OK);
+    Work work;
+    work.record(32, 1u, &heap.heap);
+    work.record(33, signature);
+    work.record(25, pipeline);
+    work.record(35, 0u, heap.gpu);
+    work.record(45, 1u, output);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+    CHECK(removed_reason() == S_OK);
+    const auto *const result = words(output);
+    CHECK(result[20] == 1);
+    for (int i = 0; i < 4; ++i) {
+        // the last words of the buffer, and none past it
+        CHECK(result[i] == pattern);
+        CHECK(result[4 + i] == 0);
+        CHECK(result[8 + i] == pattern);
+        CHECK(result[12 + i] == 0);
+        CHECK(result[16 + i] == 0);
+    }
+    // the writes that were in the buffer
+    for (std::uint32_t i = 0; i < 8; ++i)
+        CHECK(words(end - 32)[i] == 100 + i);
+    pipeline->Release();
+    signature->Release();
+    large->Release();
+    buffer->Release();
+}
+
+// The host takes a raw view only from 16 bytes into its buffer on, and drops the device over
+// one from elsewhere, where the console's starts at any word: a raw view to read is of a copy
+// of what it views, made again with the view, and one to write is of nothing.
+TEST_CASE("a raw view that does not start on 16 bytes reads a copy, and one to write is none") {
+    if (!device())
+        return;
+    const LayoutsShown layouts; // a view at an address is a later kit's (see view_at)
+    std::uint64_t output = 0, memory = 0;
+    auto *const buffer = d3d12x_test::buffer(4096, output);
+    auto *const viewed = d3d12x_test::buffer(4096, memory);
+    // word i of the memory is base + i
+    const auto fill = [&](std::uint32_t base) {
+        for (std::uint32_t i = 0; i < 1024; ++i) {
+            const auto value = base + i;
+            std::memcpy(reinterpret_cast<void *>(memory + i * 4), &value, 4);
+        }
+    };
+    const D3D12_DESCRIPTOR_RANGE ranges[]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
+                                          {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 3}};
+    const D3D12_ROOT_PARAMETER parameters[]{table(ranges, 2),
+                                            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const signature = root_signature({2, parameters});
+    auto *const pipeline = compute_pipeline(signature, R"(
+        ByteAddressBuffer at_address : register(t0);
+        ByteAddressBuffer of_resource : register(t1);
+        ByteAddressBuffer written_by_title : register(t2);
+        RWByteAddressBuffer output : register(u0);
+        RWByteAddressBuffer to_write : register(u1);
+        [numthreads(1, 1, 1)] void main() {
+            output.Store4(0, at_address.Load4(0));
+            output.Store4(16, of_resource.Load4(0));
+            output.Store4(32, written_by_title.Load4(0));
+            to_write.Store(0, 77u);
+            output.Store(48, 1u);
+        })");
+    const Heap heap(4);
+    D3D12_RESOURCE_DESC of{};
+    of.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    of.Width = 4096;
+    of.Height = of.DepthOrArraySize = of.MipLevels = 1;
+    of.SampleDesc.Count = 1;
+    of.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    struct {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view;
+        std::uint64_t address;
+    } shader_view{{DXGI_FORMAT_R32_TYPELESS, D3D12_SRV_DIMENSION_BUFFER,
+                   D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING},
+                  memory + 4};
+    shader_view.view.Buffer = {0, 8, 0, D3D12_BUFFER_SRV_FLAG_RAW};
+    auto of_buffer = shader_view.view;
+    of_buffer.Buffer.FirstElement = 2;
+    // a buffer descriptor (V#) 20 bytes in, of 32 bytes
+    const std::array<std::uint32_t, 4> descriptor{
+        static_cast<std::uint32_t>(memory + 20),
+        static_cast<std::uint32_t>((memory + 20) >> 32) & 0xffff, 32, 0x00000fac};
+    struct {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view;
+        std::uint64_t address, counter;
+    } access_view{{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER}, memory + 4, 0};
+    access_view.view.Buffer = {0, 8, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
+    // the views made (device slots 70, 18 and 71, and the descriptor), then a dispatch
+    const auto run = [&] {
+        title().call<void>(device(), 70, &of, &shader_view, heap.cpu);
+        title().call<void>(device(), 18, viewed, &of_buffer, heap.cpu + 32);
+        std::memcpy(reinterpret_cast<void *>(heap.cpu + 64), descriptor.data(), sizeof descriptor);
+        title().call<void>(device(), 71, &of, &access_view, heap.cpu + 96);
+        CHECK(removed_reason() == S_OK);
+        Work work;
+        work.record(32, 1u, &heap.heap);
+        work.record(33, signature);
+        work.record(25, pipeline);
+        work.record(35, 0u, heap.gpu);
+        work.record(45, 1u, output);
+        work.record(14, 1u, 1u, 1u);
+        work.run();
+        CHECK(removed_reason() == S_OK);
+    };
+    // what is there when the views are made, and again when they are made again
+    for (const std::uint32_t base : {0x1000u, 0x2000u}) {
+        fill(base);
+        run();
+        const auto *const result = words(output);
+        CHECK(result[12] == 1);
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            CHECK(result[i] == base + 1 + i);
+            CHECK(result[4 + i] == base + 2 + i);
+            CHECK(result[8 + i] == base + 5 + i);
+        }
+        // the write went nowhere
+        CHECK(words(memory)[1] == base + 1);
+    }
+    pipeline->Release();
+    signature->Release();
+    viewed->Release();
+    buffer->Release();
+}
+
 TEST_CASE("a texture placed in the title's memory has that memory's address") {
     if (!device())
         return;
     const TitleMemory memory;
+    const PlacementsGone placements;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = desc.Height = 64;

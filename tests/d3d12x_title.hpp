@@ -1,6 +1,7 @@
 #pragma once
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/d3d12x.hpp"
+#include "runtime/modules/placement.hpp"
 #include <catch2/catch.hpp>
 #include <windows.h>
 
@@ -46,6 +47,12 @@ class TitleCode {
         FlushInstructionCache(GetCurrentProcess(), code_, size);
         xv::runtime::modules::d3d12x::call_as_title(code_, size);
     }
+    ~TitleCode() {
+        xv::runtime::modules::d3d12x::stop_calling_as_title(code_);
+        VirtualFree(code_, 0, MEM_RELEASE);
+    }
+    TitleCode(const TitleCode &) = delete;
+    TitleCode &operator=(const TitleCode &) = delete;
     template <class Result = HRESULT, class... Arguments>
     Result call(void *object, std::uint32_t slot, Arguments... arguments) const {
         static_assert(sizeof...(Arguments) <= 9);
@@ -140,6 +147,26 @@ struct Work {
         CHECK(title().call(list, 10, allocator, static_cast<ID3D12PipelineState *>(nullptr)) ==
               S_OK);
     }
+};
+
+// The later kits' layouts of queues and lists (every list method from 59 on two slots
+// further), which the module takes from the title's calls and keeps from then on: a test whose
+// calls show them holds this, and the next test starts as a title the module knows nothing of
+struct LayoutsShown {
+    LayoutsShown() = default;
+    ~LayoutsShown() { xv::runtime::modules::d3d12x::forget_layouts(); }
+    LayoutsShown(const LayoutsShown &) = delete;
+    LayoutsShown &operator=(const LayoutsShown &) = delete;
+};
+
+// The module follows a texture placed in the title's memory, with a reference of its own and a
+// handler for the writes to that memory: a test that places textures holds this, and the next
+// test's placements are its own
+struct PlacementsGone {
+    PlacementsGone() = default;
+    ~PlacementsGone() { xv::runtime::modules::forget_placements(); }
+    PlacementsGone(const PlacementsGone &) = delete;
+    PlacementsGone &operator=(const PlacementsGone &) = delete;
 };
 
 // GetDeviceRemovedReason (37)

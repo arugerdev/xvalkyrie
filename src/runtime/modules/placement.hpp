@@ -34,6 +34,9 @@ struct PlacementUpload {
     DXGI_FORMAT format; // what the subresources hold, which may not be the resource's format
 };
 std::vector<PlacementUpload> take_d3d12_uploads();
+// Every placement let go of, and the handler that watches their memory taken out: the next
+// track_placement starts over. Exposed for the tests, each of which stands for a title.
+void forget_placements();
 // before the host writes [address, address + bytes) (ReadFile into it): a write there from
 // the kernel fails instead of faulting, so the placements in it are let go and marked dirty
 void prepare_title_write(const void *address, std::size_t bytes);

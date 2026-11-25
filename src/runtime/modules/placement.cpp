@@ -807,4 +807,20 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
     dirty = std::move(kept);
     return uploads;
 }
+void forget_placements() {
+    const std::lock_guard lock(mutex);
+    for (auto &[start, placement] : placements) {
+        protect(placement, PAGE_READWRITE);
+        release(placement);
+    }
+    placements.clear();
+    for (auto &waiting : pending)
+        release(waiting);
+    pending.clear();
+    dirty.clear();
+    largest = 0;
+    if (handler)
+        RemoveVectoredExceptionHandler(handler);
+    handler = nullptr;
+}
 } // namespace xv::runtime::modules

@@ -399,6 +399,7 @@ TEST_CASE("texels the title writes in the consoles' own formats reach the host's
                         511u | 0x201u << 10 | 3u << 30, bytes_of({0x7fff, 0x8001, 0, 0x7fff})},
                        // 1 and 2 of 15
                        {XBOX_DXGI_FORMAT_R4G4_UNORM, DXGI_FORMAT_R8G8_UNORM, 0x21, {0x11, 0x22}}};
+    const PlacementsGone placements;
     for (const auto &[format, host, texel, expected] : cases) {
         INFO("format " << format);
         // a 4x4 texture in the title's memory, linear, then CreatePlacedResourceX (44) on it;

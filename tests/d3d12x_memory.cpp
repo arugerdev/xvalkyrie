@@ -177,8 +177,6 @@ TEST_CASE("WriteBufferImmediate writes the title's own memory itself") {
     buffer->Release();
 }
 
-// This one leaves the module with the later kits' layout of queues and lists, which views of
-// memory at an address show: it comes last.
 TEST_CASE("a view of memory at an address reads a copy of it, and a descriptor the title "
           "writes reads nothing there") {
     if (!device())
@@ -259,6 +257,7 @@ TEST_CASE("a view of memory at an address reads a copy of it, and a descriptor t
 TEST_CASE("a buffer view near the end of a large buffer reaches no further than the buffer") {
     if (!device())
         return;
+    const LayoutsShown layouts; // a view at an address is a later kit's (see view_at)
     constexpr std::uint64_t size = 64 << 20;
     std::uint64_t output = 0, end = 0;
     auto *const buffer = d3d12x_test::buffer(4096, output);
@@ -355,6 +354,7 @@ TEST_CASE("a buffer view near the end of a large buffer reaches no further than 
 TEST_CASE("a raw view that does not start on 16 bytes reads a copy, and one to write is none") {
     if (!device())
         return;
+    const LayoutsShown layouts; // a view at an address is a later kit's (see view_at)
     std::uint64_t output = 0, memory = 0;
     auto *const buffer = d3d12x_test::buffer(4096, output);
     auto *const viewed = d3d12x_test::buffer(4096, memory);

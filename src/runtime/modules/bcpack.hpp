@@ -14,6 +14,8 @@ namespace xv::runtime::modules::bcpack {
 struct Tables;
 // the tables' size, as bcpack-tables.bin lays them out
 constexpr std::size_t tables_size = 77982;
+// the tables the runtime was built with (see CMakeLists.txt), empty if it was built with none
+std::span<const std::uint8_t> builtin_tables();
 // the tables from those bytes; null, with the reason in `why`, if they are not tables
 std::shared_ptr<const Tables> parse_tables(std::span<const std::uint8_t> bytes, std::string *why);
 // unpacks `source` (BC number `bc`) into `destination`, whose size gives the block count;

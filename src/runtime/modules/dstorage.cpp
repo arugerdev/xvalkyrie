@@ -268,9 +268,9 @@ HRESULT write_destination(const Request &request, const std::uint8_t *data, std:
     return S_OK;
 }
 
-// BCPack's tables are the format's constants, which are not this project's to give: they
-// are read from bcpack-tables.bin beside the executable, a file the user provides. Without it
-// a BCPack request fails, as one did before there was a decoder.
+// BCPack's tables are the format's constants: bcpack-tables.bin beside the executable where
+// there is one, else those the runtime was built with. With neither a BCPack request fails, as
+// one did before there was a decoder.
 struct BcpackTables {
     std::mutex mutex;
     bool looked = false;
@@ -292,6 +292,8 @@ std::shared_ptr<const bcpack::Tables> bcpack_tables() {
         std::string why = "there is no such file";
         if (file.is_open())
             state.tables = bcpack::parse_tables(bytes, &why);
+        if (!state.tables && !bcpack::builtin_tables().empty())
+            state.tables = bcpack::parse_tables(bcpack::builtin_tables(), &why);
         if (!state.tables)
             std::fprintf(stderr,
                          "[Runtime] DirectStorage: BCPack requests fail until the format's "

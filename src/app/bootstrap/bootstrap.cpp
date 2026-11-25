@@ -9,7 +9,11 @@
 #include "launcher/launch.hpp"
 #include "launcher/library.hpp"
 #include "runtime/console.hpp"
+#include "runtime/modules/console_shader.hpp"
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -84,6 +88,53 @@ void read_commands() {
         }
     }).detach();
 }
+// The shaders earlier runs of the title asked for that the shader cache lacks are made
+// before it starts, on most of the processor, with a window that says how far that is and
+// lets the title start before it is done; the rest are made behind it. XV_PRECOMPILE=0
+// starts the title at once; XV_PRECOMPILE_THREADS says on how many threads.
+void precompile(const std::filesystem::path &cache, const std::filesystem::path &journal,
+                const std::string &name) {
+    runtime::modules::set_shader_journal(journal);
+    if (const auto *const text = std::getenv("XV_PRECOMPILE"); text && *text == '0')
+        return;
+    const auto cores = std::max(std::thread::hardware_concurrency(), 2u);
+    const auto *const asked = std::getenv("XV_PRECOMPILE_THREADS");
+    const auto threads = asked ? static_cast<unsigned>(std::max(std::atoi(asked), 1))
+                               : std::min(cores - 1, 8u);
+    const auto started = std::chrono::steady_clock::now();
+    const auto work = runtime::modules::precompile_shaders(cache, journal, threads);
+    if (work->finished)
+        return;
+    std::cerr << "[Boot] " << work->total << " shaders of earlier runs to make for the host, on "
+              << threads << " threads" << std::endl;
+    {
+        surface::ProgressWindow window(L"XValkyrie", L"Preparing shaders for " + wide(name));
+        while (!work->finished && !window.skipped()) {
+            window.update(work->done, work->total,
+                          std::to_wstring(work->done.load()) + L" of " +
+                              std::to_wstring(work->total.load()) + L" shaders (" +
+                              std::to_wstring(work->failed.load()) + L" do not translate yet)");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (window.skipped())
+            std::cerr << "[Boot] the title starts now; the other shaders are made behind it"
+                      << std::endl;
+    }
+    std::cerr << "[Boot] shaders: " << work->made << " made, " << work->failed
+              << " that do not translate, in "
+              << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                                  started)
+                     .count()
+              << " s" << std::endl;
+}
+// a title's folder in the shader cache: by its title ID, or by its name's characters
+std::string journal_name(const std::string &id, const std::string &name) {
+    std::string folder = id.empty() ? name : id;
+    for (auto &c : folder)
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.')
+            c = '_';
+    return folder.empty() ? "title" : folder;
+}
 } // namespace
 
 std::uint32_t run(const std::filesystem::path &path, runtime::ExecuteOptions options) {
@@ -111,6 +162,9 @@ std::uint32_t run(const std::filesystem::path &path, runtime::ExecuteOptions opt
     });
     read_commands();
     std::cerr << "[Boot] " << name << std::endl;
+    precompile(options.shader_cache_directory,
+               options.shader_cache_directory / "titles" / journal_name(id, title_name(path)),
+               name);
     std::cerr << "[Boot] starting " << app::text(file) << ", saves in "
               << app::text(options.save_directory) << std::endl;
     return runtime::execute(file, bytes, runtime::title_registry(bytes), options);

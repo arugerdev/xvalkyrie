@@ -11,6 +11,7 @@
 #include "runtime/modules/console_shader.hpp"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace xv::cli {
@@ -235,6 +237,19 @@ std::optional<int> run(int argc, wchar_t **argv) {
                                     {"translated", translated},
                                     {"stopped", reasons}}
                          .dump(2)
+                  << '\n';
+        return 0;
+    }
+    if ((argc == 4 || argc == 5) && command == "shader-precompile") {
+        // <shader cache> <title's journal> [threads]: what a title's start makes, without it
+        const auto work = runtime::modules::precompile_shaders(
+            argv[2], argv[3], argc == 5 ? static_cast<unsigned>(std::stoul(argv[4])) : 8);
+        while (!work->finished)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::cout << nlohmann::json{{"total", work->total.load()},
+                                    {"made", work->made.load()},
+                                    {"failed", work->failed.load()}}
+                         .dump()
                   << '\n';
         return 0;
     }

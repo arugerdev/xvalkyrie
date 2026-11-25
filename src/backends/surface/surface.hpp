@@ -1,6 +1,7 @@
 #pragma once
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -64,6 +65,23 @@ class TitleWindow {
     void *handle_ = nullptr;
     struct Thread;
     Thread *thread_ = nullptr;
+};
+// A window that says how far something a title waits for before it starts has got (making
+// its shaders), with a button that lets the title start now and leaves the rest to go on
+// behind it. It has a thread of its own; update() from any thread. Closed when destroyed.
+class ProgressWindow {
+  public:
+    ProgressWindow(std::wstring caption, std::wstring heading);
+    ~ProgressWindow();
+    ProgressWindow(const ProgressWindow &) = delete;
+    ProgressWindow &operator=(const ProgressWindow &) = delete;
+    void update(std::size_t done, std::size_t total, std::wstring detail);
+    // the user asked for the title to start now, or closed the window
+    bool skipped() const;
+    struct State;
+
+  private:
+    std::shared_ptr<State> state_;
 };
 namespace detail {
 // HWND of the top-level window of the last title window

@@ -1,6 +1,9 @@
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,7 +20,8 @@ enum class ShaderStage {
     compute,
     geometry_points,
     geometry_lines,
-    geometry_triangles
+    geometry_triangles,
+    mesh
 };
 // whether the container's DXIL part has no bitcode
 bool console_only_shader(std::span<const std::uint8_t> container);
@@ -108,6 +112,22 @@ struct HeapLayout {
     std::vector<Read> reads;
 };
 HeapLayout shader_heap_layout(std::span<const std::uint8_t> container);
+// Each console shader the running title has made for the host is noted in `folder`, one file
+// a shader, so that precompile_shaders makes the ones the shader cache lacks before a later
+// run of the title starts. Nothing is noted while it is empty.
+void set_shader_journal(std::filesystem::path folder);
+// How far precompile_shaders has got, read from any thread
+struct Precompile {
+    std::atomic<std::size_t> total{0}, done{0}, made{0}, failed{0};
+    std::atomic<bool> finished{false};
+};
+// Makes, in `cache`, every shader noted in `folder` that it does not have yet, on `threads`
+// threads of their own that go on whatever the caller does: one the title asks for meanwhile
+// is waited for, not made twice. What does not translate is noted so as not to be tried
+// again by this version of the translator.
+std::shared_ptr<Precompile> precompile_shaders(const std::filesystem::path &cache,
+                                               const std::filesystem::path &folder,
+                                               unsigned threads);
 // A compute shader that does nothing, for a pipeline whose own shader the host's driver
 // cannot make. Empty if the host's compiler gives none.
 std::span<const std::uint8_t> empty_compute_shader();

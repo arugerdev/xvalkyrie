@@ -217,6 +217,21 @@ TEST_CASE("a register that holds one of two descriptors is used as each") {
     CHECK(source.find("t2_0.Load(") != std::string::npos);
 }
 
+TEST_CASE("a typed buffer load reads its element by the format the instruction names") {
+    // tbuffer_load_format_xy v[1:2], v0, s[12:15], format:[BUF_FMT_32_32_FLOAT] idxen
+    const auto words = translated({0xea012000, 0x80030100});
+    CHECK(reads(last_set(words, "v1"), "v0") == false);
+    CHECK(words.find(".w[0]") != std::string::npos);
+    CHECK(words.find(".w[1]") != std::string::npos);
+    // tbuffer_load_format_xyzw v[1:4], v0, s[12:15], format:[BUF_FMT_8_8_8_8_UNORM] idxen
+    const auto bytes = translated({0xe9c32000, 0x80030100});
+    CHECK(last_set(bytes, "v4").find("/ 255.0") != std::string::npos);
+    CHECK(last_set(bytes, "v1").find("& 0x000000ffu") != std::string::npos);
+    // tbuffer_load_format_x v1, v0, s[12:15], format:[BUF_FMT_16_FLOAT] idxen
+    const auto half = translated({0xe8682000, 0x80030100});
+    CHECK(last_set(half, "v1").find("f16tof32") != std::string::npos);
+}
+
 TEST_CASE("a load into the registers of its address reads every word from the address given") {
     // buffer_load_dwordx4 v[1:4], v[1:2], s[12:15], 0 idxen offen
     const auto buffer = translated({0xe0383000, 0x80030101});

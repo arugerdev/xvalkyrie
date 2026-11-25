@@ -3154,7 +3154,8 @@ struct HeapUses {
         std::vector<std::uint32_t> samplers;
     };
     Stage stages[2];
-    std::string made; // XV_D3D_LOST: what its shaders are kept as in the shader cache
+    bool compute = false; // a compute pipeline's, whose one stage is the first
+    std::string made;     // XV_D3D_LOST: what its shaders are kept as in the shader cache
 };
 // what a shader of a container says of its registers (modules::shader_heap_layout)
 HeapUses::Stage heap_stage(const D3D12_SHADER_BYTECODE &code) {
@@ -3188,14 +3189,48 @@ std::shared_ptr<const HeapUses> heap_uses(const void *pipeline) {
 // by the shaders; then a root view of each kind (t0, b0 and u0 of space 201) for the one a
 // shader may read. Null where the host has no such heaps.
 ID3D12RootSignature *heap_signature(ID3D12Device *device);
+// set while a pipeline the host turned down with such shaders is made again the title's way
+thread_local bool heap_shaders_refused = false;
+// What the host turns down with shaders that read the heaps (NVIDIA: E_OUTOFMEMORY for some)
+// is made again with the title's signature and its ranges: true when the caller should
+// make it once more, as it does then.
+bool retry_without_heaps(HRESULT result, bool heaps) {
+    if (SUCCEEDED(result) || !heaps || heap_shaders_refused)
+        return false;
+    static std::atomic<unsigned> refused{0};
+    if (const auto count = ++refused; std::has_single_bit(count)) {
+        std::fprintf(stderr,
+                     "[Runtime] %u pipelines whose shaders read the heaps themselves the host "
+                     "turns down (0x%08lx): they are made the title's way%c",
+                     count, static_cast<unsigned long>(result), 10);
+        std::fflush(stderr);
+    }
+    return true;
+}
 bool heap_shaders_wanted(ID3D12Device *device) {
-    // not yet by default: with it the host turns some pipelines down (E_OUTOFMEMORY) and
-    // the title ends; XV_HEAP_SHADERS=1 turns it on
+    if (heap_shaders_refused)
+        return false;
+    // what the host turns down this way is made again the title's way (retry_without_heaps);
+    // XV_HEAP_SHADERS=0 keeps every pipeline the title's way
     static const bool on = [] {
         const auto *const text = std::getenv("XV_HEAP_SHADERS");
-        return text && *text == '1';
+        return !text || *text != '0';
     }();
     return on && console == Target::scarlett && heap_signature(device);
+}
+// A compute shader of the Series console is made to read the heaps itself where its file
+// says what its user registers hold; one without that table keeps the title's signature.
+bool heap_compute_shader(ID3D12Device *device, const D3D12_SHADER_BYTECODE &code) {
+    return code.pShaderBytecode && heap_shaders_wanted(device) &&
+           modules::console_only_shader(shader_bytes(code)) &&
+           !modules::shader_heap_layout(shader_bytes(code)).entries.empty();
+}
+std::shared_ptr<const HeapUses> compute_heap_uses(const D3D12_SHADER_BYTECODE &code) {
+    auto uses = std::make_shared<HeapUses>();
+    uses->stages[0] = heap_stage(code);
+    uses->compute = true;
+    uses->made = "a container's";
+    return uses;
 }
 ID3D12RootSignature *heap_signature(ID3D12Device *device) {
     static std::once_flag once;
@@ -3216,18 +3251,27 @@ ID3D12RootSignature *heap_signature(ID3D12Device *device) {
             parameters[n].Descriptor = {0, 201, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE};
             parameters[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         }
-        D3D12_STATIC_SAMPLER_DESC sampler{};
-        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-        sampler.MaxLOD = D3D12_FLOAT32_MAX;
-        sampler.RegisterSpace = 200;
+        // s0: the one shaders sample with when they make a sampler of words in their code;
+        // s1: the same, for a shader that compares with it (a shadow map's)
+        D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+        for (UINT n = 0; n < 2; ++n) {
+            auto &sampler = samplers[n];
+            sampler.Filter = n ? D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT
+                               : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sampler.AddressU = sampler.AddressV = sampler.AddressW =
+                n ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            sampler.ComparisonFunc =
+                n ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_NEVER;
+            sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            sampler.ShaderRegister = n;
+            sampler.RegisterSpace = 200;
+        }
         D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
         desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
         desc.Desc_1_1.NumParameters = 5;
         desc.Desc_1_1.pParameters = parameters;
-        desc.Desc_1_1.NumStaticSamplers = 1;
-        desc.Desc_1_1.pStaticSamplers = &sampler;
+        desc.Desc_1_1.NumStaticSamplers = 2;
+        desc.Desc_1_1.pStaticSamplers = samplers;
         // ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED and
         // SAMPLER_HEAP_DIRECTLY_INDEXED
         desc.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(0x1 | 0x400 | 0x800);
@@ -3387,6 +3431,7 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     D3D12_GRAPHICS_PIPELINE_STATE_DESC host{};
     ID3D12RootSignature *from_shader = nullptr;
     std::shared_ptr<const HeapUses> uses;
+    bool tried_heaps = false;
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     std::vector<modules::PackedInput> packed;
     if (desc) {
@@ -3429,6 +3474,7 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
                            host.PS.pShaderBytecode &&
                            modules::console_only_shader(shader_bytes(host.VS)) &&
                            modules::console_only_shader(shader_bytes(host.PS));
+        tried_heaps = heaps;
         modules::use_heap_shaders(heaps);
         const bool pair =
             host_graphics_pair(self, host.VS, host.PS, simple, packed, host.pRootSignature);
@@ -3459,6 +3505,14 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     }
     if (rectangles && (!cornered || !host.GS.pShaderBytecode))
         report_half_rectangles();
+    if (retry_without_heaps(result, tried_heaps)) {
+        if (from_shader)
+            from_shader->Release();
+        heap_shaders_refused = true;
+        result = create_graphics_pipeline(self, desc, iid, state);
+        heap_shaders_refused = false;
+        return result;
+    }
     if (SUCCEEDED(result) && state)
         lost_pipeline(from_shader ? "graphics, signature from its shaders" : "graphics", state,
                       host.pRootSignature);
@@ -3541,13 +3595,22 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     // the console's pipeline flags mean nothing to the host, which takes none of them
     D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
     ID3D12RootSignature *from_shader = nullptr;
+    std::shared_ptr<const HeapUses> uses;
+    bool heaps = false;
     if (desc) {
         host = *desc;
         host.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
-        if (host_bytecode(modules::ShaderStage::compute, host.CS, modules::HostShaderModel::sm5, {},
-                          host.pRootSignature) &&
-            !host.pRootSignature)
+        heaps = heap_compute_shader(self, desc->CS);
+        modules::use_heap_shaders(heaps);
+        const bool made = host_bytecode(modules::ShaderStage::compute, host.CS,
+                                        modules::HostShaderModel::sm5, {}, host.pRootSignature);
+        modules::use_heap_shaders(false);
+        if (made && heaps) {
+            uses = compute_heap_uses(desc->CS);
+            host.pRootSignature = heap_signature(self);
+        } else if (made && !host.pRootSignature) {
             host.pRootSignature = from_shader = shader_root_signature(self, false, {desc->CS});
+        }
     }
     // a shader of the title's own that the host's driver cannot make gets an empty one in
     // its place, with the title's root signature: the title goes on, and what the shader
@@ -3563,11 +3626,21 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     if (desc && ends_host_driver(desc->CS))
         empty();
     auto result = original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state);
+    if (retry_without_heaps(result, heaps)) {
+        heap_shaders_refused = true;
+        result = create_compute_pipeline(self, desc, iid, state);
+        heap_shaders_refused = false;
+        return result;
+    }
     if (FAILED(result) && !emptied && desc && host.CS.pShaderBytecode == desc->CS.pShaderBytecode &&
         empty())
         result = original<Create>(self, 11)(self, &host, iid, state);
     if (SUCCEEDED(result) && state)
         lost_pipeline("compute", state, host.pRootSignature);
+    if (SUCCEEDED(result) && state && *state && uses) {
+        const std::lock_guard lock(kept_mutex);
+        heap_pipelines[*state] = uses;
+    }
     if (emptied) {
         std::fprintf(stderr,
                      "[Runtime] a compute shader of %zu bytes that the host's driver cannot "
@@ -4021,19 +4094,21 @@ struct ListProxy {
         std::uint64_t value = 0;
         std::vector<std::uint32_t> words;
     };
-    std::vector<RootArgument> graphics_arguments;
+    std::vector<RootArgument> graphics_arguments, compute_arguments;
     std::shared_ptr<const HeapUses> heap_uses; // of `pipeline`
     bool ours_bound = false;                   // the host's list has heap_signature
+    bool compute_ours_bound = false;           // and for computing
     D3D12_VERTEX_BUFFER_VIEW vertices{};       // XV_D3D_LOST: the title's first stream, set last
     UINT vertex_calls = 0;
     bool legacy_barriers = false; // Barrier as on a host without enhanced barriers
     bool waits_memory = false;    // it has a Wait32BitValueX or Wait64BitValueX
     // what it does to memory by address, in order, done when a queue is given it (when_run)
     std::vector<std::function<void()>> on_memory;
-    RootArgument &argument(UINT parameter) {
-        if (graphics_arguments.size() <= parameter)
-            graphics_arguments.resize(std::min<std::size_t>(parameter, 63) + 1);
-        return graphics_arguments[std::min<std::size_t>(parameter, 63)];
+    RootArgument &argument(UINT parameter, bool compute = false) {
+        auto &arguments = compute ? compute_arguments : graphics_arguments;
+        if (arguments.size() <= parameter)
+            arguments.resize(std::min<std::size_t>(parameter, 63) + 1);
+        return arguments[std::min<std::size_t>(parameter, 63)];
     }
 };
 std::mutex proxy_mutex;
@@ -4841,7 +4916,9 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->pipeline = state;
     list->heap_uses = state ? heap_uses(state) : nullptr;
     list->graphics_arguments.clear();
+    list->compute_arguments.clear();
     list->ours_bound = false;
+    list->compute_ours_bound = false;
     list->waits_memory = false;
     list->on_memory.clear();
     const auto result = host_of(self)->Reset(allocator, state);
@@ -4866,7 +4943,10 @@ D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
 // The root signatures and descriptor tables: the title's own descriptors in a table are read
 // as the table says, once bound
 void STDMETHODCALLTYPE set_compute_root_signature(void *self, ID3D12RootSignature *signature) {
-    static_cast<ListProxy *>(self)->compute_root = signature;
+    auto *const list = static_cast<ListProxy *>(self);
+    list->compute_root = signature;
+    list->compute_arguments.clear();
+    list->compute_ours_bound = false;
     host_of(self)->SetComputeRootSignature(signature);
 }
 void STDMETHODCALLTYPE set_graphics_root_signature(void *self, ID3D12RootSignature *signature) {
@@ -4878,9 +4958,12 @@ void STDMETHODCALLTYPE set_graphics_root_signature(void *self, ID3D12RootSignatu
 }
 void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
                                               D3D12_GPU_DESCRIPTOR_HANDLE table) {
-    decode_table(static_cast<ListProxy *>(self)->compute_root, parameter, table.ptr);
+    auto *const list = static_cast<ListProxy *>(self);
+    list->argument(parameter, true) = {1, table.ptr, {}};
+    decode_table(list->compute_root, parameter, table.ptr);
     bind_heap_of(self, table.ptr);
-    host_of(self)->SetComputeRootDescriptorTable(parameter, host_gpu(table));
+    if (!list->compute_ours_bound)
+        host_of(self)->SetComputeRootDescriptorTable(parameter, host_gpu(table));
 }
 void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
                                                D3D12_GPU_DESCRIPTOR_HANDLE table) {
@@ -4891,41 +4974,173 @@ void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
     if (!list->ours_bound)
         host_of(self)->SetGraphicsRootDescriptorTable(parameter, host_gpu(table));
 }
-// SetGraphicsRoot32BitConstant (38) and SetGraphicsRoot32BitConstants (40)
-void STDMETHODCALLTYPE set_graphics_root_constant(void *self, UINT parameter, UINT value,
-                                                  UINT offset) {
-    auto *const list = static_cast<ListProxy *>(self);
-    auto &argument = list->argument(parameter);
-    argument.kind = 5;
-    if (argument.words.size() <= offset)
-        argument.words.resize(std::min<std::size_t>(offset, 255) + 1);
-    argument.words[std::min<std::size_t>(offset, 255)] = value;
-    if (!list->ours_bound)
-        host_of(self)->SetGraphicsRoot32BitConstant(parameter, value, offset);
-}
-void STDMETHODCALLTYPE set_graphics_root_constants(void *self, UINT parameter, UINT count,
-                                                   const void *data, UINT offset) {
-    auto *const list = static_cast<ListProxy *>(self);
-    auto &argument = list->argument(parameter);
+// SetGraphicsRoot32BitConstant (38) and SetGraphicsRoot32BitConstants (40), and the compute
+// ones before each (37, 39)
+void keep_constants(ListProxy *list, bool compute, UINT parameter, UINT count, const void *data,
+                    UINT offset) {
+    auto &argument = list->argument(parameter, compute);
     argument.kind = 5;
     if (data && offset + count <= 256) {
         if (argument.words.size() < offset + count)
             argument.words.resize(offset + count);
         std::memcpy(argument.words.data() + offset, data, 4 * std::size_t{count});
     }
+}
+void STDMETHODCALLTYPE set_graphics_root_constant(void *self, UINT parameter, UINT value,
+                                                  UINT offset) {
+    auto *const list = static_cast<ListProxy *>(self);
+    keep_constants(list, false, parameter, 1, &value, offset);
+    if (!list->ours_bound)
+        host_of(self)->SetGraphicsRoot32BitConstant(parameter, value, offset);
+}
+void STDMETHODCALLTYPE set_graphics_root_constants(void *self, UINT parameter, UINT count,
+                                                   const void *data, UINT offset) {
+    auto *const list = static_cast<ListProxy *>(self);
+    keep_constants(list, false, parameter, count, data, offset);
     if (!list->ours_bound)
         host_of(self)->SetGraphicsRoot32BitConstants(parameter, count, data, offset);
+}
+void STDMETHODCALLTYPE set_compute_root_constant(void *self, UINT parameter, UINT value,
+                                                 UINT offset) {
+    auto *const list = static_cast<ListProxy *>(self);
+    keep_constants(list, true, parameter, 1, &value, offset);
+    if (!list->compute_ours_bound)
+        host_of(self)->SetComputeRoot32BitConstant(parameter, value, offset);
+}
+void STDMETHODCALLTYPE set_compute_root_constants(void *self, UINT parameter, UINT count,
+                                                  const void *data, UINT offset) {
+    auto *const list = static_cast<ListProxy *>(self);
+    keep_constants(list, true, parameter, count, data, offset);
+    if (!list->compute_ours_bound)
+        host_of(self)->SetComputeRoot32BitConstants(parameter, count, data, offset);
 }
 void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64_t address);
 void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64_t address);
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address);
+void STDMETHODCALLTYPE set_compute_root_cbv(void *self, UINT index, std::uint64_t address);
+void STDMETHODCALLTYPE set_compute_root_srv(void *self, UINT index, std::uint64_t address);
+void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_t address);
+// What one stage of a pipeline that reads the heaps itself has in its user registers, from
+// `first` on: a table's first descriptor, constants as they are, from the title's root
+// arguments; the descriptors it reads are made the host's, and a root view it reads is set
+// with `view` (2 shader resource, 3 constant buffer, 4 unordered access: the root
+// parameter of heap_signature, and the host's address)
+template <class View>
+void fill_user(const HeapUses::Stage &stage,
+               const std::vector<ListProxy::RootArgument> &arguments, std::uint32_t first,
+               std::uint32_t (&user)[16], View view) {
+    std::uintptr_t tables[16]{};
+    ShadowHeap heaps[16]{};
+    std::memset(user, 0, sizeof user);
+    for (const auto &entry : stage.entries) {
+        const auto at = entry.reg - first;
+        const auto *const argument =
+            entry.slot < arguments.size() ? &arguments[entry.slot] : nullptr;
+        if (entry.reg < first || at >= 16 || !argument)
+            continue;
+        if (entry.kind == 1 && argument->kind == 1) {
+            const std::lock_guard lock(shadow_mutex);
+            if (const auto *const in = shadow_heap(argument->value); in && in->shader_visible) {
+                heaps[at] = *in;
+                tables[at] = argument->value;
+                user[at] = static_cast<std::uint32_t>((argument->value - in->base) / in->stride);
+            }
+        } else if (entry.kind == 5 && argument->kind == 5) {
+            for (UINT n = 0; n < entry.count && at + n < 16; ++n)
+                if (n < argument->words.size())
+                    user[at + n] = argument->words[n];
+        } else if (entry.kind == 2 && argument->kind == 3) {
+            view(2, root_address(argument->value));
+        } else if (entry.kind == 2 && argument->kind == 2) {
+            view(3, root_constants(argument->value));
+        } else if (entry.kind == 2 && argument->kind == 4) {
+            view(4, root_uav_address(argument->value));
+        }
+    }
+    for (const auto &use : stage.uses)
+        if (const auto at = use.reg - first; use.reg >= first && at < 16 && tables[at]) {
+            const auto where = tables[at] + std::uintptr_t{use.place} * heaps[at].stride;
+            if (where + heaps[at].stride > heaps[at].end)
+                continue;
+            // a view of the title's memory is of that memory as it is now
+            std::uint64_t words[2];
+            std::memcpy(words, reinterpret_cast<const void *>(where), sizeof words);
+            if (words[0] == host_mark)
+                refresh_memory_view(words[1]);
+            decode_as(heaps[at], where, use.type);
+            if (use.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && use.stride > 4)
+                structured_view(heaps[at].device, host_slot(heaps[at], where).ptr, use.stride);
+        }
+    if (!stage.samplers.empty()) {
+        ShadowHeap samplers{};
+        {
+            const std::lock_guard lock(shadow_mutex);
+            for (const auto &[base, heap] : shadow_heaps)
+                if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.shader_visible)
+                    samplers = heap;
+        }
+        for (const auto in : stage.samplers)
+            if (const auto at = in - first; in >= first && at < 16 && samplers.base) {
+                const auto where = samplers.base + std::uintptr_t{user[at]} * samplers.stride;
+                if (where + samplers.stride <= samplers.end)
+                    decode_as(samplers, where, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
+            }
+    }
+}
+// Before a dispatch, as prepare_draw before a draw: a compute pipeline that reads the heaps
+// itself gets heap_signature and its user registers (from s0) in the first root constants;
+// any other gets the title's signature and arguments back if ours was on.
+void prepare_dispatch(ListProxy *list) {
+    const bool ours = list->heap_uses && list->heap_uses->compute;
+    if (!ours) {
+        if (!list->compute_ours_bound)
+            return;
+        list->compute_ours_bound = false;
+        list->host->SetComputeRootSignature(const_cast<ID3D12RootSignature *>(
+            static_cast<const ID3D12RootSignature *>(list->compute_root)));
+        const auto arguments = list->compute_arguments;
+        for (UINT parameter = 0; parameter < arguments.size(); ++parameter) {
+            const auto &argument = arguments[parameter];
+            if (argument.kind == 1)
+                set_compute_root_table(list, parameter, {argument.value});
+            else if (argument.kind == 2)
+                set_compute_root_cbv(list, parameter, argument.value);
+            else if (argument.kind == 3)
+                set_compute_root_srv(list, parameter, argument.value);
+            else if (argument.kind == 4)
+                set_compute_root_uav(list, parameter, argument.value);
+            else if (argument.kind == 5 && !argument.words.empty())
+                list->host->SetComputeRoot32BitConstants(
+                    parameter, static_cast<UINT>(argument.words.size()), argument.words.data(), 0);
+        }
+        return;
+    }
+    auto *const signature = heap_signature(d3d12_device.load());
+    if (!signature)
+        return;
+    if (!list->compute_ours_bound) {
+        list->host->SetComputeRootSignature(signature);
+        list->compute_ours_bound = true;
+    }
+    std::uint32_t user[16];
+    fill_user(list->heap_uses->stages[0], list->compute_arguments, 0, user,
+              [&](UINT parameter, std::uint64_t address) {
+                  if (parameter == 2)
+                      list->host->SetComputeRootShaderResourceView(parameter, address);
+                  else if (parameter == 3)
+                      list->host->SetComputeRootConstantBufferView(parameter, address);
+                  else
+                      list->host->SetComputeRootUnorderedAccessView(parameter, address);
+              });
+    list->host->SetComputeRoot32BitConstants(0, 16, user, 0);
+}
 // Before a draw: the host's list gets the root signature the pipeline is under. One of the
 // title's cache that reads the heap is told where the table the title draws with starts
 // (its first root parameter, as the programs have it in s8), and what the shaders read
 // there is made the host's; any other pipeline gets the title's signature and arguments
 // back if ours was on.
 void prepare_draw(ListProxy *list) {
-    if (!list->heap_uses) {
+    if (!list->heap_uses || list->heap_uses->compute) {
         if (!list->ours_bound)
             return;
         list->ours_bound = false;
@@ -4957,69 +5172,17 @@ void prepare_draw(ListProxy *list) {
     }
     // the user registers from s8 on: a table's first descriptor, constants as they are
     std::uint32_t user[16]{};
-    std::uintptr_t tables[16]{};
-    ShadowHeap heaps[16]{};
     const auto &arguments = list->graphics_arguments;
     for (UINT index = 0; index < 2; ++index) {
-        const auto &stage = list->heap_uses->stages[index];
-        std::memset(user, 0, sizeof user);
-        std::memset(tables, 0, sizeof tables);
-        for (const auto &entry : stage.entries) {
-            const auto at = entry.reg - 8;
-            const auto *const argument =
-                entry.slot < arguments.size() ? &arguments[entry.slot] : nullptr;
-            if (at >= 16 || !argument)
-                continue;
-            if (entry.kind == 1 && argument->kind == 1) {
-                const std::lock_guard lock(shadow_mutex);
-                if (const auto *const in = shadow_heap(argument->value); in && in->shader_visible) {
-                    heaps[at] = *in;
-                    tables[at] = argument->value;
-                    user[at] =
-                        static_cast<std::uint32_t>((argument->value - in->base) / in->stride);
-                }
-            } else if (entry.kind == 5 && argument->kind == 5) {
-                for (UINT n = 0; n < entry.count && at + n < 16; ++n)
-                    if (n < argument->words.size())
-                        user[at + n] = argument->words[n];
-            } else if (entry.kind == 2 && argument->kind == 3) {
-                list->host->SetGraphicsRootShaderResourceView(2, root_address(argument->value));
-            } else if (entry.kind == 2 && argument->kind == 2) {
-                list->host->SetGraphicsRootConstantBufferView(3, root_constants(argument->value));
-            } else if (entry.kind == 2 && argument->kind == 4) {
-                list->host->SetGraphicsRootUnorderedAccessView(4,
-                                                               root_uav_address(argument->value));
-            }
-        }
-        for (const auto &use : stage.uses)
-            if (const auto at = use.reg - 8; at < 16 && tables[at]) {
-                const auto where = tables[at] + std::uintptr_t{use.place} * heaps[at].stride;
-                if (where + heaps[at].stride > heaps[at].end)
-                    continue;
-                // a view of the title's memory is of that memory as it is now
-                std::uint64_t words[2];
-                std::memcpy(words, reinterpret_cast<const void *>(where), sizeof words);
-                if (words[0] == host_mark)
-                    refresh_memory_view(words[1]);
-                decode_as(heaps[at], where, use.type);
-                if (use.type == D3D12_DESCRIPTOR_RANGE_TYPE_SRV && use.stride > 4)
-                    structured_view(heaps[at].device, host_slot(heaps[at], where).ptr, use.stride);
-            }
-        if (!stage.samplers.empty()) {
-            ShadowHeap samplers{};
-            {
-                const std::lock_guard lock(shadow_mutex);
-                for (const auto &[base, heap] : shadow_heaps)
-                    if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.shader_visible)
-                        samplers = heap;
-            }
-            for (const auto in : stage.samplers)
-                if (const auto at = in - 8; at < 16 && samplers.base) {
-                    const auto where = samplers.base + std::uintptr_t{user[at]} * samplers.stride;
-                    if (where + samplers.stride <= samplers.end)
-                        decode_as(samplers, where, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER);
-                }
-        }
+        fill_user(list->heap_uses->stages[index], arguments, 8, user,
+                  [&](UINT parameter, std::uint64_t address) {
+                      if (parameter == 2)
+                          list->host->SetGraphicsRootShaderResourceView(parameter, address);
+                      else if (parameter == 3)
+                          list->host->SetGraphicsRootConstantBufferView(parameter, address);
+                      else
+                          list->host->SetGraphicsRootUnorderedAccessView(parameter, address);
+                  });
         list->host->SetGraphicsRoot32BitConstants(index, 16, user, 0);
     }
     // XV_D3D_LOST: what the first of these draws are given
@@ -5574,10 +5737,16 @@ void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64
     host_of(self)->SetGraphicsRootConstantBufferView(index, host);
 }
 void STDMETHODCALLTYPE set_compute_root_cbv(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootConstantBufferView(index, root_constants(address));
+    auto *const list = static_cast<ListProxy *>(self);
+    list->argument(index, true) = {2, address, {}};
+    if (!list->compute_ours_bound)
+        host_of(self)->SetComputeRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_srv(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootShaderResourceView(index, root_address(address));
+    auto *const list = static_cast<ListProxy *>(self);
+    list->argument(index, true) = {3, address, {}};
+    if (!list->compute_ours_bound)
+        host_of(self)->SetComputeRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64_t address) {
     static_cast<ListProxy *>(self)->argument(index) = {3, address, {}};
@@ -5599,7 +5768,14 @@ void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64
     host_of(self)->SetGraphicsRootShaderResourceView(index, host);
 }
 void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_t address) {
-    host_of(self)->SetComputeRootUnorderedAccessView(index, root_uav_address(address));
+    auto *const list = static_cast<ListProxy *>(self);
+    list->argument(index, true) = {4, address, {}};
+    if (!list->compute_ours_bound)
+        host_of(self)->SetComputeRootUnorderedAccessView(index, root_uav_address(address));
+}
+void STDMETHODCALLTYPE dispatch(void *self, UINT x, UINT y, UINT z) {
+    prepare_dispatch(static_cast<ListProxy *>(self));
+    host_of(self)->Dispatch(x, y, z);
 }
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address) {
     static_cast<ListProxy *>(self)->argument(index) = {4, address, {}};
@@ -5781,8 +5957,11 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[34] = reinterpret_cast<Slot>(&set_graphics_root_signature);
     vtable[35] = reinterpret_cast<Slot>(&set_compute_root_table);
     vtable[36] = reinterpret_cast<Slot>(&set_graphics_root_table);
+    vtable[37] = reinterpret_cast<Slot>(&set_compute_root_constant);
     vtable[38] = reinterpret_cast<Slot>(&set_graphics_root_constant);
+    vtable[39] = reinterpret_cast<Slot>(&set_compute_root_constants);
     vtable[40] = reinterpret_cast<Slot>(&set_graphics_root_constants);
+    vtable[14] = reinterpret_cast<Slot>(&dispatch);
     vtable[41] = reinterpret_cast<Slot>(&set_compute_root_cbv);
     vtable[42] = reinterpret_cast<Slot>(&set_graphics_root_cbv);
     vtable[43] = reinterpret_cast<Slot>(&set_compute_root_srv);
@@ -7438,6 +7617,7 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                                                 REFIID iid, void **state) {
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_PIPELINE_STATE_STREAM_DESC *,
                                                 REFIID, void **);
+    const auto *const title_desc = desc;
     // The stream is subobjects one after another, each a type and its description, aligned
     // to 8 bytes. The Series kit numbers the amplification and mesh shaders 23 and 24, where
     // the desktop has them at 24 and 25, and has subobjects of its own from 25 on.
@@ -7457,6 +7637,7 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
     std::size_t signature_at = 0; // where in the stream the root signature's pointer is
     ID3D12RootSignature *from_shader = nullptr;
     std::shared_ptr<const HeapUses> uses;
+    bool tried_heaps = false;
     std::string types = "stream of"; // XV_D3D_LOST: the subobjects, as the title numbers them
     std::string notes;               // and how its shaders were made for the host
     if (desc && desc->pPipelineStateSubobjectStream && console == Target::scarlett) {
@@ -7550,6 +7731,7 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                            pixel.pShaderBytecode &&
                            modules::console_only_shader(shader_bytes(vertex)) &&
                            modules::console_only_shader(shader_bytes(pixel));
+        tried_heaps = heaps;
         modules::use_heap_shaders(heaps);
         made = host_graphics_pair(self, vertex, pixel, simple_graphics && !compute.pShaderBytecode,
                                   {}, signature);
@@ -7570,8 +7752,25 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             std::memcpy(stream.data() + signature_at, &ours, sizeof ours);
             signature = ours;
         }
-        made |= host_bytecode(modules::ShaderStage::compute, compute, modules::HostShaderModel::sm5,
-                              {}, signature);
+        const bool compute_heaps = heap_compute_shader(self, compute);
+        tried_heaps |= compute_heaps;
+        modules::use_heap_shaders(compute_heaps);
+        const bool computes = host_bytecode(modules::ShaderStage::compute, compute,
+                                            modules::HostShaderModel::sm5, {}, signature);
+        modules::use_heap_shaders(false);
+        if (computes && compute_heaps) {
+            uses = compute_heap_uses(shaders[2]);
+            auto *const ours = heap_signature(self);
+            if (!signature_at) {
+                stream.resize(stream.size() + 16);
+                const UINT type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+                std::memcpy(stream.data() + stream.size() - 16, &type, 4);
+                signature_at = stream.size() - 8;
+            }
+            std::memcpy(stream.data() + signature_at, &ours, sizeof ours);
+            signature = ours;
+        }
+        made |= computes;
         if (made && std::getenv("XV_D3D_LOST")) {
             notes = ":";
             for (int index = 0; index < 3; ++index)
@@ -7645,6 +7844,14 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
         at += size;
     }
     const auto result = original<Create>(self, 47)(self, desc, iid, state);
+    if (retry_without_heaps(result, tried_heaps)) {
+        if (from_shader)
+            from_shader->Release();
+        heap_shaders_refused = true;
+        const auto again = create_pipeline_state(self, title_desc, iid, state);
+        heap_shaders_refused = false;
+        return again;
+    }
     if (SUCCEEDED(result) && state && *state && uses) {
         const std::lock_guard lock(kept_mutex);
         heap_pipelines[*state] = uses;

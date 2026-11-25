@@ -430,7 +430,7 @@ std::optional<std::string> translated_source(ShaderStage stage, Bytes container,
     shader.inputs = signature(container, "ISG1");
     shader.outputs = signature(container, "OSG1");
     shader.signed_inputs = signed_inputs;
-    shader.heaps = heap_shaders && stage != ShaderStage::compute;
+    shader.heaps = heap_shaders;
     auto source = rdna::translate(stage, shader, why, at, needs_sm6);
     // such a pipeline's shaders are all of the model that has the heaps
     if (shader.heaps && needs_sm6)
@@ -610,9 +610,13 @@ std::vector<std::uint8_t> compile_sm6(ShaderStage stage, const std::string &sour
     if (FAILED(host_dxc_create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
         return {};
     const bool heaps = source.find("DescriptorHeap[") != std::string::npos;
-    const wchar_t *const profile =
-        stage == ShaderStage::vertex ? (heaps ? L"vs_6_6" : L"vs_6_0") : L"ps_6_6";
-    const wchar_t *args[] = {L"-E", L"main", L"-T", profile};
+    const wchar_t *const profile = stage == ShaderStage::vertex    ? (heaps ? L"vs_6_6" : L"vs_6_0")
+                                   : stage == ShaderStage::compute ? (heaps ? L"cs_6_6" : L"cs_6_0")
+                                   : stage == ShaderStage::pixel   ? L"ps_6_6"
+                                                                   : L"gs_6_6";
+    // as compile_newer: the largest are not optimized, which takes several times as long
+    const wchar_t *args[] = {L"-E",  L"main", L"-T", profile, L"-HV", L"2018",
+                             source.size() > 100'000 ? L"-Od" : L"-O3"};
     const DxcBuffer input{source.data(), source.size(), DXC_CP_UTF8};
     ComPtr<IDxcResult> result;
     if (FAILED(compiler->Compile(&input, args, static_cast<UINT32>(std::size(args)), nullptr,

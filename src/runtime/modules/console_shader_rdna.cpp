@@ -374,6 +374,9 @@ class Translator {
     }
 
   private:
+    // the first user register of a shader that reads the heaps itself, which is xv_ud0: a
+    // compute shader's start at s0, the other stages' after the eight the hardware sets
+    std::uint32_t user_first() const { return stage_ == Stage::compute ? 0u : 8u; }
     // An Xbox One shader: its size, 5 at 0x18, where its code is at 0x28; the program starts
     // 0x28 into the code and is as long as 0x1dc says.
     bool read_older_file() {
@@ -484,7 +487,8 @@ class Translator {
                 const std::uint32_t reg = file[entry + 16], slot = file[entry + 17];
                 if (type == 4)
                     continue;
-                if (reg < 8 || reg + (type == 0 ? count : type == 1 ? 2 : 1) > 24)
+                if (reg < user_first() ||
+                    reg + (type == 0 ? count : type == 1 ? 2 : 1) > user_first() + 16)
                     give_up("user registers the host's shader is not given");
                 if (type == 1) {
                     // A root view: the host's signature has one of each kind in space 201,
@@ -517,8 +521,8 @@ class Translator {
                     for (std::uint32_t k = 0; k < count; ++k) {
                         used_s_.insert(reg + k);
                         uses_heap_ = true;
-                        prologue_ +=
-                            "    " + s(reg + k) + " = xv_ud" + std::to_string(reg + k - 8) + ";\n";
+                        prologue_ += "    " + s(reg + k) + " = xv_ud" +
+                                     std::to_string(reg + k - user_first()) + ";\n";
                     }
                 } else if (type == 5 || type == 6) {
                     const auto whole = static_cast<std::uint32_t>(parameters_.size());
@@ -2132,10 +2136,14 @@ class Translator {
             resource.dynamic = known.dynamic;
             if (const auto whole = heap_parameter_.find(known.value);
                 whole != heap_parameter_.end()) {
-                // one of a heap itself, by its byte offset there
-                if (known.dynamic < 0)
-                    give_up("a descriptor of a heap at a place that is fixed");
-                resource.type = whole->second == 2 ? 3 : 0;
+                // one of a heap itself, by its byte offset there, which may be known now
+                resource.type = whole->second == 2 ? 3u
+                                : facts_.written.count(known.origin) ? 1u
+                                                                     : 0u;
+                if (known.dynamic < 0) {
+                    resource.reg = known.offset / (whole->second == 2 ? 16 : 32);
+                    resource.loaded = true;
+                }
                 return resource;
             }
             if (known.dynamic >= 0)
@@ -2207,6 +2215,10 @@ class Translator {
     void written(const Resource &resource) {
         if (resource.type == 1)
             return;
+        // one of the heap itself is whatever the shader does with it
+        if (resource.heap && (resource.dynamic >= 0 || heap_parameter_.count(resource.parameter)) &&
+            resource.type == 0 && facts_.written.insert(resource.origin).second)
+            throw Retry{};
         if (resource.dynamic >= 0 && !facts_.written.count(resource.origin)) {
             for (const auto &range : parameters_[resource.parameter].ranges)
                 if (range.type == 1) {
@@ -2214,7 +2226,13 @@ class Translator {
                     throw Retry{};
                 }
         }
-        give_up("a store to something that is not an unordered access view");
+        give_up(std::string("a store to something that is not an unordered access view (") +
+                (resource.root    ? "a root view"
+                 : resource.heap  ? (heap_parameter_.count(resource.parameter) ? "of the heap"
+                                                                                : "of a table")
+                 : resource.loaded ? "of a table's ranges"
+                                   : "bound") +
+                ", type " + std::to_string(resource.type) + ")");
     }
     // The name of a resource as the host's shader has it, declared the first time as `type`.
     // One picked at run time is an element of an array over a range of its table: each type
@@ -2236,8 +2254,24 @@ class Translator {
                  std::to_string(resource.dynamic) + (resource.type == 3 ? " >> 4];" : " >> 5];"));
             return name;
         }
+        if (resource.heap && heap_parameter_.count(resource.parameter)) {
+            // a descriptor of a heap itself at a place known now
+            const auto name = std::string("hh") + letter + std::to_string(resource.reg);
+            const auto found = declared_.find(name);
+            if (found != declared_.end()) {
+                if (found->second != type)
+                    throw Unsupported{name + " as " + found->second + " and as " + type, ~0u, true};
+                return name;
+            }
+            declared_[name] = type;
+            uses_heap_ = needs_sm6_ = true;
+            prologue_ += "    " + type + " " + name + " = " +
+                         (resource.type == 3 ? "SamplerDescriptorHeap[" : "ResourceDescriptorHeap[") +
+                         std::to_string(resource.reg) + "u];\n";
+            return name;
+        }
         if (resource.heap) {
-            const auto slot = table_register_[resource.parameter] - 8;
+            const auto slot = table_register_[resource.parameter] - user_first();
             const auto name = std::string("h") + letter + std::to_string(slot) + "_" +
                               std::to_string(resource.reg);
             const auto found = declared_.find(name);
@@ -2253,8 +2287,13 @@ class Translator {
             return name;
         }
         if (resource.dynamic < 0) {
-            const auto name = std::string(1, letter) + std::to_string(resource.reg) + "_" +
-                              std::to_string(resource.space);
+            // the sampler a shader makes of words in its code: the host signature's one
+            // that compares where the shader compares with it
+            auto reg = resource.reg;
+            if (resource.type == 3 && resource.space == 200 && type == "SamplerComparisonState")
+                reg = 1;
+            const auto name =
+                std::string(1, letter) + std::to_string(reg) + "_" + std::to_string(resource.space);
             const auto found = declared_.find(name);
             if (found != declared_.end()) {
                 if (found->second != type)
@@ -2262,9 +2301,8 @@ class Translator {
                 return name;
             }
             declared_[name] = type;
-            declarations_ += type + " " + name + " : register(" + letter +
-                             std::to_string(resource.reg) + ", space" +
-                             std::to_string(resource.space) + ");\n";
+            declarations_ += type + " " + name + " : register(" + letter + std::to_string(reg) +
+                             ", space" + std::to_string(resource.space) + ");\n";
             return name;
         }
         const auto &ranges = parameters_[resource.parameter].ranges;
@@ -2352,8 +2390,14 @@ class Translator {
             }
             if (from.kind == Known::streams)
                 return; // a vertex stream's descriptor, which stands for the stream
-            if (from.kind != Known::table)
-                give_up("a load from memory that is not a descriptor of a table");
+            if (from.kind != Known::table) {
+                static constexpr const char *kinds[] = {
+                    "nothing known", "a constant",     "a table",   "a descriptor",
+                    "a root view",   "its own code",   "conflicts", "lanes",
+                    "root memory",   "vertex streams", "a stream"};
+                give_up(std::string("a load from memory that is not a descriptor of a table (from ") +
+                        kinds[from.kind] + (from.maybe ? ", on some ways" : "") + ")");
+            }
             // where in the table is only known when the shader runs
             if (indexed)
                 line("d" + std::to_string(dynamic_of(ins)) + " = " + where + ";");
@@ -3559,8 +3603,14 @@ class Translator {
                 continue;
             }
             x[n] = operand(ins, codes[n]);
-            if ((absolute >> n & 1) || (negate >> n & 1)) {
-                if ((!is_float && name != "v_cndmask_b32") || is_half)
+            if (((absolute >> n & 1) || (negate >> n & 1)) && is_half) {
+                // a half's sign is bit 15 of the low half the instruction reads
+                if (absolute >> n & 1)
+                    x[n] = "(" + x[n] + " & 0xffff7fffu)";
+                if (negate >> n & 1)
+                    x[n] = "(" + x[n] + " ^ 0x8000u)";
+            } else if ((absolute >> n & 1) || (negate >> n & 1)) {
+                if (!is_float && name != "v_cndmask_b32")
                     give_up(std::string(name) + " with a modifier");
                 auto value = f(x[n]);
                 if (absolute >> n & 1)
@@ -3636,6 +3686,10 @@ class Translator {
                     x[2] + " & 31u) - (" + x[1] + " & 31u)))) >> (32u - (" + x[2] + " & 31u))))";
         else if (name == "v_bfi_b32")
             value = "((" + x[0] + " & " + x[1] + ") | (~" + x[0] + " & " + x[2] + "))";
+        else if (name == "v_cvt_pk_u8_f32")
+            // the float as a byte, into the byte of the third source the second names
+            value = "((" + x[2] + " & ~(0xffu << ((" + x[1] + " & 3u) * 8u))) | ((uint)round(clamp(" +
+                    fx(0) + ", 0.0, 255.0)) << ((" + x[1] + " & 3u) * 8u)))";
         else if (name == "v_mad_i32_i24")
             value = "(uint)((((int)(" + x[0] + " << 8)) >> 8) * (((int)(" + x[1] +
                     " << 8)) >> 8)) + " + x[2];
@@ -4170,6 +4224,131 @@ class Translator {
         return "{ uint X; do { X = " + target + "; InterlockedCompareExchange(" + target + ", X, " +
                next + ", " + before + "); } while (" + before + " != X); }";
     }
+    // The components of a typed buffer access's format, as the Series GPU numbers its buffer
+    // formats (the number in an MTBUF instruction, which buffer_formats makes the older
+    // ones into): bits of each from the lowest, and how they are read - u unorm, s snorm,
+    // U uscaled, S sscaled, i uint, I sint, f float. Nothing for 0 and the packed floats.
+    struct TypedFormat {
+        std::uint32_t bits[4] = {};
+        std::uint32_t count = 0;
+        char kind = 0;
+    };
+    static std::optional<TypedFormat> typed_format(std::uint32_t format) {
+        struct Group {
+            std::uint32_t first, last;
+            std::uint32_t bits[4], count;
+            const char *kinds;
+        };
+        static constexpr Group groups[] = {
+            {1, 6, {8}, 1, "usUSiI"},
+            {7, 13, {16}, 1, "usUSiIf"},
+            {14, 19, {8, 8}, 2, "usUSiI"},
+            {20, 22, {32}, 1, "iIf"},
+            {23, 29, {16, 16}, 2, "usUSiIf"},
+            {30, 35, {11, 11, 10}, 3, "usUSiI"},
+            {37, 42, {10, 11, 11}, 3, "usUSiI"},
+            {44, 49, {2, 10, 10, 10}, 4, "usUSiI"},
+            {50, 55, {10, 10, 10, 2}, 4, "usUSiI"},
+            {56, 61, {8, 8, 8, 8}, 4, "usUSiI"},
+            {62, 64, {32, 32}, 2, "iIf"},
+            {65, 71, {16, 16, 16, 16}, 4, "usUSiIf"},
+            {72, 74, {32, 32, 32}, 3, "iIf"},
+            {75, 77, {32, 32, 32, 32}, 4, "iIf"},
+        };
+        for (const auto &group : groups)
+            if (format >= group.first && format <= group.last) {
+                TypedFormat typed;
+                std::copy(std::begin(group.bits), std::end(group.bits), typed.bits);
+                typed.count = group.count;
+                typed.kind = group.kinds[format - group.first];
+                return typed;
+            }
+        return std::nullopt;
+    }
+    // tbuffer_load_format_* and tbuffer_store_format_*: element `index` of a buffer, read and
+    // converted by the format the instruction names, whatever the descriptor's says
+    void emit_typed_buffer(const Ins &ins, const Resource &resource, const std::string &index,
+                           const std::string &extra, std::uint32_t fixed, std::uint32_t data) {
+        const auto name = ins.name;
+        const bool store = starts(name, "tbuffer_store_format_");
+        if ((!store && !starts(name, "tbuffer_load_format_")) || name.find("d16") != name.npos)
+            give_up(std::string(name));
+        const auto components =
+            static_cast<std::uint32_t>(name.size() - (store ? 21 : 20));
+        const auto typed = typed_format((ins.w0 >> 19) & 0x7f);
+        if (!typed || components < 1 || components > 4)
+            give_up(std::string(name) + " of buffer format " +
+                    std::to_string((ins.w0 >> 19) & 0x7f));
+        std::uint32_t total = 0;
+        for (std::uint32_t c = 0; c < typed->count; ++c)
+            total += typed->bits[c];
+        const bool whole = typed->kind == 'i' || typed->kind == 'I' || typed->kind == 'f';
+        if (store) {
+            // only formats of whole words, which are written as they are
+            if (!whole || typed->bits[0] != 32)
+                give_up(std::string(name) + " of a format of parts of words");
+            for (std::uint32_t c = 0; c < std::min(components, typed->count); ++c)
+                write_word(resource, index, extra, fixed, 4 * c, v(data + c));
+            return;
+        }
+        // the words the element is in; one smaller than a word is where in it the offset
+        // says
+        std::vector<std::string> word;
+        if (total < 32) {
+            const auto id = "x" + std::to_string(temporaries_++);
+            line("uint " + id + " = " +
+                 read_word(resource, index, extra, fixed == ~0u ? fixed : fixed & ~3u, 0) +
+                 " >> ((" + extra + " & 3u) * 8u);");
+            word.push_back(id);
+        } else {
+            for (std::uint32_t n = 0; n < total / 32; ++n) {
+                const auto id = "x" + std::to_string(temporaries_++);
+                line("uint " + id + " = " + read_word(resource, index, extra, fixed, 4 * n) + ";");
+                word.push_back(id);
+            }
+        }
+        const bool integer = typed->kind == 'i' || typed->kind == 'I';
+        std::uint32_t at = 0;
+        for (std::uint32_t c = 0; c < components; ++c) {
+            if (c >= typed->count) {
+                set_v(data + c, c == 3 ? (integer ? "1u" : "0x3f800000u") : "0u");
+                continue;
+            }
+            const auto bits = typed->bits[c];
+            const auto source = word[at / 32];
+            const auto mask = bits == 32 ? std::string("0xffffffffu") : hex((1u << bits) - 1);
+            const auto raw = "((" + source + " >> " + std::to_string(at % 32) + "u) & " + mask + ")";
+            const auto extended = bits == 32 ? "(int)" + raw
+                                             : "((int)(" + raw + " << " + std::to_string(32 - bits) +
+                                                   "u) >> " + std::to_string(32 - bits) + ")";
+            const auto top = std::to_string((1u << (bits - 1)) - 1) + ".0";
+            std::string value;
+            switch (typed->kind) {
+            case 'u':
+                value = u("(float(" + raw + ") / " + std::to_string((1ull << bits) - 1) + ".0)");
+                break;
+            case 's':
+                value = u("max(float(" + extended + ") / " + top + ", -1.0)");
+                break;
+            case 'U':
+                value = u("float(" + raw + ")");
+                break;
+            case 'S':
+                value = u("float(" + extended + ")");
+                break;
+            case 'i':
+                value = raw;
+                break;
+            case 'I':
+                value = "(uint)" + extended;
+                break;
+            default:
+                value = bits == 16 ? u("f16tof32(" + raw + ")") : raw;
+            }
+            set_v(data + c, value);
+            at += bits;
+        }
+    }
     void emit_buffer(const Ins &ins) {
         const auto name = ins.name;
         if (name == "buffer_gl0_inv" || name == "buffer_gl1_inv")
@@ -4254,8 +4433,6 @@ class Translator {
             }
             give_up("a vertex stream read where the input layout has nothing");
         }
-        if (ins.format == F::mtbuf)
-            give_up(std::string(name));
         const std::string guard = exec_changes_ ? "if " + active() + " " : "";
         std::string index = "0u", extra = hex(offset);
         std::uint32_t fixed = offset;
@@ -4265,6 +4442,10 @@ class Translator {
             extra = "(" + v(address + (has_index ? 1 : 0)) + " + " + extra + ")", fixed = ~0u;
         if (scalar_offset != 0x80 && scalar_offset != 125)
             extra = "(" + operand(ins, scalar_offset) + " + " + extra + ")", fixed = ~0u;
+        if (ins.format == F::mtbuf) {
+            emit_typed_buffer(ins, resource, index, extra, fixed, data);
+            return;
+        }
         if (starts(name, "buffer_load_format_") || starts(name, "buffer_store_format_")) {
             // a buffer of elements with a format: element `index`
             const bool store = starts(name, "buffer_store");
@@ -4556,7 +4737,7 @@ class Translator {
         // the first descriptor of the table the title draws with, by the stage
         if (uses_heap_) {
             text += std::string("cbuffer xv_user : register(b") +
-                    (stage_ == Stage::vertex ? "0" : "1") + ", space200) {";
+                    (stage_ == Stage::pixel ? "1" : "0") + ", space200) {";
             for (int n = 0; n < 16; ++n)
                 text += " uint xv_ud" + std::to_string(n) + ";";
             text += " };\n";

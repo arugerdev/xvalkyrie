@@ -2133,6 +2133,15 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
                          words[14], words[15], 10);
             std::fflush(stderr);
         }
+        // Memory the title has reserved and not yet committed is in no buffer and cannot be
+        // copied: the view is of nothing for now, and made again when a draw reads it, by
+        // which time the title has the memory and what it put there.
+        if (console == Target::scarlett && given && host.BufferLocation == given && !copied &&
+            VirtualQuery(reinterpret_cast<void *>(given), &info, sizeof info) &&
+            info.State == MEM_RESERVE) {
+            host.BufferLocation = 0;
+            copied = true;
+        }
         // memory the host's GPU cannot see and has no copy of: a view of nothing, whose
         // reads give 0
         if (!host.BufferLocation)

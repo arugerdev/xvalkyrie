@@ -65,6 +65,19 @@ void protect(const Placement &placement, DWORD protection) {
     for (const auto &[start, end] : other_views(placement.start, placement.end))
         protect(start, end, protection);
 }
+// memory the host is writing for the title (see TitleWrite), at each address it is seen at:
+// its placements are guarded again when it is done
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> writing;
+bool being_written(const Placement &placement) {
+    const auto first = page_down(placement.start), last = page_up(placement.end);
+    return std::any_of(writing.begin(), writing.end(), [&](const auto &range) {
+        return range.first < last && range.second > first;
+    });
+}
+void guard(const Placement &placement) {
+    if (!being_written(placement))
+        protect(placement, PAGE_READONLY);
+}
 bool writable(std::uintptr_t address) {
     MEMORY_BASIC_INFORMATION info{};
     return VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) &&
@@ -341,7 +354,7 @@ void track_placement(ID3D11Resource *resource, const void *address, UINT tile_mo
         placements[start] = {resource, start, start + bytes, tile_mode > 1, tile_mode, pitch};
     if (placement.dirty)
         dirty.push_back(start);
-    protect(placement, PAGE_READONLY);
+    guard(placement);
 }
 
 bool placement_data(const D3D11_TEXTURE2D_DESC &desc, const void *address,
@@ -351,14 +364,17 @@ bool placement_data(const D3D11_TEXTURE2D_DESC &desc, const void *address,
            readable(start, texture_layout(desc, start, data, count));
 }
 
-void prepare_title_write(const void *address, std::size_t bytes) {
+namespace {
+// [address, address + bytes) and where else its physical pages are seen
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> seen_at(const void *address,
+                                                               std::size_t bytes) {
     const auto start = reinterpret_cast<std::uintptr_t>(address);
-    if (!address || !bytes)
-        return;
-    // the memory may hold a placement at another address of its physical pages too
     auto ranges = other_views(start, start + bytes);
     ranges.emplace_back(start, start + bytes);
-    const std::lock_guard lock(mutex);
+    return ranges;
+}
+// the placements in those ranges, dirty and unguarded
+void unguard(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>> &ranges) {
     for (const auto &[first, last] : ranges)
         for (auto at = placements.lower_bound(last); at != placements.begin();) {
             auto &placement = (--at)->second;
@@ -372,6 +388,34 @@ void prepare_title_write(const void *address, std::size_t bytes) {
             protect(placement, PAGE_READWRITE);
         }
 }
+} // namespace
+
+void prepare_title_write(const void *address, std::size_t bytes) {
+    if (!address || !bytes)
+        return;
+    const auto ranges = seen_at(address, bytes);
+    const std::lock_guard lock(mutex);
+    unguard(ranges);
+}
+TitleWrite::TitleWrite(const void *address, std::size_t bytes) {
+    if (!address || !bytes)
+        return;
+    ranges_ = seen_at(address, bytes);
+    const std::lock_guard lock(mutex);
+    writing.insert(writing.end(), ranges_.begin(), ranges_.end());
+    unguard(ranges_);
+}
+TitleWrite::~TitleWrite() {
+    if (ranges_.empty())
+        return;
+    const std::lock_guard lock(mutex);
+    for (const auto &range : ranges_)
+        if (const auto found = std::find(writing.begin(), writing.end(), range);
+            found != writing.end())
+            writing.erase(found);
+    // uploaded from what was written, all of it
+    unguard(ranges_);
+}
 
 bool readable_memory(std::uint64_t address, std::size_t bytes) {
     return readable(static_cast<std::uintptr_t>(address), bytes);
@@ -384,11 +428,12 @@ void upload_placements(ID3D11DeviceContext *context) {
         const auto found = placements.find(start);
         if (found == placements.end() || !found->second.dirty)
             continue;
-        // memory the title has let go of: what was in it is all the resource gets
-        if (found->second.d3d12) {
-            kept.push_back(start); // uploaded by whoever submits Direct3D 12 work
+        // uploaded by whoever submits Direct3D 12 work, or when the host is done writing it
+        if (found->second.d3d12 || being_written(found->second)) {
+            kept.push_back(start);
             continue;
         }
+        // memory the title has let go of: what was in it is all the resource gets
         if (!readable(found->second.start, found->second.end - found->second.start)) {
             release(found->second);
             placements.erase(found);
@@ -397,7 +442,7 @@ void upload_placements(ID3D11DeviceContext *context) {
         // watched again before it is read: a write while it is read is not missed, it makes
         // the placement dirty for the next upload
         found->second.dirty = false;
-        protect(found->second, PAGE_READONLY);
+        guard(found->second);
         upload(context, found->second);
     }
     dirty = std::move(kept);
@@ -623,7 +668,7 @@ void track_placement(ID3D12Resource *resource, const void *address,
         placement.series = true;
         placement.layout = *layout;
         dirty.push_back(start);
-        protect(placement, PAGE_READONLY);
+        guard(placement);
         return;
     }
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count > 1)
@@ -657,12 +702,51 @@ void track_placement(ID3D12Resource *resource, const void *address,
     placement.d3d12 = resource;
     placement.desc = desc;
     dirty.push_back(start);
-    protect(placement, PAGE_READONLY);
+    guard(placement);
 }
+
+namespace {
+// A Direct3D 12 placement whose resource nothing but this has a reference to, and whose memory
+// is gone or another placement's: the title has let go of it, and keeping it would keep the
+// host's memory for it for as long as the title runs. While its memory is there, a view the
+// title made of it may still be read, which on the console is of the memory.
+bool let_go_of(const Placement &placement, bool taken) {
+    if (!placement.d3d12)
+        return false;
+    placement.d3d12->AddRef();
+    return placement.d3d12->Release() == 1 &&
+           (taken || !readable(placement.start, placement.end - placement.start));
+}
+} // namespace
 
 std::vector<PlacementUpload> take_d3d12_uploads() {
     std::vector<PlacementUpload> uploads;
     const std::lock_guard lock(mutex);
+    // every so many submissions, the placements the title has let go of
+    if (static unsigned submissions = 0; ++submissions % 64 == 0) {
+        std::uintptr_t before = 0; // the end of those before
+        for (auto at = placements.begin(); at != placements.end();) {
+            const auto next = std::next(at);
+            const bool taken = before > at->second.start ||
+                               (next != placements.end() && next->first < at->second.end);
+            before = std::max(before, at->second.end);
+            if (!let_go_of(at->second, taken)) {
+                at = next;
+                continue;
+            }
+            // memory another placement has stays guarded for it
+            if (!taken)
+                protect(at->second, PAGE_READWRITE);
+            release(at->second);
+            at = placements.erase(at);
+        }
+        std::erase_if(pending, [](Placement &waiting) {
+            if (!let_go_of(waiting, false))
+                return false;
+            release(waiting);
+            return true;
+        });
+    }
     for (auto waiting = pending.begin(); waiting != pending.end();) {
         if (!readable(waiting->start, waiting->end - waiting->start)) {
             ++waiting;
@@ -686,7 +770,7 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
         if (found == placements.end() || !found->second.dirty)
             continue;
         auto &placement = found->second;
-        if (!placement.d3d12) {
+        if (!placement.d3d12 || being_written(placement)) {
             kept.push_back(start);
             continue;
         }
@@ -703,7 +787,7 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
         // watched again before it is read: a write while it is read is not missed, it makes
         // the placement dirty for the next upload
         placement.dirty = false;
-        protect(placement, PAGE_READONLY);
+        guard(placement);
         PlacementUpload upload{placement.d3d12, {}, {}, placement.desc.Format};
         if (linear_subresources(placement, upload)) {
             placement.d3d12->AddRef();

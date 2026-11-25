@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <utility>
 #include <vector>
 
 // Placement resources: the title owns their memory and writes it directly, as the console's
@@ -36,6 +37,19 @@ std::vector<PlacementUpload> take_d3d12_uploads();
 // before the host writes [address, address + bytes) (ReadFile into it): a write there from
 // the kernel fails instead of faulting, so the placements in it are let go and marked dirty
 void prepare_title_write(const void *address, std::size_t bytes);
+// The same for as long as it lives, for a write that takes a while (a file read): the memory
+// is not guarded again, nor uploaded from, until the write is done, as a guard put back
+// meanwhile would fail the rest of it.
+class TitleWrite {
+  public:
+    TitleWrite(const void *address, std::size_t bytes);
+    ~TitleWrite();
+    TitleWrite(const TitleWrite &) = delete;
+    TitleWrite &operator=(const TitleWrite &) = delete;
+
+  private:
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges_;
+};
 // every page of [address, address + bytes) is committed and readable
 bool readable_memory(std::uint64_t address, std::size_t bytes);
 } // namespace xv::runtime::modules

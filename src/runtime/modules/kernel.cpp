@@ -94,7 +94,7 @@ BOOL read_buffered(HANDLE file, void *buffer, DWORD bytes, DWORD *read, OVERLAPP
 }
 // reads into memory placement resources live in
 BOOL WINAPI read_file(HANDLE file, void *buffer, DWORD bytes, DWORD *read, OVERLAPPED *overlapped) {
-    prepare_title_write(buffer, bytes);
+    const TitleWrite writing(buffer, bytes);
     auto result = ReadFile(file, buffer, bytes, read, overlapped);
     if (!result && GetLastError() == ERROR_INVALID_PARAMETER) {
         if (static std::atomic<int> shown{0}; shown++ < 4) {

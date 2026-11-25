@@ -13,6 +13,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -3402,6 +3403,9 @@ ID3D12RootSignature *shader_root_signature(ID3D12Device *self, bool drawing,
 // The host's pipeline of a title's, made now if it was not yet (see DeferredPipeline); null
 // when the host turns it down
 ID3D12PipelineState *host_pipeline(ID3D12PipelineState *state);
+// the same for a list, which goes on without it while the host's driver is long making it
+// (null then, as for one the host turns down)
+ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state);
 HRESULT STDMETHODCALLTYPE deferred_graphics_pipeline(ID3D12Device *self,
                                                      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                                                      REFIID iid, void **state);
@@ -5319,7 +5323,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->heaps[0] = list->heaps[1] = nullptr;
     list->topology = 0;
     list->indices = {};
-    list->no_pipeline = state && !(state = host_pipeline(state));
+    list->no_pipeline = state && !(state = list_pipeline(state));
     list->pipeline = state;
     list->heap_uses = state ? heap_uses(state) : nullptr;
     list->graphics_arguments.clear();
@@ -5872,7 +5876,7 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 // geometry shader does (see rectangle_pipeline).
 void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *state) {
     auto *const list = static_cast<ListProxy *>(self);
-    list->no_pipeline = state && !(state = host_pipeline(state));
+    list->no_pipeline = state && !(state = list_pipeline(state));
     list->pipeline = state;
     list->heap_uses = state ? heap_uses(state) : nullptr;
     if (state)
@@ -6565,6 +6569,30 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
     host->DispatchMesh(groups, 1, 1);
     host->Release();
 }
+// DispatchMesh (127), the desktop's: what it draws with is made ready as for a draw
+void STDMETHODCALLTYPE dispatch_mesh(void *self, UINT x, UINT y, UINT z) {
+    if (static_cast<ListProxy *>(self)->no_pipeline)
+        return;
+    ID3D12GraphicsCommandList6 *host = nullptr;
+    if (FAILED(host_of(self)->QueryInterface(IID_PPV_ARGS(&host))))
+        return;
+    count_draw(self);
+    prepare_draw(static_cast<ListProxy *>(self));
+    host->DispatchMesh(x, y, z);
+    host->Release();
+}
+// The ray tracing methods (117 to 121): building acceleration structures, copying them and
+// tracing rays. What they are given is GPU addresses of the title's memory (geometry, the
+// structures and their scratch), which are none of the host's GPU: done as they come, the
+// host's GPU reads where nothing is and the host drops the device, or its driver faults.
+// Until those addresses are the host's, nothing is done, and nothing is traced.
+void STDMETHODCALLTYPE ray_tracing_method(void *) {
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
+        std::fprintf(stderr, "[Runtime] the title traces rays, which is not done here: its "
+                             "acceleration structures are not built\n");
+        std::fflush(stderr);
+    }
+}
 // The methods of a list that work on memory by its address (the console header's slots 60
 // to 63, 69, 70 and 88 to 90). On the console a GPU address is the title's own memory and
 // the GPU does the work when it gets there; titles time their frames with the values it
@@ -6686,6 +6714,40 @@ void STDMETHODCALLTYPE flush_pipeline_x(void *self, UINT, std::uint64_t, std::ui
     group.pGlobalBarriers = &all;
     enhanced_barriers(self, 1, &group);
 }
+// Barrier is at 144 in the lists of titles of some kits and at 146 in later ones (a title's
+// libraries may be of another kit than the title itself), with console methods of their own
+// at the other: the call tells them apart, a barrier being given groups of barriers.
+bool barrier_groups(std::uint64_t count, std::uint64_t address) {
+    if (!count || count > 256 || !address)
+        return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
+        info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) ||
+        address + count * sizeof(D3D12_BARRIER_GROUP) >
+            reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize)
+        return false;
+    const auto *const groups = reinterpret_cast<const D3D12_BARRIER_GROUP *>(address);
+    return std::all_of(groups, groups + count, [](const D3D12_BARRIER_GROUP &group) {
+        return group.Type <= D3D12_BARRIER_TYPE_BUFFER && group.NumBarriers <= 4096 &&
+               (!group.NumBarriers || group.pGlobalBarriers);
+    });
+}
+template <std::size_t Index>
+void STDMETHODCALLTYPE barrier_by_layout(void *self, std::uint64_t count, std::uint64_t groups) {
+    if (barrier_groups(count, groups)) {
+        enhanced_barriers(self, static_cast<UINT32>(count),
+                          reinterpret_cast<const D3D12_BARRIER_GROUP *>(groups));
+        return;
+    }
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
+        std::fprintf(
+            stderr,
+            "[Runtime] unimplemented Direct3D 12 call: command list slot %zu (%llx, %llx), "
+            "which is no barrier\n",
+            Index, static_cast<unsigned long long>(count), static_cast<unsigned long long>(groups));
+        std::fflush(stderr);
+    }
+}
 // Wait32BitValueX and Wait64BitValueX (address, value, ...): on the console the GPU waits until
 // the memory at the address compares as asked with the value, which work of another queue
 // writes. The host's GPU has no such wait: a submission with one waits instead for the work
@@ -6722,13 +6784,17 @@ void configure_lists() {
     if (std::getenv("XV_D3D_NO_QUERIES"))
         ignore({28, 29, 30});
     list_vtable[98] = reinterpret_cast<Slot>(&dispatch_mesh_x);
+    list_vtable[127] = reinterpret_cast<Slot>(&dispatch_mesh);
+    for (std::size_t slot = 117; slot <= 121; ++slot)
+        list_vtable[slot] = reinterpret_cast<Slot>(&ray_tracing_method);
     // DriverHintX, the counters, and the binning of primitive batches
     ignore({99, 100, 101, 102, 103, 104});
     list_vtable[113] = reinterpret_cast<Slot>(&begin_render_pass);
     // SetPredicationBufferX: nothing is drawn by a predicate here
     ignore({85});
     // ID3D12GraphicsCommandList7::Barrier, in the lists of a title built with a later kit
-    list_vtable[144] = reinterpret_cast<Slot>(&enhanced_barriers);
+    list_vtable[144] = reinterpret_cast<Slot>(&barrier_by_layout<144>);
+    list_vtable[146] = reinterpret_cast<Slot>(&barrier_by_layout<146>);
 }
 // XV_D3D_LOST: every method of a list looks whether the host still has the device
 template <std::size_t Index>
@@ -6993,7 +7059,7 @@ struct Uploader {
     ID3D12GraphicsCommandList *list = nullptr;
     ID3D12Fence *fence = nullptr;
     UINT64 value = 0;
-    std::vector<ID3D12Resource *> buffers; // until the GPU is past them
+    std::vector<ID3D12Resource *> buffers; // and the textures, until the GPU is past them
 };
 std::mutex uploader_mutex;
 void upload_placements_d3d12(ID3D12CommandQueue *queue) {
@@ -7137,10 +7203,13 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
             }
             std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
             uploader.list->ResourceBarrier(1, &barrier);
+            // the texture as well: the title may let go of it before the GPU copies into it
             uploader.buffers.push_back(buffer);
-        } else if (buffer) {
-            buffer->Release();
+            uploader.buffers.push_back(upload.resource);
+            continue;
         }
+        if (buffer)
+            buffer->Release();
         upload.resource->Release();
     }
     // a list the host turned down is not executed: the host drops the device for that
@@ -7358,8 +7427,14 @@ HANDLE fence_moved = nullptr;
 // the fence's completed value to its copy, and the event for the next one
 void copy_completed_value(ID3D12Fence *fence, FollowedFence &followed) {
     const auto completed = fence->GetCompletedValue();
+    // UINT64_MAX: the device was removed, and the value stays. A title that waits on the
+    // fence's memory sees it before it submits again, and may stop then: this tells of it
+    // before the title has the value.
+    if (static std::atomic<bool> told{false}; completed == UINT64_MAX && !told.exchange(true)) {
+        std::fprintf(stderr, "[Runtime] a fence the title watches reads as the device removed\n");
+        report_failure();
+    }
     followed.completed->value.store(completed, std::memory_order_release);
-    // UINT64_MAX: the device was removed, and the value stays
     if (fence_moved && completed != UINT64_MAX && followed.armed != completed + 1 &&
         SUCCEEDED(fence->SetEventOnCompletion(completed + 1, fence_moved)))
         followed.armed = completed + 1;
@@ -8492,6 +8567,8 @@ struct DeferredPipeline {
     std::wstring name;
     std::once_flag once;
     ID3D12PipelineState *host = nullptr;
+    std::atomic<bool> ready{false};  // `host` is made, or turned down
+    std::atomic<bool> queued{false}; // given to the threads that make pipelines
 };
 // for a title that asks for an interface a pipeline of ours has
 bool deferrable(REFIID iid) {
@@ -8579,6 +8656,7 @@ ID3D12PipelineState *made_pipeline(DeferredPipeline &pipeline) {
         }
         let_go(pipeline);
     });
+    pipeline.ready.store(true, std::memory_order_release);
     return pipeline.host;
 }
 ID3D12PipelineState *host_pipeline(ID3D12PipelineState *state) {
@@ -8609,6 +8687,66 @@ ULONG STDMETHODCALLTYPE deferred_release(void *self) {
         delete pipeline;
     }
     return left;
+}
+// The pipelines lists are given before they are made are made on threads of ours. The host's
+// driver may take many seconds over one, and a title stops itself when its render thread has
+// been held that long: a list waits for its pipeline at most a second of each frame all
+// told, and what it would draw or compute with one that is not made by then is left out.
+std::mutex making_mutex;
+std::condition_variable to_make_added, pipeline_made;
+std::deque<DeferredPipeline *> to_make; // each with a reference of ours
+void make_pipelines() {
+    for (;;) {
+        DeferredPipeline *pipeline = nullptr;
+        {
+            std::unique_lock lock(making_mutex);
+            to_make_added.wait(lock, [] { return !to_make.empty(); });
+            pipeline = to_make.front();
+            to_make.pop_front();
+        }
+        made_pipeline(*pipeline);
+        // taken, so that a list that has just found it not made is waiting when told
+        { const std::lock_guard lock(making_mutex); }
+        pipeline_made.notify_all();
+        deferred_release(pipeline);
+    }
+}
+ID3D12PipelineState *list_pipeline(ID3D12PipelineState *state) {
+    auto *const deferred = deferred_of(state);
+    if (!deferred)
+        return state;
+    if (deferred->ready.load(std::memory_order_acquire))
+        return deferred->host;
+    static const bool started = [] {
+        for (auto threads = std::max(std::thread::hardware_concurrency() / 4, 2u); threads--;)
+            std::thread(make_pipelines).detach();
+        return true;
+    }();
+    static_cast<void>(started);
+    using Clock = std::chrono::steady_clock;
+    static std::uint64_t frame = ~0ull;
+    static Clock::duration left{};
+    std::unique_lock lock(making_mutex);
+    if (!deferred->queued.exchange(true)) {
+        deferred_add_ref(deferred);
+        to_make.push_back(deferred);
+        to_make_added.notify_one();
+    }
+    if (const auto now = frames_shown(); now != frame) {
+        frame = now;
+        left = std::chrono::seconds(1);
+    }
+    const auto waited_from = Clock::now();
+    pipeline_made.wait_for(lock, left, [&] { return deferred->ready.load(); });
+    left -= std::min(left, Clock::now() - waited_from);
+    if (deferred->ready.load(std::memory_order_acquire))
+        return deferred->host;
+    if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+        std::fprintf(stderr, "[Runtime] a pipeline the host's driver takes long to make is left "
+                             "out of the frame until it is made\n");
+        std::fflush(stderr);
+    }
+    return nullptr;
 }
 // private data: what the host's pipeline would keep, which nothing here reads back
 HRESULT STDMETHODCALLTYPE deferred_get_data(void *, REFGUID, UINT *size, void *) {

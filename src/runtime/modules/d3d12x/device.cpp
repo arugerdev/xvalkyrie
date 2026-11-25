@@ -7505,14 +7505,12 @@ HRESULT STDMETHODCALLTYPE signal_fence(ID3D12Fence *self, UINT64 value) {
 // Release (2) from the title: our reference goes with its last
 ULONG STDMETHODCALLTYPE release_fence(ID3D12Fence *self) {
     using Release = ULONG(STDMETHODCALLTYPE *)(void *);
+    // The follower counts the references under the same lock: in between the two releases it
+    // would see ours alone, let it go itself, and the title would be told 1 for its last.
+    const std::lock_guard lock(fence_mutex);
     const auto left = original<Release>(self, 2)(self);
-    if (left != 1)
+    if (left != 1 || !followed_fences.erase(self))
         return left;
-    {
-        const std::lock_guard lock(fence_mutex);
-        if (!followed_fences.erase(self))
-            return left;
-    }
     return original<Release>(self, 2)(self);
 }
 // CreateFence (36): the fence with the console's methods

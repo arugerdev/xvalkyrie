@@ -9,6 +9,7 @@
 #include <cstring>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <thread>
 
 // The host's command allocators and fences as a title holds them, with the console's methods
 // past the desktop's, on a WARP device. The calls come from code that calls the way a title's
@@ -321,5 +322,28 @@ TEST_CASE("a fence whose value a title reads goes when the title lets go of it, 
     completed_value(title, moving);
     CHECK(SUCCEEDED(moving->Signal(1)));
     CHECK(held_watch.gone());
+    CHECK(title.call<ULONG>(moving, 2) == 0);
+}
+
+TEST_CASE("the title's last Release of a fence whose value it reads gives 0 while fences move") {
+    const TitleCode title;
+    // another fence that moves all the time, so that its value is copied all the time
+    auto *const moving = title_fence(0);
+    completed_value(title, moving);
+    std::atomic<bool> done{false};
+    std::thread signals([&] {
+        for (UINT64 value = 1; !done; ++value)
+            moving->Signal(value);
+    });
+    int not_last = 0;
+    for (int i = 0; i < 2000; ++i) {
+        auto *const fence = title_fence(0);
+        completed_value(title, fence);
+        if (title.call<ULONG>(fence, 2) != 0)
+            ++not_last;
+    }
+    done = true;
+    signals.join();
+    CHECK(not_last == 0);
     CHECK(title.call<ULONG>(moving, 2) == 0);
 }

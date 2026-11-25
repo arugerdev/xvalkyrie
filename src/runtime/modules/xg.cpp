@@ -650,6 +650,21 @@ void *series_texture_computer(const void *description) {
     return texture.valid ? new SeriesComputer{series_computer_vtable, 1, d, std::move(texture)}
                          : nullptr;
 }
+bool series_allocation(const void *description, std::uint64_t &size, std::uint64_t &alignment) {
+    if (!description)
+        return false;
+    auto d = *static_cast<const ResourceDescription *>(description);
+    if (d.layout == 0)
+        d.layout = swizzled | suggested_mode(d);
+    else if (d.layout == row_major)
+        d.layout = swizzled | gfx10::sw_linear;
+    const auto texture = series_texture(d);
+    if (!texture.valid)
+        return false;
+    size = texture.size;
+    alignment = std::max<std::uint64_t>(texture.alignment, 1);
+    return true;
+}
 namespace {
 // There is one layout, so one tile mode: 0.
 std::uint32_t optimal_tile_mode(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,

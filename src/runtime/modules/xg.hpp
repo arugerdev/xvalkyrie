@@ -24,6 +24,10 @@ std::uint64_t texture_bytes(std::uint32_t width, std::uint32_t height, std::uint
 // D3D12_RESOURCE_DESC, whose layout names a swizzle mode: 0x100 | mode), with the console's own
 // layout of it; null where that layout is not known here. One reference, the caller's.
 void *series_texture_computer(const void *description);
+// The size and alignment of a texture of a Series title's description in the console's layout:
+// the swizzle mode it names, or the one xg_xs.dll picks where it names none (layout 0), or
+// rows (layout 1). False for a buffer, or where that layout is not known here.
+bool series_allocation(const void *description, std::uint64_t &size, std::uint64_t &alignment);
 // `module` is the name the console gives the DLL
 void install_xg(Registry &registry, std::string_view module);
 } // namespace modules

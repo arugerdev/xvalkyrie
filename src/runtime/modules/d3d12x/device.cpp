@@ -582,6 +582,27 @@ const D3D12_CLEAR_VALUE *host_clear_value(ID3D12Device *device, const D3D12_CLEA
 D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
 resource_allocation_info(D3D12_RESOURCE_ALLOCATION_INFO *info, ID3D12Device *self, UINT mask,
                          UINT count, const D3D12_RESOURCE_DESC *descs) {
+    // A Series title's texture that is only read takes at least what the console's layout of it
+    // does, in the swizzle mode it names or the one the console picks, which is how its
+    // archives store it: a title may read a streamed texture in pieces of this size, and the
+    // console's reader stops on a piece smaller than the archive's. The host's own size is kept
+    // where it is larger, for a texture placed in memory sized by it; what is drawn to the host
+    // lays out itself.
+    std::uint64_t laid_size = 0, laid_alignment = 1;
+    constexpr UINT drawn = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (console == Target::scarlett && descs && count == 1 && !(descs->Flags & drawn) &&
+        !series_allocation(descs, laid_size, laid_alignment))
+        laid_size = 0;
+    const struct Larger {
+        D3D12_RESOURCE_ALLOCATION_INFO *info;
+        std::uint64_t size;
+        ~Larger() {
+            if (size && info->SizeInBytes != UINT64_MAX)
+                info->SizeInBytes = std::max(info->SizeInBytes, size);
+        }
+    } larger{info, laid_size};
     std::vector<D3D12_RESOURCE_DESC> host(descs, descs + (descs ? count : 0));
     for (auto &desc : host) {
         desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc.Flags & 0xff);

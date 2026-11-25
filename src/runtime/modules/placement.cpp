@@ -725,6 +725,7 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
     // every so many submissions, the placements the title has let go of
     if (static unsigned submissions = 0; ++submissions % 64 == 0) {
         std::uintptr_t before = 0; // the end of those before
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> freed;
         for (auto at = placements.begin(); at != placements.end();) {
             const auto next = std::next(at);
             const bool taken = before > at->second.start ||
@@ -734,12 +735,21 @@ std::vector<PlacementUpload> take_d3d12_uploads() {
                 at = next;
                 continue;
             }
-            // memory another placement has stays guarded for it
-            if (!taken)
-                protect(at->second, PAGE_READWRITE);
+            protect(at->second, PAGE_READWRITE);
+            if (taken)
+                freed.emplace_back(at->second.start, at->second.end);
             release(at->second);
             at = placements.erase(at);
         }
+        // memory another placement has is guarded again for it, unless written since
+        for (const auto &[first, last] : freed)
+            for (auto at = placements.lower_bound(last); at != placements.begin();) {
+                auto &placement = (--at)->second;
+                if (placement.start + largest < first)
+                    break;
+                if (placement.end > first && !placement.dirty)
+                    guard(placement);
+            }
         std::erase_if(pending, [](Placement &waiting) {
             if (!let_go_of(waiting, false))
                 return false;

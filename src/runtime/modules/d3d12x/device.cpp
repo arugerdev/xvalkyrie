@@ -1805,6 +1805,17 @@ const D3D12_CLEAR_VALUE *host_clear(const D3D12_CLEAR_VALUE *clear, D3D12_CLEAR_
 std::uint64_t root_address(std::uint64_t address);
 std::uint64_t root_uav_address(std::uint64_t address);
 std::uint64_t root_constants(std::uint64_t address);
+void when_run(void *self, std::function<void()> work);
+// the title's list a method of this thread is recording into, whose copies of the title's
+// memory (ring_copy) are made again when a queue is given it
+thread_local void *copying_for = nullptr;
+struct CopyingFor {
+    void *before;
+    explicit CopyingFor(void *list) : before(copying_for) { copying_for = list; }
+    ~CopyingFor() { copying_for = before; }
+    CopyingFor(const CopyingFor &) = delete;
+    CopyingFor &operator=(const CopyingFor &) = delete;
+};
 std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
                         std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
                         std::uint64_t *offset = nullptr);
@@ -5091,6 +5102,7 @@ void fill_user(const HeapUses::Stage &stage,
 // itself gets heap_signature and its user registers (from s0) in the first root constants;
 // any other gets the title's signature and arguments back if ours was on.
 void prepare_dispatch(ListProxy *list) {
+    const CopyingFor copying(list);
     const bool ours = list->heap_uses && list->heap_uses->compute;
     if (!ours) {
         if (!list->compute_ours_bound)
@@ -5140,6 +5152,7 @@ void prepare_dispatch(ListProxy *list) {
 // there is made the host's; any other pipeline gets the title's signature and arguments
 // back if ours was on.
 void prepare_draw(ListProxy *list) {
+    const CopyingFor copying(list);
     if (!list->heap_uses || list->heap_uses->compute) {
         if (!list->ours_bound)
             return;
@@ -5565,6 +5578,7 @@ std::uint64_t geometry_address(const char *what, std::uint64_t address, std::uin
 }
 void STDMETHODCALLTYPE set_vertex_buffers(void *self, UINT start, UINT count,
                                           const D3D12_VERTEX_BUFFER_VIEW *views) {
+    const CopyingFor copying(self);
     if (views && count)
         trace_address("IASetVertexBuffers", views->BufferLocation);
     std::vector<D3D12_VERTEX_BUFFER_VIEW> host;
@@ -5583,6 +5597,7 @@ void STDMETHODCALLTYPE set_vertex_buffers(void *self, UINT start, UINT count,
     host_of(self)->IASetVertexBuffers(start, count, views ? host.data() : nullptr);
 }
 void STDMETHODCALLTYPE set_index_buffer(void *self, const D3D12_INDEX_BUFFER_VIEW *view) {
+    const CopyingFor copying(self);
     if (view)
         trace_address("IASetIndexBuffer", view->BufferLocation);
     auto host = view ? *view : D3D12_INDEX_BUFFER_VIEW{};
@@ -5638,6 +5653,21 @@ std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t m
         next = 0;
     const auto at = align ? (next + align - 1) / align * align : next;
     next = (at + bytes + 255) & ~255ull;
+    // A list's copy is made when a queue is given the list, each time it is, as the title
+    // has the memory then: titles record their lists first and fill what they draw with
+    // after. Memory the title has let go of by then is left as it was.
+    if (copying_for) {
+        const auto *const from = static_cast<const std::uint8_t *>(source);
+        auto *const to = memory + at;
+        when_run(copying_for, [from, to, bytes] {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(from, &info, sizeof info) && info.State == MEM_COMMIT &&
+                !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                from + bytes <= static_cast<const std::uint8_t *>(info.BaseAddress) +
+                                    info.RegionSize)
+                std::memcpy(to, from, bytes);
+        });
+    }
     std::memcpy(memory + at, source, bytes);
     if (buffer)
         *buffer = ring;
@@ -5721,6 +5751,7 @@ std::uint64_t root_constants(std::uint64_t address) {
     return copy ? copy : host;
 }
 void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64_t address) {
+    const CopyingFor copying(self);
     static_cast<ListProxy *>(self)->argument(index) = {2, address, {}};
     if (static_cast<ListProxy *>(self)->ours_bound)
         return;
@@ -5737,18 +5768,21 @@ void STDMETHODCALLTYPE set_graphics_root_cbv(void *self, UINT index, std::uint64
     host_of(self)->SetGraphicsRootConstantBufferView(index, host);
 }
 void STDMETHODCALLTYPE set_compute_root_cbv(void *self, UINT index, std::uint64_t address) {
+    const CopyingFor copying(self);
     auto *const list = static_cast<ListProxy *>(self);
     list->argument(index, true) = {2, address, {}};
     if (!list->compute_ours_bound)
         host_of(self)->SetComputeRootConstantBufferView(index, root_constants(address));
 }
 void STDMETHODCALLTYPE set_compute_root_srv(void *self, UINT index, std::uint64_t address) {
+    const CopyingFor copying(self);
     auto *const list = static_cast<ListProxy *>(self);
     list->argument(index, true) = {3, address, {}};
     if (!list->compute_ours_bound)
         host_of(self)->SetComputeRootShaderResourceView(index, root_address(address));
 }
 void STDMETHODCALLTYPE set_graphics_root_srv(void *self, UINT index, std::uint64_t address) {
+    const CopyingFor copying(self);
     static_cast<ListProxy *>(self)->argument(index) = {3, address, {}};
     if (static_cast<ListProxy *>(self)->ours_bound)
         return;

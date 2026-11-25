@@ -344,7 +344,7 @@ class Translator {
             fetch_inputs();
         // A Series vertex shader that takes nothing but the numbers of its vertex and its
         // instance calls no fetch shader either: it reads its vertices from buffers itself,
-        // by the vertex's number in v0 (7952987A's e5fcb71c: `v1 = s5 * v0`).
+        // by the vertex's number in v0 (`v1 = s5 * v0`).
         if (!older_ && stage_ == Stage::vertex &&
             std::none_of(code_list_.begin(), code_list_.end(),
                          [](const Ins &ins) { return ins.name == "s_swappc_b64"; }) &&

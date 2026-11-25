@@ -21,7 +21,7 @@ template <class Function> Function *xmem(const char *name) {
 } // namespace
 
 // A title keeps the numbers it is given without their low four bits and maps the pages by what
-// is left: 7952987A does (image+0xf2cbeb). Each page still has to be a page of its own.
+// is left. Each page still has to be a page of its own.
 TEST_CASE("a physical page's number is that of its first 4 KiB frame") {
     constexpr DWORD large_pages = 0x20000000;
     constexpr std::size_t page = 1 << 16, count = 20;

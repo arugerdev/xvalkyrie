@@ -62,8 +62,8 @@ HMODULE WINAPI load_library_ex_a(const char *name, HANDLE file, DWORD flags) {
 HMODULE WINAPI load_library_a(const char *name) { return load_library_ex_a(name, nullptr, 0); }
 // A file opened without buffering is read on the host only at offsets, sizes and buffers its
 // sectors align, and turned down otherwise (ERROR_INVALID_PARAMETER); the console reads it
-// anyway, and at its end gives what is left, even nothing (7952987A reads the rest of
-// appdata0.rpf's header from past its end). Such a read is made again through a handle of
+// anyway, and at its end gives what is left, even nothing (a title may read the rest
+// of a file's header from past its end). Such a read is made again through a handle of
 // the same file with buffering, and ends as the title's would have.
 BOOL read_buffered(HANDLE file, void *buffer, DWORD bytes, DWORD *read, OVERLAPPED *overlapped) {
     auto *const again =

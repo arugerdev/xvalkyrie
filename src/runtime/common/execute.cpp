@@ -900,7 +900,7 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
 // which writes the line back as well.
 // A title also writes back the lines of memory that is its own only on the console (what a
 // resource of the GPU's is made of, which the host keeps elsewhere): there is nothing to
-// write back, and the instruction is passed over (7952987A at image+0x532f230).
+// write back, and the instruction is passed over.
 bool passed_over_flush(CONTEXT &context) {
     const auto *at = reinterpret_cast<const std::uint8_t *>(context.Rip);
     if (!detail::title_image_base(at))

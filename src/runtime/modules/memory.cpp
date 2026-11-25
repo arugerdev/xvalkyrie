@@ -24,8 +24,8 @@ constexpr DWORD page_sizes = mem_large_pages | mem_4mb_pages;
 constexpr std::uintptr_t page = 1 << 16;
 constexpr std::uint64_t physical_size = 16ull << 30;
 // A title is told of a page by the number of its first 4 KiB frame, as the console does: one
-// keeps such numbers without their low four bits (the shift left by 4 before
-// XMemMapPhysicalPagesScatter at image+0xf2cbeb of 7952987A).
+// keeps such numbers without their low four bits (shifted left by 4 before
+// XMemMapPhysicalPagesScatter).
 constexpr ULONG_PTR frames = page >> 12;
 constexpr DWORD allocation_types =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO;

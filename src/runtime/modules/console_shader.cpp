@@ -751,7 +751,7 @@ std::span<const std::uint8_t> rectangle_shader(Bytes vertex) {
         return {};
     // What varies across a rectangle does so evenly: the fourth corner is as far from one
     // of the three as the third is from the one between them, which is the one where the
-    // sides meet at a right angle (7952987A gives it second). What does not vary is that
+    // sides meet at a right angle. What does not vary is that
     // corner's.
     std::string source = hlsl_struct("Vertex", outputs, false) +
                          "[maxvertexcount(4)] void main(triangle Vertex input[3], inout "

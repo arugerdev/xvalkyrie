@@ -1146,8 +1146,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE host_handle(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     return handle;
 }
 // A view of memory of the title's that is in no buffer here is a view of a copy, and the
-// title fills such memory after it has made the view (7952987A: the constants and matrices
-// of a draw). What each was made of is kept, by the host's slot, so that the copy can be
+// title fills such memory after it has made the view (the constants and matrices of a
+// draw). What each was made of is kept, by the host's slot, so that the copy can be
 // made again when a draw reads it (refresh_memory_view).
 struct MemoryView {
     D3D12_CPU_DESCRIPTOR_HANDLE handle{}; // the title's
@@ -1892,7 +1892,7 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
     // a descriptor the title cleared is a null one, whose reads give 0: the host's slot may
     // hold anything until it is made so. What decodes to nothing is left unmarked, as it may
     // be no descriptor at all: a range of the title's signature runs past the descriptors it
-    // wrote, into what it keeps after them (7952987A: a draw's constants right after its
+    // wrote, into what it keeps after them (a draw's constants right after its
     // table), which the mark would overwrite. It is decoded again when it is read again.
     if ((first == 0 && words[2] == 0 && words[3] == 0) || null_buffer(words)) {
         view_nothing(false);
@@ -2074,8 +2074,7 @@ void STDMETHODCALLTYPE create_cbv(ID3D12Device *self, const D3D12_CONSTANT_BUFFE
         // On the Series console the view may be of any memory the title has, a buffer or
         // not, and start anywhere: the host drops the device over an address that is in no
         // buffer of its own. Such constants are copied to where the host takes them, as
-        // they are when the view is made (7952987A makes its views as it draws, at
-        // image+0x4da8f5c).
+        // they are when the view is made (a title may make its views as it draws).
         const auto given = host.BufferLocation;
         host.BufferLocation =
             console == Target::scarlett ? root_address(given) : gpu_address(given);
@@ -3125,8 +3124,8 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
     }
     if (!known) {
         // Memory of the title's that is in no buffer here: what the view is of is copied,
-        // as it is now, to where the host can have a view (7952987A has the matrices its
-        // first screens are drawn with in such views, made as it draws).
+        // as it is now, to where the host can have a view (the matrices a title draws its
+        // first screens with may be in such views, made as it draws).
         const auto bytes =
             (view.Buffer.FirstElement + std::uint64_t{view.Buffer.NumElements}) * element;
         MEMORY_BASIC_INFORMATION info{};

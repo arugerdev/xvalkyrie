@@ -4868,6 +4868,19 @@ void STDMETHODCALLTYPE resource_barrier(void *self, UINT count,
         if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
             barrier.Transition.StateBefore = host_state(barrier.Transition.StateBefore);
             barrier.Transition.StateAfter = host_state(barrier.Transition.StateAfter);
+            // a depth buffer the console also writes otherwise is only one here (host_rules):
+            // those states are its writing one
+            if (barrier.Transition.pResource && barrier.Transition.pResource->GetDesc().Flags &
+                                                    D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+                for (auto *const state :
+                     {&barrier.Transition.StateBefore, &barrier.Transition.StateAfter}) {
+                    constexpr auto others =
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    if (*state & others)
+                        *state = (*state & ~others) | D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                    if (*state & D3D12_RESOURCE_STATE_DEPTH_WRITE)
+                        *state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                }
             if (barrier.Transition.StateAfter & D3D12_RESOURCE_STATE_RENDER_TARGET ||
                 barrier.Transition.StateBefore & D3D12_RESOURCE_STATE_RENDER_TARGET) {
                 const std::lock_guard lock(state_mutex);
@@ -4877,7 +4890,9 @@ void STDMETHODCALLTYPE resource_barrier(void *self, UINT count,
     // The title's placed resources are committed ones here, each with memory of its own:
     // none aliases another, and the host turns a list down for saying so.
     std::erase_if(host, [](const D3D12_RESOURCE_BARRIER &barrier) {
-        return barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+        return barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ||
+               (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                barrier.Transition.StateBefore == barrier.Transition.StateAfter);
     });
     // The console takes two transitions of one subresource in a call, one after the other;
     // the host takes a subresource once per call, so the call is split where one comes again.
@@ -6655,6 +6670,15 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
     host->DispatchMesh(groups, 1, 1);
     host->Release();
 }
+// ExecuteIndirect (59): left out with the rest of what the list draws or computes while its
+// pipeline is not there, as the host turns down the list with another pipeline set
+void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *signature, UINT count,
+                                        ID3D12Resource *arguments, UINT64 offset,
+                                        ID3D12Resource *counts, UINT64 counts_offset) {
+    if (static_cast<ListProxy *>(self)->no_pipeline)
+        return;
+    host_of(self)->ExecuteIndirect(signature, count, arguments, offset, counts, counts_offset);
+}
 // DispatchMesh (127), the desktop's: what it draws with is made ready as for a draw
 void STDMETHODCALLTYPE dispatch_mesh(void *self, UINT x, UINT y, UINT z) {
     if (static_cast<ListProxy *>(self)->no_pipeline)
@@ -6819,8 +6843,9 @@ bool barrier_groups(std::uint64_t count, std::uint64_t address) {
     });
 }
 // The console's lists hand out memory for the GPU to read from among their commands (size,
-// alignment), at 148 in the later kits, which a library of the console's fills: here a ring
-// of memory of the title's kind, gone round only long after the GPU has read what was in it.
+// alignment), at 146 here (148 in a list of the later layout, see list_by_layout), which a
+// library of the console's fills: here a ring of memory of the title's kind, gone round only
+// long after the GPU has read what was in it.
 void *list_memory(std::uint64_t size, std::uint64_t alignment) {
     constexpr std::uint64_t ring_size = 256ull << 20;
     static auto *const ring =
@@ -6839,9 +6864,6 @@ void *list_memory(std::uint64_t size, std::uint64_t alignment) {
     at += size;
     return memory;
 }
-void *STDMETHODCALLTYPE allocate_list_memory(void *, std::uint64_t size, std::uint64_t alignment) {
-    return list_memory(size, alignment);
-}
 template <std::size_t Index>
 std::uint64_t STDMETHODCALLTYPE barrier_by_layout(void *self, std::uint64_t count,
                                                   std::uint64_t groups) {
@@ -6850,7 +6872,7 @@ std::uint64_t STDMETHODCALLTYPE barrier_by_layout(void *self, std::uint64_t coun
                           reinterpret_cast<const D3D12_BARRIER_GROUP *>(groups));
         return 0;
     }
-    // memory among the commands, as at 148, in a list of another layout
+    // memory among the commands
     if (groups && groups <= (1 << 16) && !(groups & (groups - 1)))
         return reinterpret_cast<std::uint64_t>(list_memory(count, groups));
     if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
@@ -6910,7 +6932,7 @@ void configure_lists() {
     // ID3D12GraphicsCommandList7::Barrier, in the lists of a title built with a later kit
     list_vtable[144] = reinterpret_cast<Slot>(&barrier_by_layout<144>);
     list_vtable[146] = reinterpret_cast<Slot>(&barrier_by_layout<146>);
-    list_vtable[148] = reinterpret_cast<Slot>(&allocate_list_memory);
+    list_vtable[59] = reinterpret_cast<Slot>(&execute_indirect);
 }
 // XV_D3D_LOST: every method of a list looks whether the host still has the device
 template <std::size_t Index>

@@ -269,8 +269,7 @@ void capture_frame(ID3D12Resource *picture) {
         one.resource->Release();
     }
     if (picture)
-        save(picture, tracked_state(picture, D3D12_RESOURCE_STATE_PRESENT), frame, "presented",
-             0);
+        save(picture, tracked_state(picture, D3D12_RESOURCE_STATE_PRESENT), frame, "presented", 0);
     std::fflush(stderr);
 }
 } // namespace xv::runtime::modules::d3d12x

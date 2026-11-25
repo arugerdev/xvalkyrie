@@ -689,10 +689,10 @@ void forget_scratch(void *resource) {
 }
 // the bytes all of a texture's subresources take as the host copies them to a buffer
 std::uint64_t copyable_bytes(ID3D12Device *device, const D3D12_RESOURCE_DESC &desc) {
-    const UINT count = std::max<UINT>(desc.MipLevels, 1) *
-                       (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                            ? 1
-                            : std::max<UINT>(desc.DepthOrArraySize, 1));
+    const UINT count =
+        std::max<UINT>(desc.MipLevels, 1) * (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                                 ? 1
+                                                 : std::max<UINT>(desc.DepthOrArraySize, 1));
     UINT64 total = 0;
     device->GetCopyableFootprints(&desc, 0, count, 0, nullptr, nullptr, nullptr, &total);
     return total;
@@ -719,8 +719,8 @@ void *scratch_memory(ID3D12Resource *self) {
             if (ID3DDestructionNotifier *notifier = nullptr;
                 SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&notifier))) && notifier) {
                 UINT id = 0;
-                notifier->RegisterDestructionCallback(
-                    [](void *gone) { forget_scratch(gone); }, self, &id);
+                notifier->RegisterDestructionCallback([](void *gone) { forget_scratch(gone); },
+                                                      self, &id);
                 notifier->Release();
             }
         if (static std::atomic<int> shown{0}; shown++ < 4) {
@@ -798,13 +798,12 @@ void upload_scratch(ID3D12CommandQueue *queue) {
     static ID3D12Fence *fence = nullptr;
     static UINT64 value = 0;
     const std::lock_guard lock(list_mutex);
-    if (!list &&
-        (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                               IID_PPV_ARGS(&allocator))) ||
-         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
-                                          IID_PPV_ARGS(&list))) ||
-         FAILED(list->Close()) ||
-         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))) {
+    if (!list && (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                        IID_PPV_ARGS(&allocator))) ||
+                  FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator,
+                                                   nullptr, IID_PPV_ARGS(&list))) ||
+                  FAILED(list->Close()) ||
+                  FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))) {
         list = nullptr;
         device->Release();
         return;
@@ -838,8 +837,9 @@ void upload_scratch(ID3D12CommandQueue *queue) {
         for (UINT n = 0; n < count; ++n) {
             const D3D12_TEXTURE_COPY_LOCATION to{
                 one.texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = n}};
-            const D3D12_TEXTURE_COPY_LOCATION from{
-                one.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {.PlacedFootprint = footprints[n]}};
+            const D3D12_TEXTURE_COPY_LOCATION from{one.upload,
+                                                   D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                                   {.PlacedFootprint = footprints[n]}};
             list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
         }
         std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
@@ -854,7 +854,8 @@ void upload_scratch(ID3D12CommandQueue *queue) {
     for (const auto &one : written)
         one.texture->Release();
     if (static std::atomic<int> shown{0}; shown++ < 4) {
-        std::fprintf(stderr, "[Runtime] %zu textures the title wrote through its memory copied in\n",
+        std::fprintf(stderr,
+                     "[Runtime] %zu textures the title wrote through its memory copied in\n",
                      written.size());
         std::fflush(stderr);
     }
@@ -5200,9 +5201,8 @@ void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_
 // with `view` (2 shader resource, 3 constant buffer, 4 unordered access: the root
 // parameter of heap_signature, and the host's address)
 template <class View>
-void fill_user(const HeapUses::Stage &stage,
-               const std::vector<ListProxy::RootArgument> &arguments, std::uint32_t first,
-               std::uint32_t (&user)[24], View view) {
+void fill_user(const HeapUses::Stage &stage, const std::vector<ListProxy::RootArgument> &arguments,
+               std::uint32_t first, std::uint32_t (&user)[24], View view) {
     std::uintptr_t tables[24]{};
     ShadowHeap heaps[24]{};
     std::memset(user, 0, sizeof user);
@@ -5827,8 +5827,8 @@ std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t m
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(from, &info, sizeof info) && info.State == MEM_COMMIT &&
                 !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
-                from + bytes <= static_cast<const std::uint8_t *>(info.BaseAddress) +
-                                    info.RegionSize)
+                from + bytes <=
+                    static_cast<const std::uint8_t *>(info.BaseAddress) + info.RegionSize)
                 std::memcpy(to, from, bytes);
         });
     }
@@ -7970,8 +7970,8 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
                 std::fprintf(stderr, "[Runtime]   console code only: %d\n",
                              modules::console_only_shader(shader_bytes(shaders[3])));
             }
-            made |= host_bytecode(modules::ShaderStage::pixel, pixel,
-                                  modules::HostShaderModel::sm6, {}, signature);
+            made |= host_bytecode(modules::ShaderStage::pixel, pixel, modules::HostShaderModel::sm6,
+                                  {}, signature);
             modules::use_heap_shaders(false);
             if (shader_at[3])
                 std::memcpy(stream.data() + shader_at[3], &mesh, sizeof mesh);

@@ -3455,12 +3455,15 @@ bool heap_shaders_wanted(ID3D12Device *device) {
     }();
     return on && console == Target::scarlett && heap_signature(device);
 }
-// A compute shader of the Series console is made to read the heaps itself where its file
-// says what its user registers hold; one without that table keeps the title's signature.
-bool heap_compute_shader(ID3D12Device *device, const D3D12_SHADER_BYTECODE &code) {
-    return code.pShaderBytecode && heap_shaders_wanted(device) &&
-           modules::console_only_shader(shader_bytes(code)) &&
+// A shader of the Series console is made to read the heaps itself where its file says what
+// its user registers hold and what it reads at each place of a table; one of the earlier
+// kits, whose file has neither (Fortnite's), keeps the title's signature.
+bool heap_layout_known(const D3D12_SHADER_BYTECODE &code) {
+    return code.pShaderBytecode && modules::console_only_shader(shader_bytes(code)) &&
            !modules::shader_heap_layout(shader_bytes(code)).entries.empty();
+}
+bool heap_compute_shader(ID3D12Device *device, const D3D12_SHADER_BYTECODE &code) {
+    return heap_shaders_wanted(device) && heap_layout_known(code);
 }
 std::shared_ptr<const HeapUses> compute_heap_uses(const D3D12_SHADER_BYTECODE &code) {
     auto uses = std::make_shared<HeapUses>();
@@ -3757,9 +3760,8 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
         // the pipeline is under a root signature of ours (see HeapUses), with
         // XV_HEAP_SHADERS=1; else the title's signature and its ranges are kept.
         const bool heaps = simple && heap_shaders_wanted(self) && host.VS.pShaderBytecode &&
-                           host.PS.pShaderBytecode &&
-                           modules::console_only_shader(shader_bytes(host.VS)) &&
-                           modules::console_only_shader(shader_bytes(host.PS));
+                           host.PS.pShaderBytecode && heap_layout_known(host.VS) &&
+                           heap_layout_known(host.PS);
         tried_heaps = heaps;
         modules::use_heap_shaders(heaps);
         const bool pair =
@@ -8084,9 +8086,8 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             std::memcpy(&signature, stream.data() + signature_at, sizeof signature);
         const bool heaps = simple_graphics && !compute.pShaderBytecode &&
                            heap_shaders_wanted(self) && vertex.pShaderBytecode &&
-                           pixel.pShaderBytecode &&
-                           modules::console_only_shader(shader_bytes(vertex)) &&
-                           modules::console_only_shader(shader_bytes(pixel));
+                           pixel.pShaderBytecode && heap_layout_known(vertex) &&
+                           heap_layout_known(pixel);
         tried_heaps = heaps;
         auto mesh = shaders[3];
         // a mesh shader and its pixel shader read the heaps themselves, as a vertex and pixel

@@ -33,8 +33,12 @@ HRESULT made_pipeline(void *pipeline);
 void console_command_allocator(void *allocator);
 void console_fence(void *fence);
 // Code at [code, code + size) calls the console's Direct3D 12 objects as the title's own code
-// does. Exposed for the tests, which have no title.
+// does, until it is given to stop_calling_as_title. Exposed for the tests, which have no title.
 void call_as_title(const void *code, std::size_t size);
+void stop_calling_as_title(const void *code);
+// The title's layouts of queues and lists unknown again, as before its calls showed them.
+// Exposed for the tests, each of which stands for a title of its own.
+void forget_layouts();
 // why the host's device stopped, and what its debug layer said, to the log
 void report_failure();
 // a texture's first subresource, copied to the CPU through the title's direct queue

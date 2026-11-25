@@ -9,8 +9,10 @@
 #include <windows.h>
 
 // A placed texture whose memory the title writes while its uploads are taken. Catch2 reports
-// every access violation its own handler sees first, so this is one test case: the module's
-// handler, installed by the first track_placement, comes before Catch2's in it.
+// every access violation its own handler sees first, and puts its handler first as each test
+// case starts, so this is one test case: the module's handler, installed by its first
+// track_placement, comes before Catch2's in it. When it ends, the module lets go of the
+// placement and of its handler, which the next test's first placement installs again.
 namespace {
 using namespace xv::runtime;
 
@@ -63,6 +65,13 @@ class Texture final : public ID3D12Resource {
     D3D12_RESOURCE_DESC desc;
 };
 
+// the module's placements and handler let go of when a test ends
+struct ForgetPlacements {
+    ForgetPlacements() = default;
+    ~ForgetPlacements() { modules::forget_placements(); }
+    ForgetPlacements(const ForgetPlacements &) = delete;
+    ForgetPlacements &operator=(const ForgetPlacements &) = delete;
+};
 // the first byte of each upload taken, which gives back the taker's references
 std::vector<int> take_first_bytes() {
     std::vector<int> first;
@@ -90,6 +99,7 @@ TEST_CASE("a placement is uploaded again after every write, one made while it is
     REQUIRE(memory);
     memory[0] = 1;
     Texture texture(desc);
+    const ForgetPlacements forget;
     modules::track_placement(&texture, const_cast<std::uint8_t *>(memory));
 
     // uploaded once when placed, then not until it is written

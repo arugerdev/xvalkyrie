@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -357,11 +358,22 @@ using Raw = std::uint64_t(STDMETHODCALLTYPE *)(void *, std::uint64_t, std::uint6
                                                std::uint64_t, std::uint64_t, std::uint64_t,
                                                std::uint64_t, std::uint64_t, std::uint64_t,
                                                std::uint64_t);
-// Code that calls as the title's own does, besides the title's: the tests' (see call_as_title)
-std::atomic<const std::uint8_t *> test_code{nullptr}, test_code_end{nullptr};
+// Code that calls as the title's own does, besides the title's: the tests' (see call_as_title),
+// a few pieces at most. A free place has neither end; one is filled start first and emptied
+// end first, so that a caller never sees a range that is not one.
+struct CodeRange {
+    std::atomic<const std::uint8_t *> start{nullptr}, end{nullptr};
+};
+std::array<CodeRange, 4> test_code;
+std::mutex test_code_mutex;
 bool title_code(const void *address) {
+    if (detail::in_title(address))
+        return true;
     const auto *const at = static_cast<const std::uint8_t *>(address);
-    return detail::in_title(address) || (at >= test_code.load() && at < test_code_end.load());
+    for (const auto &range : test_code)
+        if (at >= range.start.load() && at < range.end.load())
+            return true;
+    return false;
 }
 // Whether the call that returns to `address` is the title's own call of this slot: the
 // instruction before it is `call [reg + Index * 8]`. The host's runtime also gets here with
@@ -9036,9 +9048,24 @@ void console_fence(void *fence) {
                                    {12, reinterpret_cast<Slot>(&fence_gpu_address)}});
 }
 void call_as_title(const void *code, std::size_t size) {
-    test_code_end = static_cast<const std::uint8_t *>(code) + size;
-    test_code = static_cast<const std::uint8_t *>(code);
+    const std::lock_guard lock(test_code_mutex);
+    for (auto &range : test_code)
+        if (!range.start.load()) {
+            range.start = static_cast<const std::uint8_t *>(code);
+            range.end = static_cast<const std::uint8_t *>(code) + size;
+            return;
+        }
+    throw std::length_error("Too many pieces of code call as the title");
 }
+void stop_calling_as_title(const void *code) {
+    const std::lock_guard lock(test_code_mutex);
+    for (auto &range : test_code)
+        if (range.start.load() == code) {
+            range.end = nullptr;
+            range.start = nullptr;
+        }
+}
+void forget_layouts() { later_queue = false; }
 void report_failure() {
     auto *const device = d3d12_device.load();
     if (!device)

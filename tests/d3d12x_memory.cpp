@@ -183,6 +183,7 @@ TEST_CASE("a view of memory at an address reads a copy of it, and a descriptor t
           "writes reads nothing there") {
     if (!device())
         return;
+    const LayoutsShown layouts; // a view at an address is a later kit's (see view_at)
     const TitleMemory memory;
     std::uint64_t output = 0;
     auto *const buffer = d3d12x_test::buffer(4096, output);
@@ -448,6 +449,7 @@ TEST_CASE("a texture placed in the title's memory has that memory's address") {
     if (!device())
         return;
     const TitleMemory memory;
+    const PlacementsGone placements;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = desc.Height = 64;

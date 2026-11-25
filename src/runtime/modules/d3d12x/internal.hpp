@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <d3d12.h>
 
 // What the console's device and queue have for showing frames, which the host does with a
@@ -6,6 +7,14 @@
 namespace xv::runtime::modules::d3d12x {
 // the state the title's own barriers left a render target in, `unknown` if it made none
 D3D12_RESOURCE_STATES tracked_state(ID3D12Resource *resource, D3D12_RESOURCE_STATES unknown);
+// how many frames the title has presented
+std::uint64_t frames_shown();
+// XV_CAPTURE (capture.cpp): whether this frame is one to keep; a target or depth buffer the
+// title binds, a draw into the target bound first, and the frame presented
+bool capturing();
+void capture_bound(ID3D12Resource *resource, bool depth);
+void capture_draw(ID3D12Resource *target);
+void capture_frame(ID3D12Resource *picture);
 // ID3D12CommandQueue::PresentX on the host's queue
 HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_parameters,
                   const void *present_parameters);

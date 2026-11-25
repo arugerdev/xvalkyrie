@@ -665,41 +665,200 @@ void console_resource(void *resource) {
 }
 // Map (8) of a resource the host does not map, and the address of one that has none. All of the
 // console's memory is the CPU's as well, and a title maps a texture of the default heap to fill it
-// (one clears its back buffers that way). The title gets memory of ours of the resource's size
-// instead, and what it writes there goes nowhere.
+// (a video player writes its frames that way, one clears its back buffers). The title gets
+// memory of ours, laid out as the host copies the texture's subresources to a buffer, whose
+// writes are watched: what it wrote since the last time goes to the texture before a direct
+// queue runs the next lists it is given (upload_scratch). Such memory is never given back,
+// as the title may go on writing where it was told to.
 std::mutex scratch_mutex;
 struct Scratch {
     void *memory = nullptr;
     std::uint64_t size = 0;
+    ID3D12Resource *upload = nullptr; // of `size` bytes, mapped at `staged`
+    void *staged = nullptr;
 };
 std::map<ID3D12Resource *, Scratch> scratch_maps;
+void forget_scratch(void *resource) {
+    const std::lock_guard lock(scratch_mutex);
+    if (const auto found = scratch_maps.find(static_cast<ID3D12Resource *>(resource));
+        found != scratch_maps.end()) {
+        if (found->second.upload)
+            found->second.upload->Release();
+        scratch_maps.erase(found);
+    }
+}
+// the bytes all of a texture's subresources take as the host copies them to a buffer
+std::uint64_t copyable_bytes(ID3D12Device *device, const D3D12_RESOURCE_DESC &desc) {
+    const UINT count = std::max<UINT>(desc.MipLevels, 1) *
+                       (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                            ? 1
+                            : std::max<UINT>(desc.DepthOrArraySize, 1));
+    UINT64 total = 0;
+    device->GetCopyableFootprints(&desc, 0, count, 0, nullptr, nullptr, nullptr, &total);
+    return total;
+}
 void *scratch_memory(ID3D12Resource *self) {
     ID3D12Device *device = nullptr;
     if (FAILED(self->GetDevice(IID_PPV_ARGS(&device))))
         return nullptr;
     const auto desc = self->GetDesc();
-    const auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    auto size = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && size != ~0ull)
+        size = std::max(size, copyable_bytes(device, desc));
     device->Release();
     if (size == ~0ull)
         return nullptr;
     const std::lock_guard lock(scratch_mutex);
-    // a resource made where a released one was finds that one's memory, which may be smaller
+    const bool known = scratch_maps.contains(self);
     auto &scratch = scratch_maps[self];
     if (scratch.size < size) {
-        if (scratch.memory)
-            VirtualFree(scratch.memory, 0, MEM_RELEASE);
-        scratch = {VirtualAlloc(nullptr, static_cast<SIZE_T>(size), MEM_RESERVE | MEM_COMMIT,
-                                PAGE_READWRITE),
+        scratch = {VirtualAlloc(nullptr, static_cast<SIZE_T>(size),
+                                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE),
                    size};
+        if (!known)
+            if (ID3DDestructionNotifier *notifier = nullptr;
+                SUCCEEDED(self->QueryInterface(IID_PPV_ARGS(&notifier))) && notifier) {
+                UINT id = 0;
+                notifier->RegisterDestructionCallback(
+                    [](void *gone) { forget_scratch(gone); }, self, &id);
+                notifier->Release();
+            }
         if (static std::atomic<int> shown{0}; shown++ < 4) {
             std::fprintf(stderr,
-                         "[Runtime] the title writes a %llux%u texture's memory, which the host "
-                         "does not give: what it writes there is lost\n",
+                         "[Runtime] the title writes a %llux%u texture's memory: what it writes "
+                         "there goes to the texture before the next lists a direct queue runs\n",
                          desc.Width, desc.Height);
             std::fflush(stderr);
         }
     }
     return scratch.memory;
+}
+// Before a direct queue runs lists: each texture whose memory of ours (scratch_memory) the
+// title wrote since the last time gets that memory copied in, on that queue, first.
+void upload_scratch(ID3D12CommandQueue *queue) {
+    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    struct Written {
+        ID3D12Resource *texture, *upload;
+        std::uint64_t size;
+    };
+    std::vector<Written> written;
+    ID3D12Device *device = nullptr;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))))
+        return;
+    {
+        const std::lock_guard lock(scratch_mutex);
+        for (auto &[texture, scratch] : scratch_maps) {
+            if (!scratch.memory || texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                continue;
+            void *pages[1];
+            ULONG_PTR count = 1;
+            ULONG granularity = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, scratch.memory,
+                              static_cast<SIZE_T>(scratch.size), pages, &count, &granularity) ||
+                !count)
+                continue;
+            ResetWriteWatch(scratch.memory, static_cast<SIZE_T>(scratch.size));
+            if (!scratch.upload) {
+                const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+                const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER,
+                                               0,
+                                               scratch.size,
+                                               1,
+                                               1,
+                                               1,
+                                               DXGI_FORMAT_UNKNOWN,
+                                               {1, 0},
+                                               D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                               D3D12_RESOURCE_FLAG_NONE};
+                if (FAILED(device->CreateCommittedResource(
+                        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                        nullptr, IID_PPV_ARGS(&scratch.upload))) ||
+                    FAILED(scratch.upload->Map(0, nullptr, &scratch.staged))) {
+                    if (scratch.upload)
+                        scratch.upload->Release();
+                    scratch.upload = nullptr;
+                    continue;
+                }
+            }
+            // what the title has now, which the copy reads when the queue gets to it
+            std::memcpy(scratch.staged, scratch.memory, static_cast<std::size_t>(scratch.size));
+            texture->AddRef();
+            written.push_back({texture, scratch.upload, scratch.size});
+        }
+    }
+    if (written.empty()) {
+        device->Release();
+        return;
+    }
+    // one list a time, made again once the queue is done with the one before
+    static std::mutex list_mutex;
+    static ID3D12CommandAllocator *allocator = nullptr;
+    static ID3D12GraphicsCommandList *list = nullptr;
+    static ID3D12Fence *fence = nullptr;
+    static UINT64 value = 0;
+    const std::lock_guard lock(list_mutex);
+    if (!list &&
+        (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&allocator))) ||
+         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                          IID_PPV_ARGS(&list))) ||
+         FAILED(list->Close()) ||
+         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))) {
+        list = nullptr;
+        device->Release();
+        return;
+    }
+    if (fence->GetCompletedValue() < value) {
+        const auto event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        fence->SetEventOnCompletion(value, event);
+        WaitForSingleObject(event, 2000);
+        CloseHandle(event);
+    }
+    allocator->Reset();
+    list->Reset(allocator, nullptr);
+    for (const auto &one : written) {
+        const auto desc = one.texture->GetDesc();
+        const UINT count = std::max<UINT>(desc.MipLevels, 1) *
+                           (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                ? 1
+                                : std::max<UINT>(desc.DepthOrArraySize, 1));
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(count);
+        UINT64 total = 0;
+        device->GetCopyableFootprints(&desc, 0, count, 0, footprints.data(), nullptr, nullptr,
+                                      &total);
+        if (total > one.size)
+            continue;
+        const auto state = tracked_state(one.texture, D3D12_RESOURCE_STATE_COMMON);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Transition = {one.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state,
+                              D3D12_RESOURCE_STATE_COPY_DEST};
+        if (state != D3D12_RESOURCE_STATE_COPY_DEST)
+            list->ResourceBarrier(1, &barrier);
+        for (UINT n = 0; n < count; ++n) {
+            const D3D12_TEXTURE_COPY_LOCATION to{
+                one.texture, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = n}};
+            const D3D12_TEXTURE_COPY_LOCATION from{
+                one.upload, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {.PlacedFootprint = footprints[n]}};
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        }
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        if (state != D3D12_RESOURCE_STATE_COPY_DEST)
+            list->ResourceBarrier(1, &barrier);
+    }
+    if (SUCCEEDED(list->Close())) {
+        ID3D12CommandList *const lists[] = {list};
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, ++value);
+    }
+    for (const auto &one : written)
+        one.texture->Release();
+    if (static std::atomic<int> shown{0}; shown++ < 4) {
+        std::fprintf(stderr, "[Runtime] %zu textures the title wrote through its memory copied in\n",
+                     written.size());
+        std::fflush(stderr);
+    }
+    device->Release();
 }
 HRESULT STDMETHODCALLTYPE map_resource(ID3D12Resource *self, UINT subresource,
                                        const D3D12_RANGE *range, void **data) {
@@ -2293,6 +2452,10 @@ void STDMETHODCALLTYPE create_target_view(ID3D12Device *self, ID3D12Resource *re
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, Index)(
         self, resource, desc, host_handle(handle));
     mark_host(handle);
+    if (Index == 21) { // XV_CAPTURE: what a depth view is of
+        const std::lock_guard lock(target_mutex);
+        target_of[host_handle(handle).ptr] = resource;
+    }
     if (Index == 20) {
         const std::lock_guard lock(target_mutex);
         target_of[host_handle(handle).ptr] = resource;
@@ -5341,6 +5504,7 @@ void prepare_draw(ListProxy *list) {
 std::mutex draw_mutex;
 std::map<ID3D12Resource *, std::uint64_t> draws_into;
 void count_draw(void *self) {
+    capture_draw(static_cast<ListProxy *>(self)->target);
     static const bool probing = std::getenv("XV_D3D_PROBE") != nullptr;
     if (!probing)
         return;
@@ -5884,6 +6048,22 @@ void STDMETHODCALLTYPE om_set_render_targets(void *self, UINT count, const Handl
     Handle host_depth{};
     if (depth)
         host_depth = host_view(*depth);
+    // XV_CAPTURE: what this frame draws into, and the first target for its draws
+    if (capturing()) {
+        ID3D12Resource *first = nullptr;
+        {
+            const std::lock_guard lock(target_mutex);
+            for (const auto &view : host)
+                if (const auto found = target_of.find(view.ptr); found != target_of.end()) {
+                    capture_bound(found->second, false);
+                    first = first ? first : found->second;
+                }
+            if (depth)
+                if (const auto found = target_of.find(host_depth.ptr); found != target_of.end())
+                    capture_bound(found->second, true);
+        }
+        static_cast<ListProxy *>(self)->target = first;
+    }
     if (static std::atomic<int> shown{0};
         std::getenv("XV_D3D_LOST") && (shown++ < 16 || lost_again)) {
         const std::lock_guard lock(target_mutex);
@@ -6077,6 +6257,7 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
                          groups, flags, arguments, payload);
         return;
     }
+    count_draw(self);
     prepare_draw(static_cast<ListProxy *>(self));
     host->DispatchMesh(groups, 1, 1);
     host->Release();
@@ -6774,6 +6955,7 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
     if (const auto *text = std::getenv("XV_D3D_SLOW"))
         Sleep(std::atoi(text));
     decode_written_heaps();
+    upload_scratch(self);
     copy_twins();
     upload_placements_d3d12(self);
     std::vector<ID3D12CommandList *> host(count);

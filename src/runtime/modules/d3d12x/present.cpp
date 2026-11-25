@@ -221,6 +221,8 @@ void probe(ID3D12Resource *picture) {
 }
 } // namespace
 
+std::uint64_t frames_shown() { return presents.load(); }
+
 // What became of each frame, by the token WaitFrameEventX gave for it: a title asks with
 // GetFrameStatisticsX, and an engine holds its next frames until it is told that the ones
 // before were shown. Times are the performance counter's.
@@ -294,6 +296,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, UINT planes, const void *plane_para
     if (const auto result = prepare(queue, desc); FAILED(result))
         return result;
     probe(picture);
+    capture_frame(picture);
     auto &state = presenter;
     wait_for(state.fence, state.value);
     match_fullscreen(state);

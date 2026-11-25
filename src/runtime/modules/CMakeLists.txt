@@ -3,7 +3,7 @@
 # has to be put beside the executable.
 add_library(xv_runtime_modules xg.cpp texture_layout.cpp kernel.cpp memory.cpp dstorage.cpp bcpack.cpp
   bcpack-tables.cpp console_shader.cpp console_shader_rdna.cpp watchdog.cpp acphal.cpp window.cpp system.cpp placement.cpp storage.cpp gameinput.cpp locale.cpp network.cpp
-  d3d12x/device.cpp d3d12x/present.cpp
+  d3d12x/device.cpp d3d12x/present.cpp d3d12x/capture.cpp
   gameruntime/runtime.cpp gameruntime/slots.cpp gameruntime/task_queue.cpp gameruntime/async.cpp
   gameruntime/user.cpp gameruntime/save.cpp gameruntime/system.cpp gameruntime/store.cpp
   gameruntime/ui.cpp gameruntime/streaming.cpp)

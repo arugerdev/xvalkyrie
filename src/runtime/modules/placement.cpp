@@ -352,21 +352,25 @@ bool placement_data(const D3D11_TEXTURE2D_DESC &desc, const void *address,
 }
 
 void prepare_title_write(const void *address, std::size_t bytes) {
-    const auto first = reinterpret_cast<std::uintptr_t>(address), last = first + bytes;
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
     if (!address || !bytes)
         return;
+    // the memory may hold a placement at another address of its physical pages too
+    auto ranges = other_views(start, start + bytes);
+    ranges.emplace_back(start, start + bytes);
     const std::lock_guard lock(mutex);
-    for (auto at = placements.lower_bound(last); at != placements.begin();) {
-        auto &placement = (--at)->second;
-        if (placement.start + largest < first)
-            break;
-        if (placement.end <= first || placement.start >= last)
-            continue;
-        if (!placement.dirty)
-            dirty.push_back(placement.start);
-        placement.dirty = true;
-        protect(placement, PAGE_READWRITE);
-    }
+    for (const auto &[first, last] : ranges)
+        for (auto at = placements.lower_bound(last); at != placements.begin();) {
+            auto &placement = (--at)->second;
+            if (placement.start + largest < first)
+                break;
+            if (placement.end <= first || placement.start >= last)
+                continue;
+            if (!placement.dirty)
+                dirty.push_back(placement.start);
+            placement.dirty = true;
+            protect(placement, PAGE_READWRITE);
+        }
 }
 
 bool readable_memory(std::uint64_t address, std::size_t bytes) {

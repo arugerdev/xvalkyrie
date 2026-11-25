@@ -2884,6 +2884,90 @@ HRESULT STDMETHODCALLTYPE create_root_signature(ID3D12Device *self, UINT node, c
     }
     return result;
 }
+D3D12_RESOURCE_DESC host_resource_desc(ID3D12Device *device, const D3D12_RESOURCE_DESC &desc);
+D3D12_RESOURCE_STATES host_state(D3D12_RESOURCE_STATES state);
+// A title places textures in memory it maps pages into later, many more than it has pages
+// for (slots of what it streams): on the console they take nothing until then. Here such a
+// texture is a reserved resource, which has no memory either, and is given a heap of its own
+// when it is first uploaded to (back_texture).
+std::mutex unbacked_mutex;
+std::set<const void *> unbacked;
+HRESULT unbacked_texture(ID3D12Device *self, std::uint64_t address, const D3D12_RESOURCE_DESC *desc,
+                         D3D12_RESOURCE_STATES state, REFIID iid, void **resource) {
+    if (console != Target::scarlett || !desc || !address || !resource ||
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->SampleDesc.Count > 1 ||
+        desc->Flags &
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
+        readable_memory(address, 1))
+        return E_NOTIMPL;
+    auto host = host_resource_desc(self, *desc);
+    host.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    host.Alignment = 0;
+    using Create =
+        HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_RESOURCE_DESC *, D3D12_RESOURCE_STATES,
+                                     const D3D12_CLEAR_VALUE *, REFIID, void **);
+    const auto result =
+        original<Create>(self, 30)(self, &host, host_state(state), nullptr, iid, resource);
+    if (FAILED(result))
+        return result;
+    // its address is where it was placed, as a committed one's
+    console_resource(*resource);
+    mappable_resource(*resource);
+    ID3DDestructionNotifier *notifier = nullptr;
+    UINT id = 0;
+    if (SUCCEEDED(static_cast<IUnknown *>(*resource)->QueryInterface(IID_PPV_ARGS(&notifier)))) {
+        notifier->RegisterDestructionCallback(
+            [](void *gone) {
+                const std::lock_guard lock(unbacked_mutex);
+                unbacked.erase(gone);
+            },
+            *resource, &id);
+        notifier->Release();
+    }
+    const std::lock_guard lock(unbacked_mutex);
+    unbacked.insert(*resource);
+    return result;
+}
+// the heap for one of those, its tiles mapped on `queue` before the work given it next; the
+// resource keeps the heap
+void back_texture(ID3D12CommandQueue *queue, ID3D12Device *device, ID3D12Resource *texture) {
+    {
+        const std::lock_guard lock(unbacked_mutex);
+        if (!unbacked.erase(texture))
+            return;
+    }
+    UINT tiles = 0;
+    D3D12_PACKED_MIP_INFO packed{};
+    device->GetResourceTiling(texture, &tiles, &packed, nullptr, nullptr, 0, nullptr);
+    if (!tiles)
+        return;
+    const D3D12_HEAP_DESC heap_desc{std::uint64_t{tiles} * D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES,
+                                    {D3D12_HEAP_TYPE_DEFAULT},
+                                    0,
+                                    D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES};
+    ID3D12Heap *heap = nullptr;
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap))))
+        return;
+    // the standard mips' tiles in order, then the packed ones
+    const UINT standard = tiles - packed.NumTilesForPackedMips;
+    D3D12_TILED_RESOURCE_COORDINATE starts[2]{};
+    D3D12_TILE_REGION_SIZE sizes[2]{};
+    UINT regions = 0;
+    if (standard)
+        sizes[regions++].NumTiles = standard;
+    if (packed.NumTilesForPackedMips) {
+        starts[regions].Subresource = packed.NumStandardMips;
+        sizes[regions++].NumTiles = packed.NumTilesForPackedMips;
+    }
+    const UINT offset = 0;
+    queue->UpdateTileMappings(texture, regions, starts, sizes, heap, 1, nullptr, &offset, &tiles,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
+    static constexpr GUID backing{
+        0x6f2b1c4e, 0x58d3, 0x4a7f, {0x9e, 0x21, 0x3c, 0x5a, 0x7d, 0x80, 0x14, 0xb6}};
+    texture->SetPrivateDataInterface(backing, heap);
+    heap->Release();
+}
 // slot 44: CreatePlacedResourceX(address, desc, state, clear, iid, resource), a resource on
 // memory of the title's (Unreal's XboxOneD3D12Texture.cpp names it). The host cannot place a
 // resource at an address: a committed one in GPU memory stands for it.
@@ -2911,8 +2995,10 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
         std::fflush(stderr);
     }
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
-    const auto result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state,
-                                                  clear, iid, resource);
+    auto result = unbacked_texture(self, address, desc, state, iid, resource);
+    if (FAILED(result))
+        result = create_committed_resource(self, &heap, D3D12_HEAP_FLAG_NONE, desc, state, clear,
+                                           iid, resource);
     if (SUCCEEDED(result) && resource && *resource && desc && address &&
         desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         note_placed_texture(static_cast<ID3D12Resource *>(*resource), address, *desc);
@@ -6732,13 +6818,41 @@ bool barrier_groups(std::uint64_t count, std::uint64_t address) {
                (!group.NumBarriers || group.pGlobalBarriers);
     });
 }
+// The console's lists hand out memory for the GPU to read from among their commands (size,
+// alignment), at 148 in the later kits, which a library of the console's fills: here a ring
+// of memory of the title's kind, gone round only long after the GPU has read what was in it.
+void *list_memory(std::uint64_t size, std::uint64_t alignment) {
+    constexpr std::uint64_t ring_size = 256ull << 20;
+    static auto *const ring =
+        static_cast<std::uint8_t *>(modules::allocate_aligned(ring_size, 1 << 16, nullptr));
+    static std::mutex ring_mutex;
+    static std::uint64_t at = 0;
+    if (!ring || !size || size > ring_size / 4 || alignment > (1 << 16) ||
+        alignment & (alignment - 1))
+        return nullptr;
+    const std::lock_guard lock(ring_mutex);
+    at = (at + std::max<std::uint64_t>(alignment, 1) - 1) &
+         ~(std::max<std::uint64_t>(alignment, 1) - 1);
+    if (at + size > ring_size)
+        at = 0;
+    auto *const memory = ring + at;
+    at += size;
+    return memory;
+}
+void *STDMETHODCALLTYPE allocate_list_memory(void *, std::uint64_t size, std::uint64_t alignment) {
+    return list_memory(size, alignment);
+}
 template <std::size_t Index>
-void STDMETHODCALLTYPE barrier_by_layout(void *self, std::uint64_t count, std::uint64_t groups) {
+std::uint64_t STDMETHODCALLTYPE barrier_by_layout(void *self, std::uint64_t count,
+                                                  std::uint64_t groups) {
     if (barrier_groups(count, groups)) {
         enhanced_barriers(self, static_cast<UINT32>(count),
                           reinterpret_cast<const D3D12_BARRIER_GROUP *>(groups));
-        return;
+        return 0;
     }
+    // memory among the commands, as at 148, in a list of another layout
+    if (groups && groups <= (1 << 16) && !(groups & (groups - 1)))
+        return reinterpret_cast<std::uint64_t>(list_memory(count, groups));
     if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
         std::fprintf(
             stderr,
@@ -6747,6 +6861,7 @@ void STDMETHODCALLTYPE barrier_by_layout(void *self, std::uint64_t count, std::u
             Index, static_cast<unsigned long long>(count), static_cast<unsigned long long>(groups));
         std::fflush(stderr);
     }
+    return 0;
 }
 // Wait32BitValueX and Wait64BitValueX (address, value, ...): on the console the GPU waits until
 // the memory at the address compares as asked with the value, which work of another queue
@@ -6795,6 +6910,7 @@ void configure_lists() {
     // ID3D12GraphicsCommandList7::Barrier, in the lists of a title built with a later kit
     list_vtable[144] = reinterpret_cast<Slot>(&barrier_by_layout<144>);
     list_vtable[146] = reinterpret_cast<Slot>(&barrier_by_layout<146>);
+    list_vtable[148] = reinterpret_cast<Slot>(&allocate_list_memory);
 }
 // XV_D3D_LOST: every method of a list looks whether the host still has the device
 template <std::size_t Index>
@@ -7055,11 +7171,22 @@ bool convert_row(DXGI_FORMAT format, const std::uint8_t *source, std::uint8_t *t
 // title's on the same queue. Textures are where the title keeps them between its own lists:
 // shader resources.
 struct Uploader {
-    ID3D12CommandAllocator *allocator = nullptr;
-    ID3D12GraphicsCommandList *list = nullptr;
+    // the lists take turns, so that a submission waits for the uploads of one some
+    // submissions back, which the GPU is past, and not for the last ones
+    struct Turn {
+        ID3D12CommandAllocator *allocator = nullptr;
+        ID3D12GraphicsCommandList *list = nullptr;
+        UINT64 value = 0; // the fence's once the GPU is past this turn's uploads
+        // the texels, in a buffer kept mapped and grown as needed
+        ID3D12Resource *staging = nullptr;
+        UINT64 size = 0;
+        std::uint8_t *mapped = nullptr;
+        std::vector<ID3D12Resource *> textures; // until the GPU is past them
+    };
     ID3D12Fence *fence = nullptr;
     UINT64 value = 0;
-    std::vector<ID3D12Resource *> buffers; // and the textures, until the GPU is past them
+    std::array<Turn, 4> turns;
+    std::size_t next = 0;
 };
 std::mutex uploader_mutex;
 void upload_placements_d3d12(ID3D12CommandQueue *queue) {
@@ -7087,19 +7214,25 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
     static Uploader uploader;
     ID3D12Device *device = nullptr;
     queue->GetDevice(IID_PPV_ARGS(&device));
-    if (!uploader.list &&
-        (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                               IID_PPV_ARGS(&uploader.allocator))) ||
-         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, uploader.allocator,
-                                          nullptr, IID_PPV_ARGS(&uploader.list))) ||
-         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploader.fence))))) {
+    const auto give_up = [&] {
+        for (auto &upload : uploads)
+            upload.resource->Release();
         device->Release();
-        return;
-    }
-    if (uploader.value) {
-        if (uploader.fence->GetCompletedValue() < uploader.value) {
+    };
+    if (!uploader.fence &&
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploader.fence))))
+        return give_up();
+    auto &turn = uploader.turns[uploader.next++ % uploader.turns.size()];
+    if (!turn.list &&
+        (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&turn.allocator))) ||
+         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, turn.allocator,
+                                          nullptr, IID_PPV_ARGS(&turn.list)))))
+        return give_up();
+    if (turn.value) {
+        if (uploader.fence->GetCompletedValue() < turn.value) {
             auto *const event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            uploader.fence->SetEventOnCompletion(uploader.value, event);
+            uploader.fence->SetEventOnCompletion(turn.value, event);
             const auto waited = WaitForSingleObject(event, 5000);
             CloseHandle(event);
             if (waited != WAIT_OBJECT_0) {
@@ -7107,27 +7240,79 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
                              "[Runtime] the uploads before these are not done after 5 s (the "
                              "queue is at %llu of %llu, device 0x%08lx)%c",
                              static_cast<unsigned long long>(uploader.fence->GetCompletedValue()),
-                             static_cast<unsigned long long>(uploader.value),
+                             static_cast<unsigned long long>(turn.value),
                              static_cast<unsigned long>(device->GetDeviceRemovedReason()), 10);
                 std::fflush(stderr);
             }
         }
-        for (auto *buffer : uploader.buffers)
-            buffer->Release();
-        uploader.buffers.clear();
-        uploader.allocator->Reset();
-        uploader.list->Reset(uploader.allocator, nullptr);
+        for (auto *texture : turn.textures)
+            texture->Release();
+        turn.textures.clear();
+        turn.allocator->Reset();
+        turn.list->Reset(turn.allocator, nullptr);
+    }
+    // the staging buffer is grown to hold every texture's texels
+    const auto convertible = [](const PlacementUpload &upload, const D3D12_RESOURCE_DESC &desc) {
+        return upload.format == desc.Format || convert_row(upload.format, nullptr, nullptr, 0);
+    };
+    const auto aligned = [](UINT64 bytes) {
+        return (bytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+               ~UINT64{D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1};
+    };
+    UINT64 total = 0;
+    for (auto &upload : uploads) {
+        const auto desc = upload.resource->GetDesc();
+        UINT64 bytes = 0;
+        if (convertible(upload, desc))
+            device->GetCopyableFootprints(&desc, 0, static_cast<UINT>(upload.subresources.size()),
+                                          0, nullptr, nullptr, nullptr, &bytes);
+        total += aligned(bytes);
+    }
+    if (total > turn.size) {
+        if (turn.staging)
+            turn.staging->Release();
+        turn.staging = nullptr;
+        turn.size = std::bit_ceil(std::max<UINT64>(total, 16 << 20));
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
+        const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER,
+                                              0,
+                                              turn.size,
+                                              1,
+                                              1,
+                                              1,
+                                              DXGI_FORMAT_UNKNOWN,
+                                              {1, 0},
+                                              D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                              D3D12_RESOURCE_FLAG_NONE};
+        void *mapped = nullptr;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                   IID_PPV_ARGS(&turn.staging))) ||
+            FAILED(turn.staging->Map(0, nullptr, &mapped))) {
+            if (turn.staging)
+                turn.staging->Release();
+            turn.staging = nullptr;
+            turn.size = 0;
+            // closed, and reset when its turn comes again
+            turn.list->Close();
+            queue->Signal(uploader.fence, ++uploader.value);
+            turn.value = uploader.value;
+            return give_up();
+        }
+        turn.mapped = static_cast<std::uint8_t *>(mapped);
     }
     std::string what; // of each texture, should the host turn the list down
+    UINT64 offset = 0;
     for (auto &upload : uploads) {
         const auto desc = upload.resource->GetDesc();
         // texels in a format of the console's own whose stand-in has another layout are
         // converted; where there is no way to, the host's texture keeps what it has
-        if (upload.format != desc.Format && !convert_row(upload.format, nullptr, nullptr, 0)) {
+        if (!convertible(upload, desc)) {
             upload.resource->Release();
             continue;
         }
         const auto count = static_cast<UINT>(upload.subresources.size());
+        back_texture(queue, device, upload.resource);
         what += " [dimension " + std::to_string(desc.Dimension) + " " + std::to_string(desc.Width) +
                 "x" + std::to_string(desc.Height) + "x" + std::to_string(desc.DepthOrArraySize) +
                 " mips " + std::to_string(desc.MipLevels) + " format " +
@@ -7145,25 +7330,12 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
         std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(count);
         std::vector<UINT> rows(count);
         UINT64 bytes = 0;
-        device->GetCopyableFootprints(&desc, 0, count, 0, footprints.data(), rows.data(), nullptr,
-                                      &bytes);
-        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD};
-        const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER,
-                                              0,
-                                              bytes,
-                                              1,
-                                              1,
-                                              1,
-                                              DXGI_FORMAT_UNKNOWN,
-                                              {1, 0},
-                                              D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                                              D3D12_RESOURCE_FLAG_NONE};
-        ID3D12Resource *buffer = nullptr;
-        void *mapped = nullptr;
-        if (SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
-                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                      IID_PPV_ARGS(&buffer))) &&
-            SUCCEEDED(buffer->Map(0, nullptr, &mapped))) {
+        device->GetCopyableFootprints(&desc, 0, count, offset, footprints.data(), rows.data(),
+                                      nullptr, &bytes);
+        offset += aligned(bytes);
+        auto *const buffer = turn.staging;
+        auto *const mapped = turn.mapped;
+        {
             for (UINT i = 0; i < count; ++i) {
                 const auto &source = upload.subresources[i];
                 const auto pitch = upload.pitches[i];
@@ -7174,8 +7346,7 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
                          line < rows[i] &&
                          slice * plane + std::size_t{line + 1} * pitch <= source.size();
                          ++line) {
-                        auto *const to = static_cast<std::uint8_t *>(mapped) +
-                                         footprints[i].Offset +
+                        auto *const to = mapped + footprints[i].Offset +
                                          (std::size_t{slice} * rows[i] + line) *
                                              footprints[i].Footprint.RowPitch;
                         const auto *const from = reinterpret_cast<const std::uint8_t *>(
@@ -7186,12 +7357,11 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
                             std::memcpy(to, from, pitch);
                     }
             }
-            buffer->Unmap(0, nullptr);
             D3D12_RESOURCE_BARRIER barrier{};
             barrier.Transition = {upload.resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                   D3D12_RESOURCE_STATE_COPY_DEST};
-            uploader.list->ResourceBarrier(1, &barrier);
+            turn.list->ResourceBarrier(1, &barrier);
             for (UINT i = 0; i < count; ++i) {
                 const D3D12_TEXTURE_COPY_LOCATION target{upload.resource,
                                                          D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -7199,21 +7369,16 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
                 const D3D12_TEXTURE_COPY_LOCATION source{buffer,
                                                          D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                                                          {.PlacedFootprint = footprints[i]}};
-                uploader.list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+                turn.list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
             }
             std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-            uploader.list->ResourceBarrier(1, &barrier);
-            // the texture as well: the title may let go of it before the GPU copies into it
-            uploader.buffers.push_back(buffer);
-            uploader.buffers.push_back(upload.resource);
-            continue;
+            turn.list->ResourceBarrier(1, &barrier);
+            // the title may let go of the texture before the GPU copies into it
+            turn.textures.push_back(upload.resource);
         }
-        if (buffer)
-            buffer->Release();
-        upload.resource->Release();
     }
     // a list the host turned down is not executed: the host drops the device for that
-    if (const auto closed = uploader.list->Close(); FAILED(closed)) {
+    if (const auto closed = turn.list->Close(); FAILED(closed)) {
         std::fprintf(stderr,
                      "[Runtime] the upload of %zu textures the title wrote is turned down "
                      "(0x%08lx) and what it wrote is lost:%s%c",
@@ -7221,7 +7386,7 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
         report_messages();
     } else {
         const bool had = SUCCEEDED(device->GetDeviceRemovedReason());
-        ID3D12CommandList *const lists[] = {uploader.list};
+        ID3D12CommandList *const lists[] = {turn.list};
         queue->ExecuteCommandLists(1, lists);
         if (const auto reason = device->GetDeviceRemovedReason(); had && FAILED(reason)) {
             std::fprintf(stderr,
@@ -7232,6 +7397,7 @@ void upload_placements_d3d12(ID3D12CommandQueue *queue) {
         }
     }
     queue->Signal(uploader.fence, ++uploader.value);
+    turn.value = uploader.value;
     device->Release();
 }
 // The order of the queues' work for the console's waits on memory (wait_memory). Each queue

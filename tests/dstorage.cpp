@@ -78,7 +78,8 @@ struct ErrorRecord {
     std::uint8_t rest[1024];
 };
 
-// a queue of requests from memory, which runs what it is given when it is submitted
+// a queue of requests from memory, which runs what it is given once it is submitted, on a
+// thread of its own
 class MemoryQueue {
   public:
     MemoryQueue() {
@@ -90,11 +91,17 @@ class MemoryQueue {
         static_cast<IUnknown *>(queue_)->Release();
         static_cast<IUnknown *>(factory_)->Release();
     }
-    // EnqueueRequest (slot 3) and Submit (slot 6); the failures since the last time, and the
-    // first of them (RetrieveErrorRecord, slot 10)
+    // EnqueueRequest (slot 3), an event after it (EnqueueSetEvent, slot 12) and Submit (slot
+    // 6), waited for; the failures since the last time, and the first of them
+    // (RetrieveErrorRecord, slot 10)
     ErrorRecord run(const Request &request) {
+        auto *const done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        REQUIRE(done);
         call_void(queue_, 3, &request);
+        call_void(queue_, 12, done);
         call_void(queue_, 6);
+        CHECK(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
+        CloseHandle(done);
         ErrorRecord record{};
         call_void(queue_, 10, &record);
         return record;

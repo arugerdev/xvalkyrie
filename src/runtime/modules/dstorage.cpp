@@ -8,14 +8,18 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <execution>
 #include <initializer_list>
 #include <intrin.h>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 #include <windows.h>
@@ -26,7 +30,7 @@
 // DirectStorage as the Series console has it (dstorage_xs.dll, and XCRDAPI.dll for the
 // factory): queues of read requests, with marks in between that set a status or signal a
 // fence once everything before them is done. Here a queue does its work when it is
-// submitted, on the thread that submits it, in order. Reads may be inflated (zlib), then
+// submitted, on a thread of its own, in order. Reads may be inflated (zlib), then
 // unpacked (the console's texture compression, BCPack). Sources and destinations may be the
 // title's memory or its physical pages.
 namespace xv::runtime::modules {
@@ -306,7 +310,7 @@ HRESULT read(const Request &request) {
     // a file read straight to the title's memory, when nothing comes in between
     if (!decompress && options.source_type != source_memory &&
         !options.destination_is_physical_pages) {
-        prepare_title_write(request.destination, request.source_size);
+        const TitleWrite writing(request.destination, request.source_size);
         return read_file(request, request.destination);
     }
     std::vector<std::uint8_t> packed;
@@ -349,7 +353,16 @@ class Queue final : public Object<QueueInterface> {
           error_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
         desc_.name = name_.c_str();
     }
-    ~Queue() override { CloseHandle(error_); }
+    ~Queue() override {
+        {
+            const std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+        CloseHandle(error_);
+    }
     void EnqueueRequest(const Request *request) override {
         if (!request)
             return;
@@ -392,88 +405,41 @@ class Queue final : public Object<QueueInterface> {
         }
         submit_when_full();
     }
+    // As on the console, the submitting thread goes on at once: a title submits from threads
+    // that have more to do, and one may watch that they do (a title stops itself when one of
+    // them has not got on for a while). The queue's thread does the submissions in order.
     void Submit() override {
-        std::vector<Entry> work;
         {
             const std::lock_guard lock(mutex_);
-            work.swap(pending_);
+            if (pending_.empty())
+                return;
+            submitted_.push_back(std::move(pending_));
+            pending_.clear();
+            if (!worker_.joinable())
+                worker_ = std::thread([this] { work(); });
         }
-        // one submission at a time, so that marks follow the requests before them
-        const std::lock_guard running(running_);
-        HRESULT since_mark = S_OK;
-        // XV_DS_TIME: when each submission starts, how much it reads and how long it takes
-        const bool timed = std::getenv("XV_DS_TIME");
-        const auto started = GetTickCount64();
-        std::uint64_t requests = 0, packed = 0, plain = 0, first_offset = 0;
-        struct Timed {
-            bool on;
-            const char *name;
-            ULONGLONG started;
-            std::uint64_t &requests, &packed, &plain, &first_offset;
-            std::size_t entries;
-            ~Timed() {
-                if (!on || !entries)
-                    return;
-                std::fprintf(stderr,
-                             "[Time] at %llu ms thread %lu DirectStorage submit on %s: %zu "
-                             "entries, %llu requests from offset %llu, %llu -> %llu bytes, %llu "
-                             "ms\n",
-                             started, GetCurrentThreadId(), name, entries, requests, first_offset,
-                             packed, plain, GetTickCount64() - started);
-                std::fflush(stderr);
-            }
-        } const report{timed,  name_.c_str(), started,      requests,
-                       packed, plain,         first_offset, work.size()};
-        for (auto &entry : work) {
-            if (auto *const request = std::get_if<Request>(&entry)) {
-                if (!requests++)
-                    first_offset = request->file_offset;
-                packed += request->source_size;
-                plain += request->destination_size;
-                const auto result = read(*request);
-                // XV_FILE_TRACE: the first requests, and every one that fails
-                if (static std::atomic<int> shown{0};
-                    std::getenv("XV_FILE_TRACE") && (FAILED(result) || shown < 24) && shown++ < 200)
-                    std::fprintf(stderr,
-                                 "[Runtime] DirectStorage request: options 0x%llx, %u bytes at "
-                                 "%llu to %u bytes (intermediate %u): 0x%08lx\n",
-                                 std::bit_cast<UINT64>(request->options), request->source_size,
-                                 request->file_offset, request->destination_size,
-                                 request->intermediate_size, static_cast<unsigned long>(result));
-                if (auto *const file = file_of(*request))
-                    file->Release();
-                if (FAILED(result)) {
-                    if (SUCCEEDED(since_mark))
-                        since_mark = result;
-                    const std::lock_guard lock(mutex_);
-                    if (!failures_++)
-                        first_failure_ = result;
-                    SetEvent(error_);
-                }
-            } else if (auto *const mark = std::get_if<Mark>(&entry)) {
-                mark->status->set(mark->index, since_mark);
-                mark->status->Release();
-                since_mark = S_OK;
-            } else if (auto *const signal = std::get_if<Signal>(&entry)) {
-                signal->fence->Signal(signal->value);
-                signal->fence->Release();
-            } else if (auto *const event = std::get_if<Event>(&entry)) {
-                SetEvent(event->handle);
-            }
-        }
+        ready_.notify_one();
     }
     void CancelRequestsWithTag(UINT64 mask, UINT64 value) override {
-        const std::lock_guard lock(mutex_);
-        std::erase_if(pending_, [&](Entry &entry) {
+        const auto cancelled = [&](Entry &entry) {
             auto *const request = std::get_if<Request>(&entry);
             if (!request || (request->tag & mask) != value)
                 return false;
             if (auto *const file = file_of(*request))
                 file->Release();
             return true;
-        });
+        };
+        const std::lock_guard lock(mutex_);
+        std::erase_if(pending_, cancelled);
+        for (auto &work : submitted_)
+            std::erase_if(work, cancelled);
     }
-    void Close() override { Submit(); }
+    // what was enqueued is done before the queue is
+    void Close() override {
+        Submit();
+        std::unique_lock lock(mutex_);
+        idle_.wait(lock, [&] { return submitted_.empty() && !busy_; });
+    }
     HANDLE GetErrorEvent() override { return error_; }
     void RetrieveErrorRecord(ErrorRecord *record) override {
         if (!record)
@@ -516,6 +482,100 @@ class Queue final : public Object<QueueInterface> {
         HANDLE handle;
     };
     using Entry = std::variant<Request, Mark, Signal, Event>;
+    void work() {
+        for (;;) {
+            std::vector<Entry> entries;
+            {
+                std::unique_lock lock(mutex_);
+                ready_.wait(lock, [&] { return stopping_ || !submitted_.empty(); });
+                if (submitted_.empty())
+                    return; // stopping, with nothing left to do
+                entries = std::move(submitted_.front());
+                submitted_.pop_front();
+                busy_ = true;
+            }
+            run(entries);
+            {
+                const std::lock_guard lock(mutex_);
+                busy_ = false;
+            }
+            idle_.notify_all();
+        }
+    }
+    // The requests up to each mark are read at once, the marks after them in order.
+    void run(std::vector<Entry> &entries) {
+        // XV_DS_TIME: when each submission starts, how much it reads and how long it takes
+        const auto started = GetTickCount64();
+        std::uint64_t requests = 0, packed = 0, plain = 0, first_offset = 0;
+        for (const auto &entry : entries)
+            if (const auto *const request = std::get_if<Request>(&entry)) {
+                if (!requests++)
+                    first_offset = request->file_offset;
+                packed += request->source_size;
+                plain += request->destination_size;
+            }
+        HRESULT since_mark = S_OK;
+        for (std::size_t at = 0; at < entries.size();) {
+            auto end = at;
+            while (end < entries.size() && std::holds_alternative<Request>(entries[end]))
+                ++end;
+            if (end > at) {
+                std::mutex failing;
+                std::for_each(std::execution::par, entries.begin() + at, entries.begin() + end,
+                              [&](Entry &entry) {
+                                  const auto result = finish(std::get<Request>(entry));
+                                  if (SUCCEEDED(result))
+                                      return;
+                                  const std::lock_guard lock(failing);
+                                  if (SUCCEEDED(since_mark))
+                                      since_mark = result;
+                              });
+                at = end;
+                continue;
+            }
+            auto &entry = entries[at++];
+            if (auto *const mark = std::get_if<Mark>(&entry)) {
+                mark->status->set(mark->index, since_mark);
+                mark->status->Release();
+                since_mark = S_OK;
+            } else if (auto *const signal = std::get_if<Signal>(&entry)) {
+                signal->fence->Signal(signal->value);
+                signal->fence->Release();
+            } else if (auto *const event = std::get_if<Event>(&entry)) {
+                SetEvent(event->handle);
+            }
+        }
+        if (std::getenv("XV_DS_TIME")) {
+            std::fprintf(stderr,
+                         "[Time] at %llu ms DirectStorage submit on %s: %zu entries, %llu requests "
+                         "from offset %llu, %llu -> %llu bytes, %llu ms\n",
+                         started, name_.c_str(), entries.size(), requests, first_offset, packed,
+                         plain, GetTickCount64() - started);
+            std::fflush(stderr);
+        }
+    }
+    // a request read, its file let go of and a failure kept for the error record
+    HRESULT finish(const Request &request) {
+        const auto result = read(request);
+        // XV_FILE_TRACE: the first requests, and every one that fails
+        if (static std::atomic<int> shown{0};
+            std::getenv("XV_FILE_TRACE") && (FAILED(result) || shown < 24) && shown++ < 200)
+            std::fprintf(stderr,
+                         "[Runtime] DirectStorage request: options 0x%llx, %u bytes at %llu to %u "
+                         "bytes (intermediate %u): 0x%08lx\n",
+                         std::bit_cast<UINT64>(request.options), request.source_size,
+                         request.file_offset, request.destination_size, request.intermediate_size,
+                         static_cast<unsigned long>(result));
+        if (auto *const file = file_of(request))
+            file->Release();
+        if (FAILED(result)) {
+            const std::lock_guard lock(mutex_);
+            if (!failures_++)
+                first_failure_ = result;
+            SetEvent(error_);
+        }
+        return result;
+    }
     // a queue submits itself when half of it is taken, unless it was made not to
     void submit_when_full() {
         if (desc_.options & 1)
@@ -531,8 +591,12 @@ class Queue final : public Object<QueueInterface> {
     QueueDesc1 desc_;
     std::string name_;
     HANDLE error_;
-    std::mutex mutex_, running_;
+    std::mutex mutex_;
+    std::condition_variable ready_, idle_;
     std::vector<Entry> pending_;
+    std::deque<std::vector<Entry>> submitted_; // for the queue's thread, in order
+    bool busy_ = false, stopping_ = false;
+    std::thread worker_;
     UINT32 failures_ = 0;
     HRESULT first_failure_ = S_OK;
 };

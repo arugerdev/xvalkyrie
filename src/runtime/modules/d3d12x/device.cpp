@@ -4598,6 +4598,9 @@ struct ListProxy {
     UINT vertex_calls = 0;
     bool legacy_barriers = false; // Barrier as on a host without enhanced barriers
     bool waits_memory = false;    // it has a Wait32BitValueX or Wait64BitValueX
+    // the host's driver faulted on what it was given: the list is not executed, as the host
+    // drops the device for it
+    bool broken = false;
     // what it does to memory by address, in order, done when a queue is given it (when_run)
     std::vector<std::function<void()>> on_memory;
     RootArgument &argument(UINT parameter, bool compute = false) {
@@ -5432,6 +5435,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->ours_bound = false;
     list->compute_ours_bound = false;
     list->waits_memory = false;
+    list->broken = false;
     list->on_memory.clear();
     const auto result = host_of(self)->Reset(allocator, state);
     if (static std::atomic<int> shown{0};
@@ -5975,13 +5979,32 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 // A quad list is drawn with indices of ours over the title's vertices. A rectangle list
 // gives three corners of each rectangle and the GPU makes the fourth: here the pipeline's
 // geometry shader does (see rectangle_pipeline).
+// The host's driver faults on the pipelines a library of the console's that builds ray
+// tracing structures makes; the list is left unexecuted then (ListProxy::broken).
+bool host_set_pipeline(ID3D12GraphicsCommandList *list, ID3D12PipelineState *state) {
+    __try {
+        list->SetPipelineState(state);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *state) {
     auto *const list = static_cast<ListProxy *>(self);
     list->no_pipeline = state && !(state = list_pipeline(state));
     list->pipeline = state;
     list->heap_uses = state ? heap_uses(state) : nullptr;
-    if (state)
-        list->host->SetPipelineState(state);
+    if (state && !host_set_pipeline(list->host, state)) {
+        if (static std::atomic<bool> told{false}; !told.exchange(true)) {
+            std::fprintf(stderr,
+                         "[Runtime] the host's driver faults on a pipeline set from %s: its list "
+                         "is not executed\n",
+                         detail::guest_location(_ReturnAddress()).c_str());
+            std::fflush(stderr);
+        }
+        list->no_pipeline = true;
+        list->broken = true;
+    }
 }
 // XV_D3D_LOST: what the first draws are made with
 void lost_draw(void *self, const char *method, UINT count) {
@@ -7542,7 +7565,16 @@ void STDMETHODCALLTYPE execute_command_lists(ID3D12CommandQueue *self, UINT coun
         for (const auto &work : static_cast<ListProxy *>(static_cast<void *>(lists[i]))->on_memory)
             work();
     }
-    self->ExecuteCommandLists(count, host.data());
+    {
+        const std::lock_guard lock(proxy_mutex);
+        for (UINT i = 0; i < count; ++i)
+            if (list_proxies.contains(lists[i]) &&
+                static_cast<ListProxy *>(static_cast<void *>(lists[i]))->broken)
+                host[i] = nullptr;
+        std::erase(host, nullptr);
+    }
+    if (!host.empty())
+        self->ExecuteCommandLists(static_cast<UINT>(host.size()), host.data());
     order_after(self);
     // the submission the host drops the device at
     if (static std::atomic<bool> told{false}; !told.load())

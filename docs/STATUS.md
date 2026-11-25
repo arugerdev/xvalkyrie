@@ -17,22 +17,31 @@ everything else.
 |---|---|---|---|
 | `acphal.dll` | 10 | 0 |  |
 | `advapi32.dll` | 0 | 0 | advapi32.dll |
+| `api-ms-win-core-com-l1-1-0.dll` | 0 | 0 | combase.dll |
+| `api-ms-win-core-com-l1-1-1.dll` | 0 | 0 | combase.dll |
+| `api-ms-win-core-winrt-error-l1-1-0.dll` | 0 | 0 | combase.dll |
+| `api-ms-win-core-winrt-error-l1-1-1.dll` | 0 | 0 | combase.dll |
+| `api-ms-win-core-winrt-l1-1-0.dll` | 0 | 0 | combase.dll |
+| `api-ms-win-core-winrt-string-l1-1-0.dll` | 0 | 0 | combase.dll |
 | `bcrypt.dll` | 0 | 0 | bcrypt.dll |
-| `chad.dll` | 5 | 0 |  |
+| `chad.dll` | 6 | 0 |  |
 | `combase.dll` | 2 | 0 | combase.dll |
 | `crypt32.dll` | 0 | 0 | crypt32.dll |
+| `d3d11.dll` | 10 | 52 |  |
 | `d3d11_x.dll` | 10 | 52 |  |
 | `d3d12_x.dll` | 21 | 32 |  |
+| `d3dcompiler_46.dll` | 0 | 0 | d3dcompiler_47.dll |
 | `d3dcompiler_47.dll` | 0 | 0 | d3dcompiler_47.dll |
 | `dxcompiler_x.dll` | 1 | 0 |  |
 | `etwplus.dll` | 4 | 0 |  |
 | `gameinput.dll` | 2 | 0 |  |
-| `kernelx.dll` | 97 | 0 | kernel32.dll |
-| `mfplat.dll` | 5 | 0 | mfplat.dll |
+| `kernelx.dll` | 102 | 0 | kernel32.dll |
+| `mfplat.dll` | 6 | 0 | mfplat.dll |
 | `mmdevapi.dll` | 6 | 0 | mmdevapi.dll |
 | `msvcp_win.dll` | 0 | 0 | msvcp_win.dll |
+| `oleaut32.dll` | 0 | 0 | oleaut32.dll |
 | `pixevt.dll` | 15 | 0 |  |
-| `toolhelpx.dll` | 4 | 0 | kernel32.dll |
+| `toolhelpx.dll` | 7 | 0 | kernel32.dll |
 | `vccorlib110.dll` | 1 | 0 |  |
 | `vccorlib140.dll` | 1 | 0 |  |
 | `windows.media.mediacontrol.dll` | 1 | 0 |  |
@@ -41,13 +50,13 @@ everything else.
 | `xapu.dll` | 6 | 0 |  |
 | `xaudio2_9.dll` | 14 | 0 |  |
 | `xfrontpaneldisplay.dll` | 8 | 0 |  |
-| `xg_x.dll` | 5 | 0 |  |
+| `xg_x.dll` | 7 | 0 |  |
 | `xgameruntime.dll` | 6 | 0 |  |
-| `xmem.dll` | 18 | 0 |  |
+| `xmem.dll` | 21 | 0 |  |
 
-83 functions of the host's API are answered the console's way, whichever API set a title imports them from:
+88 functions of the host's API are answered the console's way, whichever API set a title imports them from:
 
-`CoCreateInstance`, `CreateDirectoryW`, `CreateFile2`, `CreateFileA`, `CreateFileW`, `CreateWindowExA`, `CreateWindowExW`, `DeleteFileW`, `FindFirstFileA`, `FindFirstFileExA`, `FindFirstFileExW`, `FindFirstFileW`, `FreeLibrary`, `GetCurrentProcessorNumber`, `GetDiskFreeSpaceExW`, `GetDiskFreeSpaceW`, `GetFileAttributesA`, `GetFileAttributesExA`, `GetFileAttributesExW`, `GetFileAttributesW`, `GetLocaleInfoA`, `GetLocaleInfoEx`, `GetLocaleInfoW`, `GetProcAddress`, `GetProcessPreferredUILanguages`, `GetSystemDefaultLCID`, `GetSystemDefaultLangID`, `GetSystemDefaultLocaleName`, `GetSystemDefaultUILanguage`, `GetSystemInfo`, `GetSystemPreferredUILanguages`, `GetThreadLocale`, `GetThreadPreferredUILanguages`, `GetThreadUILanguage`, `GetUserDefaultGeoName`, `GetUserDefaultLCID`, `GetUserDefaultLangID`, `GetUserDefaultLocaleName`, `GetUserDefaultUILanguage`, `GetUserGeoID`, `GetUserPreferredUILanguages`, `LoadLibraryA`, `LoadLibraryExA`, `LoadLibraryExW`, `LoadLibraryW`, `LoadPackagedLibrary`, `MoveFileExW`, `OutputDebugStringA`, `OutputDebugStringW`, `ReadFile`, `ReadFileEx`, `RegCloseKey`, `RegOpenKeyExW`, `RegOpenKeyW`, `RegQueryValueExW`, `RegisterClassA`, `RegisterClassExA`, `RegisterClassExW`, `RegisterClassW`, `RemoveDirectoryW`, `SetFileAttributesW`, `SetThreadAffinityMask`, `SetThreadpoolAffinityMask`, `ShowWindow`, `VirtualAlloc`, `VirtualAllocEx`, `VirtualFree`, `VirtualFreeEx`, `VirtualProtect`, `__C_specific_handler`, `_fsopen`, `_stat64i32`, `_wfopen`, `_wfopen_s`, `_wfsopen`, `_wmkdir`, `_wremove`, `_wrename`, `_wrmdir`, `_wstat64`, `fopen`, `fopen_s`, `remove`
+`CoCreateInstance`, `CreateDirectoryA`, `CreateDirectoryW`, `CreateFile2`, `CreateFileA`, `CreateFileW`, `CreateWindowExA`, `CreateWindowExW`, `DeleteFileA`, `DeleteFileW`, `FindFirstFileA`, `FindFirstFileExA`, `FindFirstFileExW`, `FindFirstFileW`, `FreeLibrary`, `GetCurrentProcessorNumber`, `GetDiskFreeSpaceExW`, `GetDiskFreeSpaceW`, `GetFileAttributesA`, `GetFileAttributesExA`, `GetFileAttributesExW`, `GetFileAttributesW`, `GetLocaleInfoA`, `GetLocaleInfoEx`, `GetLocaleInfoW`, `GetProcAddress`, `GetProcessPreferredUILanguages`, `GetSystemDefaultLCID`, `GetSystemDefaultLangID`, `GetSystemDefaultLocaleName`, `GetSystemDefaultUILanguage`, `GetSystemInfo`, `GetSystemPreferredUILanguages`, `GetThreadLocale`, `GetThreadPreferredUILanguages`, `GetThreadUILanguage`, `GetUserDefaultGeoName`, `GetUserDefaultLCID`, `GetUserDefaultLangID`, `GetUserDefaultLocaleName`, `GetUserDefaultUILanguage`, `GetUserGeoID`, `GetUserPreferredUILanguages`, `LoadLibraryA`, `LoadLibraryExA`, `LoadLibraryExW`, `LoadLibraryW`, `LoadPackagedLibrary`, `MoveFileExA`, `MoveFileExW`, `OutputDebugStringA`, `OutputDebugStringW`, `ReadFile`, `ReadFileEx`, `RegCloseKey`, `RegOpenKeyExW`, `RegOpenKeyW`, `RegQueryValueExW`, `RegisterClassA`, `RegisterClassExA`, `RegisterClassExW`, `RegisterClassW`, `RemoveDirectoryA`, `RemoveDirectoryW`, `SetFileAttributesA`, `SetFileAttributesW`, `SetThreadAffinityMask`, `SetThreadpoolAffinityMask`, `ShowWindow`, `VirtualAlloc`, `VirtualAllocEx`, `VirtualFree`, `VirtualFreeEx`, `VirtualProtect`, `__C_specific_handler`, `_fsopen`, `_stat64i32`, `_wfopen`, `_wfopen_s`, `_wfsopen`, `_wmkdir`, `_wremove`, `_wrename`, `_wrmdir`, `_wstat64`, `fopen`, `fopen_s`, `remove`
 
 <details><summary><code>acphal.dll</code>: 10 functions</summary>
 
@@ -55,15 +64,21 @@ everything else.
 
 </details>
 
-<details><summary><code>chad.dll</code>: 5 functions</summary>
+<details><summary><code>chad.dll</code>: 6 functions</summary>
 
-`XDspActivate`, `XDspConnect`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`
+`XDspActivate`, `XDspConnect`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`
 
 </details>
 
 <details><summary><code>combase.dll</code>: 2 functions</summary>
 
 `RoActivateInstance`, `RoGetActivationFactory`
+
+</details>
+
+<details><summary><code>d3d11.dll</code>: 10 functions</summary>
+
+`D3D11CreateDevice`, `D3D11XCreateDeviceX`, `D3D11XCreateDeviceXAndSwapChain1`, `D3DAllocateGraphicsMemory`, `D3DFreeGraphicsMemory`, `D3DMapEsramMemory`, `DXGIXGetFrameStatistics`, `DXGIXPresentArray`, `DXGIXSetFrameNotification`, `DXGIXSetVLineNotification`
 
 </details>
 
@@ -97,15 +112,15 @@ everything else.
 
 </details>
 
-<details><summary><code>kernelx.dll</code>: 97 functions</summary>
+<details><summary><code>kernelx.dll</code>: 102 functions</summary>
 
-`AllocateTitlePhysicalPages`, `CreateDirectoryW`, `CreateFile2`, `CreateFileA`, `CreateFileW`, `DeleteFileW`, `EventActivityIdControl`, `EventEnabled`, `EventProviderEnabled`, `EventRegister`, `EventSetInformation`, `EventUnregister`, `EventWrite`, `EventWriteEx`, `EventWriteString`, `EventWriteTransfer`, `FindFirstFileA`, `FindFirstFileExA`, `FindFirstFileExW`, `FindFirstFileW`, `FreeLibrary`, `FreeTitlePhysicalPages`, `GetConsoleType`, `GetCurrentProcessorNumber`, `GetDiskFreeSpaceExW`, `GetDiskFreeSpaceW`, `GetFileAttributesA`, `GetFileAttributesExA`, `GetFileAttributesExW`, `GetFileAttributesW`, `GetProcAddress`, `GetSystemInfo`, `GetSystemOSVersion`, `GetThreadName`, `GetTraceEnableFlags`, `GetTraceEnableLevel`, `GetTraceLoggerHandle`, `JobTitleMemoryStatus`, `LoadLibraryA`, `LoadLibraryExA`, `LoadLibraryExW`, `LoadLibraryW`, `LoadPackagedLibrary`, `MapTitlePhysicalPages`, `MoveFileExW`, `OutputDebugStringA`, `OutputDebugStringW`, `QueryProcessorSchedulingStatistics`, `ReadFile`, `ReadFileEx`, `RegisterTraceGuidsA`, `RegisterTraceGuidsW`, `RemoveDirectoryW`, `SetFileAttributesW`, `SetThreadAffinityMask`, `SetThreadName`, `SetThreadpoolAffinityMask`, `TitleMemoryStatus`, `ToolingMemoryStatus`, `TraceEvent`, `TraceEventInstance`, `TraceMessage`, `TraceMessageVa`, `UnregisterTraceGuids`, `VirtualAlloc`, `VirtualAllocEx`, `VirtualFree`, `VirtualFreeEx`, `VirtualProtect`, `WaitOnAddress`, `WakeByAddressAll`, `WakeByAddressSingle`, `XMemAlloc`, `XMemAllocDefault`, `XMemCheckDefaultHeaps`, `XMemFree`, `XMemFreeDefault`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetAuxiliaryTitleMemory`, `XMemPreallocateFreeSpace`, `XMemReleaseAuxiliaryTitleMemory`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `_fsopen`, `_stat64i32`, `_wfopen`, `_wfopen_s`, `_wfsopen`, `_wmkdir`, `_wremove`, `_wrename`, `_wrmdir`, `_wstat64`, `fopen`, `fopen_s`, `remove`
+`AllocateTitlePhysicalPages`, `CreateDirectoryA`, `CreateDirectoryW`, `CreateFile2`, `CreateFileA`, `CreateFileW`, `DeleteFileA`, `DeleteFileW`, `EventActivityIdControl`, `EventEnabled`, `EventProviderEnabled`, `EventRegister`, `EventSetInformation`, `EventUnregister`, `EventWrite`, `EventWriteEx`, `EventWriteString`, `EventWriteTransfer`, `FindFirstFileA`, `FindFirstFileExA`, `FindFirstFileExW`, `FindFirstFileW`, `FreeLibrary`, `FreeTitlePhysicalPages`, `GetConsoleType`, `GetCurrentProcessorNumber`, `GetDiskFreeSpaceExW`, `GetDiskFreeSpaceW`, `GetFileAttributesA`, `GetFileAttributesExA`, `GetFileAttributesExW`, `GetFileAttributesW`, `GetProcAddress`, `GetSystemInfo`, `GetSystemOSVersion`, `GetThreadName`, `GetTraceEnableFlags`, `GetTraceEnableLevel`, `GetTraceLoggerHandle`, `JobTitleMemoryStatus`, `LoadLibraryA`, `LoadLibraryExA`, `LoadLibraryExW`, `LoadLibraryW`, `LoadPackagedLibrary`, `MapTitlePhysicalPages`, `MoveFileExA`, `MoveFileExW`, `OutputDebugStringA`, `OutputDebugStringW`, `QueryProcessorSchedulingStatistics`, `ReadFile`, `ReadFileEx`, `RegisterTraceGuidsA`, `RegisterTraceGuidsW`, `RemoveDirectoryA`, `RemoveDirectoryW`, `SetFileAttributesA`, `SetFileAttributesW`, `SetThreadAffinityMask`, `SetThreadName`, `SetThreadpoolAffinityMask`, `TitleMemoryStatus`, `ToolingMemoryStatus`, `TraceEvent`, `TraceEventInstance`, `TraceMessage`, `TraceMessageVa`, `UnregisterTraceGuids`, `VirtualAlloc`, `VirtualAllocEx`, `VirtualFree`, `VirtualFreeEx`, `VirtualProtect`, `WaitOnAddress`, `WakeByAddressAll`, `WakeByAddressSingle`, `XMemAlloc`, `XMemAllocDefault`, `XMemCheckDefaultHeaps`, `XMemFree`, `XMemFreeDefault`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetAuxiliaryTitleMemory`, `XMemPreallocateFreeSpace`, `XMemReleaseAuxiliaryTitleMemory`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `_fsopen`, `_stat64i32`, `_wfopen`, `_wfopen_s`, `_wfsopen`, `_wmkdir`, `_wremove`, `_wrename`, `_wrmdir`, `_wstat64`, `fopen`, `fopen_s`, `remove`
 
 </details>
 
-<details><summary><code>mfplat.dll</code>: 5 functions</summary>
+<details><summary><code>mfplat.dll</code>: 6 functions</summary>
 
-`MFCreateDXGISurfaceBufferX`, `MFCreateDxvaSampleRendererX`, `MFCreateNV12ToRGB32ConverterX`, `MFCreateRGB32ToNV12ConverterX`, `MFResetDXGIDeviceManagerX`
+`MFCreateDXGIDeviceManager`, `MFCreateDXGISurfaceBufferX`, `MFCreateDxvaSampleRendererX`, `MFCreateNV12ToRGB32ConverterX`, `MFCreateRGB32ToNV12ConverterX`, `MFResetDXGIDeviceManagerX`
 
 </details>
 
@@ -121,9 +136,9 @@ everything else.
 
 </details>
 
-<details><summary><code>toolhelpx.dll</code>: 4 functions</summary>
+<details><summary><code>toolhelpx.dll</code>: 7 functions</summary>
 
-`GetSourceLineFromAddress`, `GetSymbolFromAddress`, `MiniDumpWriteDump`, `QuerySystemHardwareInfo`
+`GetSourceLineFromAddress`, `GetSymbolFromAddress`, `K32EnumProcessModules`, `K32GetModuleBaseNameA`, `K32GetModuleInformation`, `MiniDumpWriteDump`, `QuerySystemHardwareInfo`
 
 </details>
 
@@ -163,9 +178,9 @@ everything else.
 
 </details>
 
-<details><summary><code>xg_x.dll</code>: 5 functions</summary>
+<details><summary><code>xg_x.dll</code>: 7 functions</summary>
 
-`XGComputeOptimalDepthStencilTileModes`, `XGComputeOptimalTileMode`, `XGComputeTexture2DLayout`, `XGCreateTexture2DComputer`, `XGCreateTextureComputer`
+`XGComputeOptimalDepthStencilTileModes`, `XGComputeOptimalTileMode`, `XGComputeTexture2DLayout`, `XGComputeTexture3DLayout`, `XGCreateTexture2DComputer`, `XGCreateTextureComputer`, `XGSuggestSwizzleMode`
 
 </details>
 
@@ -175,9 +190,9 @@ everything else.
 
 </details>
 
-<details><summary><code>xmem.dll</code>: 18 functions</summary>
+<details><summary><code>xmem.dll</code>: 21 functions</summary>
 
-`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemTransferMemory`, `XMemVirtualAlloc`
+`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemSetOption`, `XMemTransferMemory`, `XMemVirtualAlloc`, `XMemVirtualQuery`
 
 </details>
 
@@ -188,7 +203,7 @@ everything else.
 | `acphal.dll` | 10 | 0 |  |
 | `advapi32.dll` | 0 | 0 | advapi32.dll |
 | `bcrypt.dll` | 0 | 0 | bcrypt.dll |
-| `chad.dll` | 5 | 0 |  |
+| `chad.dll` | 6 | 0 |  |
 | `crypt32.dll` | 0 | 0 | crypt32.dll |
 | `d3d12_xs.dll` | 14 | 32 |  |
 | `dstorage_xs.dll` | 1 | 0 |  |
@@ -203,13 +218,13 @@ everything else.
 | `xaudio2_9.dll` | 14 | 0 |  |
 | `xcrdapi.dll` | 1 | 0 |  |
 | `xfrontpaneldisplay.dll` | 8 | 0 |  |
-| `xg_xs.dll` | 5 | 0 |  |
+| `xg_xs.dll` | 7 | 0 |  |
 | `xgameruntime.dll` | 6 | 0 |  |
-| `xmem.dll` | 18 | 0 |  |
+| `xmem.dll` | 21 | 0 |  |
 
-84 functions of the host's API are answered the console's way, whichever API set a title imports them from:
+89 functions of the host's API are answered the console's way, whichever API set a title imports them from:
 
-`CoCreateInstance`, `CreateDirectoryW`, `CreateFile2`, `CreateFileA`, `CreateFileW`, `CreateWindowExA`, `CreateWindowExW`, `DeleteFileW`, `FindFirstFileA`, `FindFirstFileExA`, `FindFirstFileExW`, `FindFirstFileW`, `FreeLibrary`, `GetCurrentProcessorNumber`, `GetDiskFreeSpaceExW`, `GetDiskFreeSpaceW`, `GetFileAttributesA`, `GetFileAttributesExA`, `GetFileAttributesExW`, `GetFileAttributesW`, `GetLocaleInfoA`, `GetLocaleInfoEx`, `GetLocaleInfoW`, `GetProcAddress`, `GetProcessPreferredUILanguages`, `GetSystemDefaultLCID`, `GetSystemDefaultLangID`, `GetSystemDefaultLocaleName`, `GetSystemDefaultUILanguage`, `GetSystemInfo`, `GetSystemPreferredUILanguages`, `GetThreadLocale`, `GetThreadPreferredUILanguages`, `GetThreadUILanguage`, `GetUserDefaultGeoName`, `GetUserDefaultLCID`, `GetUserDefaultLangID`, `GetUserDefaultLocaleName`, `GetUserDefaultUILanguage`, `GetUserGeoID`, `GetUserPreferredUILanguages`, `LoadLibraryA`, `LoadLibraryExA`, `LoadLibraryExW`, `LoadLibraryW`, `LoadPackagedLibrary`, `MoveFileExW`, `OutputDebugStringA`, `OutputDebugStringW`, `ReadFile`, `ReadFileEx`, `RegCloseKey`, `RegOpenKeyExW`, `RegOpenKeyW`, `RegQueryValueExW`, `RegisterClassA`, `RegisterClassExA`, `RegisterClassExW`, `RegisterClassW`, `RemoveDirectoryW`, `RtlPcToFileHeader`, `SetFileAttributesW`, `SetThreadAffinityMask`, `SetThreadpoolAffinityMask`, `ShowWindow`, `VirtualAlloc`, `VirtualAllocEx`, `VirtualFree`, `VirtualFreeEx`, `VirtualProtect`, `__C_specific_handler`, `_fsopen`, `_stat64i32`, `_wfopen`, `_wfopen_s`, `_wfsopen`, `_wmkdir`, `_wremove`, `_wrename`, `_wrmdir`, `_wstat64`, `fopen`, `fopen_s`, `remove`
+`CoCreateInstance`, `CreateDirectoryA`, `CreateDirectoryW`, `CreateFile2`, `CreateFileA`, `CreateFileW`, `CreateWindowExA`, `CreateWindowExW`, `DeleteFileA`, `DeleteFileW`, `FindFirstFileA`, `FindFirstFileExA`, `FindFirstFileExW`, `FindFirstFileW`, `FreeLibrary`, `GetCurrentProcessorNumber`, `GetDiskFreeSpaceExW`, `GetDiskFreeSpaceW`, `GetFileAttributesA`, `GetFileAttributesExA`, `GetFileAttributesExW`, `GetFileAttributesW`, `GetLocaleInfoA`, `GetLocaleInfoEx`, `GetLocaleInfoW`, `GetProcAddress`, `GetProcessPreferredUILanguages`, `GetSystemDefaultLCID`, `GetSystemDefaultLangID`, `GetSystemDefaultLocaleName`, `GetSystemDefaultUILanguage`, `GetSystemInfo`, `GetSystemPreferredUILanguages`, `GetThreadLocale`, `GetThreadPreferredUILanguages`, `GetThreadUILanguage`, `GetUserDefaultGeoName`, `GetUserDefaultLCID`, `GetUserDefaultLangID`, `GetUserDefaultLocaleName`, `GetUserDefaultUILanguage`, `GetUserGeoID`, `GetUserPreferredUILanguages`, `LoadLibraryA`, `LoadLibraryExA`, `LoadLibraryExW`, `LoadLibraryW`, `LoadPackagedLibrary`, `MoveFileExA`, `MoveFileExW`, `OutputDebugStringA`, `OutputDebugStringW`, `ReadFile`, `ReadFileEx`, `RegCloseKey`, `RegOpenKeyExW`, `RegOpenKeyW`, `RegQueryValueExW`, `RegisterClassA`, `RegisterClassExA`, `RegisterClassExW`, `RegisterClassW`, `RemoveDirectoryA`, `RemoveDirectoryW`, `RtlPcToFileHeader`, `SetFileAttributesA`, `SetFileAttributesW`, `SetThreadAffinityMask`, `SetThreadpoolAffinityMask`, `ShowWindow`, `VirtualAlloc`, `VirtualAllocEx`, `VirtualFree`, `VirtualFreeEx`, `VirtualProtect`, `__C_specific_handler`, `_fsopen`, `_stat64i32`, `_wfopen`, `_wfopen_s`, `_wfsopen`, `_wmkdir`, `_wremove`, `_wrename`, `_wrmdir`, `_wstat64`, `fopen`, `fopen_s`, `remove`
 
 <details><summary><code>acphal.dll</code>: 10 functions</summary>
 
@@ -217,9 +232,9 @@ everything else.
 
 </details>
 
-<details><summary><code>chad.dll</code>: 5 functions</summary>
+<details><summary><code>chad.dll</code>: 6 functions</summary>
 
-`XDspActivate`, `XDspConnect`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`
+`XDspActivate`, `XDspConnect`, `XDspConnectWithMaximumStreamLimit`, `XDspDeactivate`, `XDspDisconnect`, `XDspSubmitCommand`
 
 </details>
 
@@ -283,9 +298,9 @@ everything else.
 
 </details>
 
-<details><summary><code>xg_xs.dll</code>: 5 functions</summary>
+<details><summary><code>xg_xs.dll</code>: 7 functions</summary>
 
-`XGComputeOptimalDepthStencilTileModes`, `XGComputeOptimalTileMode`, `XGComputeTexture2DLayout`, `XGCreateTexture2DComputer`, `XGCreateTextureComputer`
+`XGComputeOptimalDepthStencilTileModes`, `XGComputeOptimalTileMode`, `XGComputeTexture2DLayout`, `XGComputeTexture3DLayout`, `XGCreateTexture2DComputer`, `XGCreateTextureComputer`, `XGSuggestSwizzleMode`
 
 </details>
 
@@ -295,9 +310,9 @@ everything else.
 
 </details>
 
-<details><summary><code>xmem.dll</code>: 18 functions</summary>
+<details><summary><code>xmem.dll</code>: 21 functions</summary>
 
-`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemTransferMemory`, `XMemVirtualAlloc`
+`XMemAlloc`, `XMemAllocDefault`, `XMemAllocatePhysicalPages`, `XMemFree`, `XMemFreeDefault`, `XMemFreePhysicalPages`, `XMemGetAllocationHysteresis`, `XMemGetAllocationStatistics`, `XMemGetWin32HeapStatistics`, `XMemGetWorkingSetStatistics`, `XMemIsToolsMemAvailable`, `XMemMakeTag`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`, `XMemPreallocateFreeSpace`, `XMemSetAllocationHooks`, `XMemSetAllocationHysteresis`, `XMemSetOption`, `XMemTransferMemory`, `XMemVirtualAlloc`, `XMemVirtualQuery`
 
 </details>
 
@@ -370,13 +385,13 @@ translated when all of its instructions do, and its resources are followed.
 | vector, two operands | 47 | 48 |
 | vector, one operand | 66 | 81 |
 | vector compare | 190 | 190 |
-| vector, three operands | 383 | 428 |
+| vector, three operands | 387 | 428 |
 | packed vector | 22 | 22 |
 | interpolation | 3 | 3 |
-| shared memory | 71 | 147 |
+| shared memory | 72 | 147 |
 | global memory | 0 | 54 |
 | untyped buffer | 48 | 64 |
-| typed buffer | 0 | 16 |
+| typed buffer | 16 | 16 |
 | image | 73 | 110 |
 | export | 1 | 1 |
 
@@ -416,15 +431,15 @@ translated when all of its instructions do, and its resources are followed.
 
 </details>
 
-<details><summary>vector, three operands: 45 not handled</summary>
+<details><summary>vector, three operands: 41 not handled</summary>
 
-`v_mullit_f32`, `v_cvt_pk_u8_f32`, `v_div_fixup_f32`, `v_div_fixup_f64`, `v_ldexp_f64`, `v_div_scale_f32`, `v_div_scale_f64`, `v_div_fmas_f32`, `v_div_fmas_f64`, `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_trig_preop_f64`, `v_mqsad_u32_u8`, `v_mad_u64_u32`, `v_mad_i64_i32`, `v_trunc_f64`, `v_ceil_f64`, `v_rndne_f64`, `v_floor_f64`, `v_rsq_f64`, `v_sqrt_f64`, `v_frexp_exp_i32_f64`, `v_frexp_mant_f64`, `v_fract_f64`, `v_movreld_b32`, `v_movrels_b32`, `v_movrelsd_b32`, `v_movrelsd_2_b32`, `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_interp_p1_f32`, `v_interp_p2_f32`, `v_interp_mov_f32`, `v_lshlrev_b64`, `v_lshrrev_b64`, `v_ashrrev_i64`, `v_cvt_pknorm_i16_f16`, `v_cvt_pknorm_u16_f16`, `v_interp_p1ll_f16`, `v_interp_p1lv_f16`, `v_interp_p2_f16`, `v_div_fixup_f16`, `v_writelane_b32`
+`v_mullit_f32`, `v_div_fixup_f32`, `v_div_fixup_f64`, `v_ldexp_f64`, `v_div_scale_f32`, `v_div_scale_f64`, `v_div_fmas_f32`, `v_div_fmas_f64`, `v_qsad_pk_u16_u8`, `v_mqsad_pk_u16_u8`, `v_trig_preop_f64`, `v_mqsad_u32_u8`, `v_mad_u64_u32`, `v_mad_i64_i32`, `v_trunc_f64`, `v_ceil_f64`, `v_rndne_f64`, `v_floor_f64`, `v_rsq_f64`, `v_sqrt_f64`, `v_frexp_exp_i32_f64`, `v_frexp_mant_f64`, `v_fract_f64`, `v_movreld_b32`, `v_movrels_b32`, `v_movrelsd_b32`, `v_movrelsd_2_b32`, `v_frexp_mant_f16`, `v_frexp_exp_i16_f16`, `v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`, `v_interp_p1_f32`, `v_interp_p2_f32`, `v_interp_mov_f32`, `v_cvt_pknorm_i16_f16`, `v_cvt_pknorm_u16_f16`, `v_interp_p1ll_f16`, `v_interp_p1lv_f16`, `v_interp_p2_f16`, `v_div_fixup_f16`, `v_writelane_b32`
 
 </details>
 
-<details><summary>shared memory: 76 not handled</summary>
+<details><summary>shared memory: 75 not handled</summary>
 
-`ds_swizzle_b32`, `ds_consume`, `ds_append`, `ds_add_u64`, `ds_sub_u64`, `ds_rsub_u64`, `ds_inc_u64`, `ds_dec_u64`, `ds_min_i64`, `ds_max_i64`, `ds_min_u64`, `ds_max_u64`, `ds_and_b64`, `ds_or_b64`, `ds_xor_b64`, `ds_mskor_b64`, `ds_cmpst_b64`, `ds_cmpst_f64`, `ds_min_f64`, `ds_max_f64`, `ds_add_rtn_u64`, `ds_sub_rtn_u64`, `ds_rsub_rtn_u64`, `ds_inc_rtn_u64`, `ds_dec_rtn_u64`, `ds_min_rtn_i64`, `ds_max_rtn_i64`, `ds_min_rtn_u64`, `ds_max_rtn_u64`, `ds_and_rtn_b64`, `ds_or_rtn_b64`, `ds_xor_rtn_b64`, `ds_mskor_rtn_b64`, `ds_wrxchg_rtn_b64`, `ds_wrxchg2_rtn_b64`, `ds_wrxchg2st64_rtn_b64`, `ds_cmpst_rtn_b64`, `ds_cmpst_rtn_f64`, `ds_min_rtn_f64`, `ds_max_rtn_f64`, `ds_condxchg32_rtn_b64`, `ds_add_src2_u32`, `ds_sub_src2_u32`, `ds_rsub_src2_u32`, `ds_inc_src2_u32`, `ds_dec_src2_u32`, `ds_min_src2_i32`, `ds_max_src2_i32`, `ds_min_src2_u32`, `ds_max_src2_u32`, `ds_and_src2_b32`, `ds_or_src2_b32`, `ds_xor_src2_b32`, `ds_write_src2_b32`, `ds_min_src2_f32`, `ds_max_src2_f32`, `ds_add_src2_f32`, `ds_write_addtid_b32`, `ds_read_addtid_b32`, `ds_permute_b32`, `ds_bpermute_b32`, `ds_add_src2_u64`, `ds_sub_src2_u64`, `ds_rsub_src2_u64`, `ds_inc_src2_u64`, `ds_dec_src2_u64`, `ds_min_src2_i64`, `ds_max_src2_i64`, `ds_min_src2_u64`, `ds_max_src2_u64`, `ds_and_src2_b64`, `ds_or_src2_b64`, `ds_xor_src2_b64`, `ds_write_src2_b64`, `ds_min_src2_f64`, `ds_max_src2_f64`
+`ds_consume`, `ds_append`, `ds_add_u64`, `ds_sub_u64`, `ds_rsub_u64`, `ds_inc_u64`, `ds_dec_u64`, `ds_min_i64`, `ds_max_i64`, `ds_min_u64`, `ds_max_u64`, `ds_and_b64`, `ds_or_b64`, `ds_xor_b64`, `ds_mskor_b64`, `ds_cmpst_b64`, `ds_cmpst_f64`, `ds_min_f64`, `ds_max_f64`, `ds_add_rtn_u64`, `ds_sub_rtn_u64`, `ds_rsub_rtn_u64`, `ds_inc_rtn_u64`, `ds_dec_rtn_u64`, `ds_min_rtn_i64`, `ds_max_rtn_i64`, `ds_min_rtn_u64`, `ds_max_rtn_u64`, `ds_and_rtn_b64`, `ds_or_rtn_b64`, `ds_xor_rtn_b64`, `ds_mskor_rtn_b64`, `ds_wrxchg_rtn_b64`, `ds_wrxchg2_rtn_b64`, `ds_wrxchg2st64_rtn_b64`, `ds_cmpst_rtn_b64`, `ds_cmpst_rtn_f64`, `ds_min_rtn_f64`, `ds_max_rtn_f64`, `ds_condxchg32_rtn_b64`, `ds_add_src2_u32`, `ds_sub_src2_u32`, `ds_rsub_src2_u32`, `ds_inc_src2_u32`, `ds_dec_src2_u32`, `ds_min_src2_i32`, `ds_max_src2_i32`, `ds_min_src2_u32`, `ds_max_src2_u32`, `ds_and_src2_b32`, `ds_or_src2_b32`, `ds_xor_src2_b32`, `ds_write_src2_b32`, `ds_min_src2_f32`, `ds_max_src2_f32`, `ds_add_src2_f32`, `ds_write_addtid_b32`, `ds_read_addtid_b32`, `ds_permute_b32`, `ds_bpermute_b32`, `ds_add_src2_u64`, `ds_sub_src2_u64`, `ds_rsub_src2_u64`, `ds_inc_src2_u64`, `ds_dec_src2_u64`, `ds_min_src2_i64`, `ds_max_src2_i64`, `ds_min_src2_u64`, `ds_max_src2_u64`, `ds_and_src2_b64`, `ds_or_src2_b64`, `ds_xor_src2_b64`, `ds_write_src2_b64`, `ds_min_src2_f64`, `ds_max_src2_f64`
 
 </details>
 
@@ -437,12 +452,6 @@ translated when all of its instructions do, and its resources are followed.
 <details><summary>untyped buffer: 16 not handled</summary>
 
 `buffer_atomic_swap_x2`, `buffer_atomic_cmpswap_x2`, `buffer_atomic_add_x2`, `buffer_atomic_sub_x2`, `buffer_atomic_smin_x2`, `buffer_atomic_umin_x2`, `buffer_atomic_smax_x2`, `buffer_atomic_umax_x2`, `buffer_atomic_and_x2`, `buffer_atomic_or_x2`, `buffer_atomic_xor_x2`, `buffer_atomic_inc_x2`, `buffer_atomic_dec_x2`, `buffer_atomic_fcmpswap_x2`, `buffer_atomic_fmin_x2`, `buffer_atomic_fmax_x2`
-
-</details>
-
-<details><summary>typed buffer: 16 not handled</summary>
-
-`tbuffer_load_format_x`, `tbuffer_load_format_xy`, `tbuffer_load_format_xyz`, `tbuffer_load_format_xyzw`, `tbuffer_store_format_x`, `tbuffer_store_format_xy`, `tbuffer_store_format_xyz`, `tbuffer_store_format_xyzw`, `tbuffer_load_format_d16_x`, `tbuffer_load_format_d16_xy`, `tbuffer_load_format_d16_xyz`, `tbuffer_load_format_d16_xyzw`, `tbuffer_store_format_d16_x`, `tbuffer_store_format_d16_xy`, `tbuffer_store_format_d16_xyz`, `tbuffer_store_format_d16_xyzw`
 
 </details>
 

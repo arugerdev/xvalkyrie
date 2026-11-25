@@ -101,7 +101,6 @@ the states mean are in [COMPATIBILITY.md](COMPATIBILITY.md).
 The project is experimental. What it implements of each console, counted from the code:
 
 <!-- status:begin -->
-
 [![status map](docs/img/status.svg)](docs/STATUS.md)
 
 Every function and instruction behind these numbers is listed in [docs/STATUS.md](docs/STATUS.md).
@@ -162,6 +161,8 @@ running. It starts `xvboot` for each title, which is also the command line.
 ```
 xvalkyrie [FILE|FOLDER]              open the window, and a title if one is given
 xvboot exec TITLE [--allow-missing] [--trace] [--mute] [--backend d3d11|vulkan]
+                  [--no-config] [--profile NAME] [--console MODEL] [--language TAG]
+                  [--fullscreen MODE] [--set SECTION.KEY=VALUE]
 ```
 
 A title is an executable or the folder of an unpacked title (the one with
@@ -170,6 +171,18 @@ opened: XValkyrie decrypts nothing.
 
 `exec` runs the title's code in the `xvboot` process with no sandbox. Only run what you
 trust.
+
+`exec` takes the settings of the window (`config.ini` and the profile). The other options
+change them for that run alone, and nothing of it is saved:
+
+| Option                    | Effect                                                                                                   |
+| ------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `--no-config`             | None of the saved settings is read: every one is its default                                             |
+| `--profile NAME`          | The profile `NAME`, as saved                                                                             |
+| `--console MODEL`         | The console the title is told it runs on: `series_x`, `series_s`, `xbox_one_x`, `xbox_one_s`, `xbox_one` |
+| `--language TAG`          | The console's language and region, such as `es-AR`                                                       |
+| `--fullscreen MODE`       | What F11 does: `borderless` or `native`                                                                  |
+| `--set SECTION.KEY=VALUE` | Any setting by its name in `config.ini` (`console.headset=true`), or of the profile (`profile.gamertag`) |
 
 The commands that look at a title without running it print JSON:
 
@@ -190,7 +203,8 @@ The commands that look at a title without running it print JSON:
 
 In the window, Options > Input binds the gamepad to keys or to the host's gamepad,
 Options > Graphics picks the backend and what F11 does, Options > Console sets the signed-in
-user and, optionally, the system storage: a folder with the console's own apps, each
+user, the console model titles are told they run on (Series X or S, Xbox One X, One S or
+One, for each generation) and, optionally, the system storage: a folder with the console's own apps, each
 unpacked in a folder of its own. With one, apps find the packages they depend on there and
 File > Boot from Menu starts the dashboard, as far as it gets (see the roadmap). Options >
 Game Libraries sets the folders that are scanned for titles. Settings are kept

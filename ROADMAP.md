@@ -63,6 +63,11 @@ The test program is an unpacked ERA title kept outside the repository, in
   `[Runtime]`
 - [x] Options > Console: gamertag, user ID, gamerscore, age group, headset and how the system
   keyboard answers, saved in `config.ini`
+- [x] Options > Console > Console model: the console a title is told it runs on, for each
+  generation (Series X or S; Xbox One X, One S or One), through the registry value the GDK
+  reads and `GetConsoleType`, with the memory a title has on it
+- [x] `xvboot exec` takes any setting for one run (`--console`, `--profile`, `--set
+  SECTION.KEY=VALUE`...), or none of `config.ini` (`--no-config`); nothing of it is saved
 - [x] System keyboard (`ShowVirtualKeyboardAsync`, `KeyboardOptions`) as a window on the host
 - [x] Party, party chat, secure device associations, quality of service, game DVR and speech
   recognizers report that they are not there

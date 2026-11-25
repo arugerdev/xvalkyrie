@@ -99,21 +99,47 @@ void precompile(const std::filesystem::path &cache, const std::filesystem::path 
         return;
     const auto cores = std::max(std::thread::hardware_concurrency(), 2u);
     const auto *const asked = std::getenv("XV_PRECOMPILE_THREADS");
-    const auto threads = asked ? static_cast<unsigned>(std::max(std::atoi(asked), 1))
-                               : std::min(cores - 1, 8u);
+    const auto threads =
+        asked ? static_cast<unsigned>(std::max(std::atoi(asked), 1)) : std::min(cores - 1, 8u);
     const auto started = std::chrono::steady_clock::now();
     const auto work = runtime::modules::precompile_shaders(cache, journal, threads);
+    // a journal its index knows is looked at in a moment, and needs no window
+    for (int waited = 0; !work->scanned && waited < 5; ++waited)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (work->finished)
         return;
-    std::cerr << "[Boot] " << work->total << " shaders of earlier runs to make for the host, on "
-              << threads << " threads" << std::endl;
+    // what the window says goes to the log too, every few seconds
+    bool told = false;
+    auto said = started;
+    const auto say = [&](const std::string &text) {
+        if (const auto now = std::chrono::steady_clock::now();
+            now - said >= std::chrono::seconds(5)) {
+            said = now;
+            std::cerr << "[Boot] " << text << std::endl;
+        }
+    };
     {
         surface::ProgressWindow window(L"XValkyrie", L"Preparing shaders for " + wide(name));
         while (!work->finished && !window.skipped()) {
-            window.update(work->done, work->total,
-                          std::to_wstring(work->done.load()) + L" of " +
-                              std::to_wstring(work->total.load()) + L" shaders (" +
-                              std::to_wstring(work->failed.load()) + L" do not translate yet)");
+            if (!work->scanned) {
+                const auto text = std::to_string(work->looked.load()) + " of " +
+                                  std::to_string(work->journal.load()) +
+                                  " shaders of earlier runs looked at";
+                window.update(work->looked, work->journal, wide(text));
+                say(text);
+            } else {
+                if (!told) {
+                    told = true;
+                    std::cerr << "[Boot] " << work->total
+                              << " shaders of earlier runs to make for the host, on " << threads
+                              << " threads" << std::endl;
+                }
+                const auto text = std::to_string(work->done.load()) + " of " +
+                                  std::to_string(work->total.load()) + " shaders (" +
+                                  std::to_string(work->failed.load()) + " do not translate yet)";
+                window.update(work->done, work->total, wide(text));
+                say(text);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (window.skipped())

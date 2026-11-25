@@ -116,15 +116,19 @@ HeapLayout shader_heap_layout(std::span<const std::uint8_t> container);
 // a shader, so that precompile_shaders makes the ones the shader cache lacks before a later
 // run of the title starts. Nothing is noted while it is empty.
 void set_shader_journal(std::filesystem::path folder);
-// How far precompile_shaders has got, read from any thread
+// How far precompile_shaders has got, read from any thread: how many of the journal's
+// entries it has looked at, then, once `scanned`, how many of those to make it has made
 struct Precompile {
+    std::atomic<std::size_t> journal{0}, looked{0};
     std::atomic<std::size_t> total{0}, done{0}, made{0}, failed{0};
-    std::atomic<bool> finished{false};
+    std::atomic<bool> scanned{false}, finished{false};
 };
 // Makes, in `cache`, every shader noted in `folder` that it does not have yet, on `threads`
 // threads of their own that go on whatever the caller does: one the title asks for meanwhile
-// is waited for, not made twice. What does not translate is noted so as not to be tried
-// again by this version of the translator.
+// is waited for, not made twice. It returns at once; the journal is looked at on a thread
+// too, through an index kept beside it, so that a later start reads only the entries it has
+// not seen. What does not translate, or what the host's compiler turns down, is noted so as
+// not to be tried again by this version of the translator.
 std::shared_ptr<Precompile> precompile_shaders(const std::filesystem::path &cache,
                                                const std::filesystem::path &folder,
                                                unsigned threads);

@@ -2,11 +2,16 @@
 #include "runtime/modules/console_shader_rdna.hpp"
 #include <catch2/catch.hpp>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <d3dcompiler.h>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <string>
+#include <thread>
 #include <vector>
+#include <windows.h>
 
 namespace {
 using namespace xv::runtime::modules;
@@ -372,4 +377,39 @@ TEST_CASE("a vertex shader that calls no fetch shader reads its vertex and insta
     CHECK(source->find("v0 = input.xv_vertex;") != std::string::npos);
     CHECK(source->find("v3 = input.xv_instance;") != std::string::npos);
     CHECK(source->find("POSITION") == std::string::npos);
+}
+
+TEST_CASE("a start reads only the journal's entries its index does not know") {
+    const auto folder = std::filesystem::temp_directory_path() /
+                        ("xv_precompile_" + std::to_string(GetCurrentProcessId()));
+    const auto journal = folder / "journal";
+    std::filesystem::create_directories(journal);
+    // "XVSJ", version 1, a pixel shader for Shader Model 5 without heaps or signed inputs, of
+    // four bytes that are no shader, without a root signature
+    const std::uint32_t entry[] = {0x4a535658u, 1, 1, 0, 0, 0, 4, 0, 0x65706f6e};
+    std::ofstream(journal / "entry.xvsj", std::ios::binary)
+        .write(reinterpret_cast<const char *>(entry), sizeof entry);
+    const auto run = [&] {
+        const auto work = precompile_shaders(folder, journal, 2);
+        for (int waited = 0; !work->finished && waited < 1000; ++waited)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        REQUIRE(work->finished);
+        CHECK(work->journal == 1);
+        CHECK(work->looked == 1);
+        return work->total.load();
+    };
+    const auto noted = [&] {
+        for (const auto &item : std::filesystem::directory_iterator(folder))
+            if (item.path().extension() == ".none")
+                return item.path();
+        return std::filesystem::path{};
+    };
+    CHECK(run() == 1);
+    REQUIRE(!noted().empty());
+    // settled by this version, as the index says: neither the entry nor the cache is read
+    std::filesystem::remove(noted());
+    CHECK(run() == 0);
+    std::filesystem::remove(journal / "index.txt");
+    CHECK(run() == 1);
+    std::filesystem::remove_all(folder);
 }

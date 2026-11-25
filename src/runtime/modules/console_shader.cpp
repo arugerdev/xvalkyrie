@@ -630,8 +630,8 @@ std::vector<std::uint8_t> compile_sm6(ShaderStage stage, const std::string &sour
                                    : stage == ShaderStage::pixel   ? L"ps_6_6"
                                                                    : L"gs_6_6";
     // as compile_newer: the largest are not optimized, which takes several times as long
-    const wchar_t *args[] = {L"-E",  L"main", L"-T", profile, L"-HV", L"2018",
-                             source.size() > 100'000 ? L"-Od" : L"-O3"};
+    const wchar_t *args[] = {
+        L"-E", L"main", L"-T", profile, L"-HV", L"2018", source.size() > 100'000 ? L"-Od" : L"-O3"};
     const DxcBuffer input{source.data(), source.size(), DXC_CP_UTF8};
     ComPtr<IDxcResult> result;
     if (FAILED(compiler->Compile(&input, args, static_cast<UINT32>(std::size(args)), nullptr,
@@ -705,8 +705,15 @@ std::string hash_name(Bytes bytes) {
     return text;
 }
 std::vector<std::uint8_t> read_file(const std::filesystem::path &path) {
-    std::ifstream file(path, std::ios::binary);
-    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto size = file ? static_cast<std::streamoff>(file.tellg()) : 0;
+    if (size <= 0)
+        return {};
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    file.seekg(0);
+    file.read(reinterpret_cast<char *>(bytes.data()), size);
+    bytes.resize(static_cast<std::size_t>(file.gcount()));
+    return bytes;
 }
 void write_file(const std::filesystem::path &path, Bytes bytes) {
     std::error_code error;
@@ -1133,17 +1140,26 @@ namespace {
 // what a host shader is made from, which says its name in the shader cache: the title's
 // shader, the model asked for, the inputs that are signed, the pipeline's root signature for
 // one with none of its own, and whether it reads the heaps itself
-std::string cache_name(ShaderStage stage, Bytes container, HostShaderModel model,
-                       std::uint32_t signed_inputs, Bytes root_signature, bool heaps,
+// (the same from the hash names of the shader and of the root signature, the latter empty
+// where there is none)
+std::string cache_name(ShaderStage stage, const std::string &container, HostShaderModel model,
+                       std::uint32_t signed_inputs, const std::string &root, bool heaps,
                        std::string_view more = {}) {
     const char letter = "vpc123m"[static_cast<int>(stage)];
     const char *const model_name = model == HostShaderModel::sm6         ? "-sm6"
                                    : model == HostShaderModel::automatic ? "-auto"
                                                                          : "";
-    return hash_name(container) + "-" + letter + "-v" + std::to_string(translator_version) +
-           model_name + (signed_inputs ? "-s" + std::to_string(signed_inputs) : "") +
-           (root_signature.empty() ? "" : "-r" + hash_name(root_signature).substr(0, 12)) +
-           std::string(more) + (heaps ? "-heaps" : "");
+    return container + "-" + letter + "-v" + std::to_string(translator_version) + model_name +
+           (signed_inputs ? "-s" + std::to_string(signed_inputs) : "") +
+           (root.empty() ? "" : "-r" + root) + std::string(more) + (heaps ? "-heaps" : "");
+}
+std::string cache_name(ShaderStage stage, Bytes container, HostShaderModel model,
+                       std::uint32_t signed_inputs, Bytes root_signature, bool heaps,
+                       std::string_view more = {}) {
+    return cache_name(stage, hash_name(container), model, signed_inputs,
+                      root_signature.empty() ? std::string{}
+                                             : hash_name(root_signature).substr(0, 12),
+                      heaps, more);
 }
 // The shaders the running title asked for, one file each in its own folder of the shader
 // cache, so that a later run makes them before the title starts (precompile_shaders). A file
@@ -1198,10 +1214,10 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
     // XV_SHADER_SOLID: every translated pixel shader writes one colour to its first target,
     // to tell whether what is drawn with them gets to the screen at all
     static const bool solid = std::getenv("XV_SHADER_SOLID") != nullptr;
-    const auto name =
-        cache_name(stage, container, model, signed_inputs, root_signature, heap_shaders,
-                   stand_ins_only ? "-stand-in" : "") +
-        (solid ? std::string("-solid") + std::getenv("XV_SHADER_SOLID") : "") + ".dxbc";
+    const auto name = cache_name(stage, container, model, signed_inputs, root_signature,
+                                 heap_shaders, stand_ins_only ? "-stand-in" : "") +
+                      (solid ? std::string("-solid") + std::getenv("XV_SHADER_SOLID") : "") +
+                      ".dxbc";
     // one thread makes a shader, and the others that want the same one wait for it: titles
     // make their pipelines on many threads, and the host's compiler is slow
     {
@@ -1321,98 +1337,210 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
 
 void set_shader_journal(std::filesystem::path folder) { journal = std::move(folder); }
 
+namespace {
+// What a journal entry's file says of its shader, as far as its name in the cache goes, and
+// the version of the translator the cache last had it settled by (made, or noted as not
+// made). The journal's index keeps these, so that a later start reads neither the entries
+// it knows nor the cache for the ones settled by this version.
+struct Noted {
+    ShaderStage stage;
+    HostShaderModel model;
+    bool heaps;
+    std::uint32_t signed_inputs;
+    std::string container, root; // hash names, as cache_name has them
+    int settled = 0;
+};
+constexpr char index_name[] = "index.txt";
+constexpr char index_heading[] = "XVSI 1";
+// a journal entry's header, if the file is one
+std::optional<std::array<std::uint32_t, 8>> journal_header(Bytes bytes) {
+    std::array<std::uint32_t, 8> header{};
+    if (bytes.size() < sizeof header)
+        return std::nullopt;
+    std::memcpy(header.data(), bytes.data(), sizeof header);
+    if (header[0] != 0x4a535658u || header[1] != journal_version || header[2] > 6 ||
+        header[3] > 2 || sizeof header + std::uint64_t{header[6]} + header[7] != bytes.size())
+        return std::nullopt;
+    return header;
+}
+// one line an entry: its file's stem, stage, model, heaps, signed inputs, the hash names of
+// the shader and of the root signature ("-" for none), and the version that settled it
+std::map<std::string, Noted> read_index(const std::filesystem::path &folder) {
+    std::map<std::string, Noted> index;
+    std::ifstream file(folder / index_name);
+    std::string line;
+    if (!std::getline(file, line) || line != index_heading)
+        return index;
+    while (std::getline(file, line)) {
+        char stem[33]{}, container[33]{}, root[33]{};
+        unsigned stage = 0, model = 0, heaps = 0, signed_inputs = 0;
+        int settled = 0;
+        if (std::sscanf(line.c_str(), "%32s %u %u %u %u %32s %32s %d", stem, &stage, &model, &heaps,
+                        &signed_inputs, container, root, &settled) != 8 ||
+            stage > 6 || model > 2)
+            continue;
+        index[stem] = {static_cast<ShaderStage>(stage),
+                       static_cast<HostShaderModel>(model),
+                       heaps != 0,
+                       signed_inputs,
+                       container,
+                       std::strcmp(root, "-") ? root : "",
+                       settled};
+    }
+    return index;
+}
+void write_index(const std::filesystem::path &folder, const std::map<std::string, Noted> &index) {
+    std::string text = std::string(index_heading) + "\n";
+    for (const auto &[stem, noted] : index) {
+        char line[192];
+        std::snprintf(line, sizeof line, "%s %u %u %u %u %s %s %d\n", stem.c_str(),
+                      static_cast<unsigned>(noted.stage), static_cast<unsigned>(noted.model),
+                      noted.heaps ? 1u : 0u, noted.signed_inputs, noted.container.c_str(),
+                      noted.root.empty() ? "-" : noted.root.c_str(), noted.settled);
+        text += line;
+    }
+    write_file(folder / index_name,
+               {reinterpret_cast<const std::uint8_t *>(text.data()), text.size()});
+}
+} // namespace
+
 std::shared_ptr<Precompile> precompile_shaders(const std::filesystem::path &cache,
                                                const std::filesystem::path &folder,
                                                unsigned threads) {
     auto work = std::make_shared<Precompile>();
-    struct Entry {
-        ShaderStage stage;
-        HostShaderModel model;
-        bool heaps;
-        std::uint32_t signed_inputs;
-        std::vector<std::uint8_t> bytes; // the shader, then the root signature
-        std::uint32_t container;
-        std::string name;
-    };
-    auto entries = std::make_shared<std::vector<Entry>>();
-    std::error_code error;
-    for (const auto &item : std::filesystem::directory_iterator(folder, error)) {
-        if (item.path().extension() != ".xvsj")
-            continue;
-        auto bytes = read_file(item.path());
-        std::uint32_t header[8]{};
-        if (bytes.size() < sizeof header)
-            continue;
-        std::memcpy(header, bytes.data(), sizeof header);
-        if (header[0] != 0x4a535658u || header[1] != journal_version || header[2] > 6 ||
-            header[3] > 2 || sizeof header + std::uint64_t{header[6]} + header[7] != bytes.size())
-            continue;
-        Entry entry{static_cast<ShaderStage>(header[2]), static_cast<HostShaderModel>(header[3]),
-                    header[4] != 0, header[5], {}, header[6], {}};
-        entry.bytes.assign(bytes.begin() + sizeof header, bytes.end());
-        const Bytes container(entry.bytes.data(), entry.container);
-        const Bytes root(entry.bytes.data() + entry.container, entry.bytes.size() - entry.container);
-        entry.name = cache_name(entry.stage, container, entry.model, entry.signed_inputs, root,
-                                entry.heaps) +
-                     ".dxbc";
-        // made already, or not made by this version of the translator
-        if (std::filesystem::exists(cache / entry.name, error) ||
-            std::filesystem::exists(cache / (entry.name + ".none"), error))
-            continue;
-        entries->push_back(std::move(entry));
-    }
-    work->total = entries->size();
-    if (entries->empty()) {
-        work->finished = true;
-        return work;
-    }
-    threads = std::clamp(threads, 1u, static_cast<unsigned>(entries->size()));
-    auto next = std::make_shared<std::atomic<std::size_t>>(0);
-    auto left = std::make_shared<std::atomic<unsigned>>(threads);
-    for (unsigned n = 0; n < threads; ++n)
-        std::thread([work, entries, next, left, cache] {
-            // what the title asks for meanwhile goes first, if it was let start
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-            for (std::size_t at; (at = (*next)++) < entries->size();) {
-                const auto &entry = (*entries)[at];
-                {
-                    // one the title is making itself is left to it
-                    std::unique_lock lock(mutex);
-                    if (made.count(entry.name) || making.count(entry.name)) {
-                        ++work->done;
-                        continue;
-                    }
-                    making.insert(entry.name);
-                }
-                heap_shaders = entry.heaps;
-                const Bytes container(entry.bytes.data(), entry.container);
-                const Bytes root(entry.bytes.data() + entry.container,
-                                 entry.bytes.size() - entry.container);
-                bool needs_sm6 = false;
-                std::string why;
-                auto source = translated_source(entry.stage, container, &why, nullptr, &needs_sm6,
-                                                entry.signed_inputs, root);
-                const bool sm6 = entry.model == HostShaderModel::sm6 ||
-                                 (entry.model == HostShaderModel::automatic && needs_sm6);
-                std::vector<std::uint8_t> shader;
-                if (source && (sm6 || !needs_sm6))
-                    shader = sm6 ? compile_sm6(entry.stage, *source)
-                                 : compile_now(entry.stage, *source, false);
-                // what the host's compiler turns down is tried again in the next run
-                if (!source || needs_sm6 > sm6)
-                    write_file(cache / (entry.name + ".none"),
-                               {reinterpret_cast<const std::uint8_t *>(why.data()), why.size()});
-                else if (!shader.empty())
-                    write_file(cache / entry.name, shader);
-                ++(shader.empty() ? work->failed : work->made);
-                ++work->done;
-                const std::lock_guard lock(mutex);
-                making.erase(entry.name);
-                made_one.notify_all();
+    // The journal is looked at on a thread of its own too, so that the caller can say how
+    // far that is: one the index does not know yet is read whole, once.
+    std::thread([work, cache, folder, threads] {
+        struct Entry {
+            std::filesystem::path file;
+            std::string stem, name;
+            bool settled = false;
+        };
+        struct Shared {
+            std::map<std::string, Noted> index;
+            std::vector<Entry> entries;
+            std::atomic<std::size_t> next{0};
+            std::atomic<unsigned> left{0};
+        };
+        auto shared = std::make_shared<Shared>();
+        std::vector<std::filesystem::path> files;
+        std::error_code error;
+        for (const auto &item : std::filesystem::directory_iterator(folder, error))
+            if (item.path().extension() == ".xvsj")
+                files.push_back(item.path());
+        work->journal = files.size();
+        auto known = read_index(folder);
+        bool changed = false;
+        for (const auto &file : files) {
+            ++work->looked;
+            auto stem = file.stem().string();
+            Noted noted{};
+            if (const auto found = known.find(stem); found != known.end()) {
+                noted = std::move(found->second);
+            } else {
+                const auto bytes = read_file(file);
+                const auto header = journal_header(bytes);
+                if (!header)
+                    continue;
+                const Bytes all(bytes);
+                const auto root = all.subspan(32 + (*header)[6]);
+                noted = {static_cast<ShaderStage>((*header)[2]),
+                         static_cast<HostShaderModel>((*header)[3]),
+                         (*header)[4] != 0,
+                         (*header)[5],
+                         hash_name(all.subspan(32, (*header)[6])),
+                         root.empty() ? std::string{} : hash_name(root).substr(0, 12)};
+                changed = true;
             }
-            if (--*left == 0)
+            if (noted.settled != translator_version) {
+                auto name = cache_name(noted.stage, noted.container, noted.model,
+                                       noted.signed_inputs, noted.root, noted.heaps) +
+                            ".dxbc";
+                // made already, or not made by this version of the translator
+                if (std::filesystem::exists(cache / name, error) ||
+                    std::filesystem::exists(cache / (name + ".none"), error)) {
+                    noted.settled = translator_version;
+                    changed = true;
+                } else {
+                    shared->entries.push_back({file, stem, std::move(name)});
+                }
+            }
+            shared->index.emplace(std::move(stem), std::move(noted));
+        }
+        // what is no longer in the journal leaves the index too
+        if (changed || shared->index.size() != known.size())
+            write_index(folder, shared->index);
+        work->total = shared->entries.size();
+        work->scanned = true;
+        if (shared->entries.empty()) {
+            work->finished = true;
+            return;
+        }
+        const auto count = std::clamp(threads, 1u, static_cast<unsigned>(work->total));
+        shared->left = count;
+        for (unsigned n = 0; n < count; ++n)
+            std::thread([work, shared, cache, folder] {
+                // what the title asks for meanwhile goes first, if it was let start
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                for (std::size_t at; (at = shared->next++) < shared->entries.size();) {
+                    auto &entry = shared->entries[at];
+                    {
+                        // one the title is making itself is left to it
+                        std::unique_lock lock(mutex);
+                        if (made.count(entry.name) || making.count(entry.name)) {
+                            ++work->done;
+                            continue;
+                        }
+                        making.insert(entry.name);
+                    }
+                    const auto bytes = read_file(entry.file);
+                    const auto header = journal_header(bytes);
+                    std::vector<std::uint8_t> shader;
+                    if (header) {
+                        const auto stage = static_cast<ShaderStage>((*header)[2]);
+                        const auto model = static_cast<HostShaderModel>((*header)[3]);
+                        heap_shaders = (*header)[4] != 0;
+                        const Bytes all(bytes);
+                        bool needs_sm6 = false;
+                        std::string why;
+                        auto source = translated_source(stage, all.subspan(32, (*header)[6]), &why,
+                                                        nullptr, &needs_sm6, (*header)[5],
+                                                        all.subspan(32 + (*header)[6]));
+                        const bool sm6 = model == HostShaderModel::sm6 ||
+                                         (model == HostShaderModel::automatic && needs_sm6);
+                        if (source && needs_sm6 && !sm6) {
+                            why = "the pipeline needs Shader Model 5 shaders";
+                        } else if (source) {
+                            why = "the host's compiler";
+                            shader = sm6 ? compile_sm6(stage, *source)
+                                         : compile_now(stage, *source, false, &why);
+                        }
+                        // what the host's compiler turns down as well: it is given the same
+                        // shader by this version of the translator, which a run of the title
+                        // still tries for itself
+                        write_file(shader.empty() ? cache / (entry.name + ".none")
+                                                  : cache / entry.name,
+                                   shader.empty()
+                                       ? Bytes{reinterpret_cast<const std::uint8_t *>(why.data()),
+                                               why.size()}
+                                       : Bytes{shader});
+                        entry.settled = true;
+                    }
+                    ++(shader.empty() ? work->failed : work->made);
+                    ++work->done;
+                    const std::lock_guard lock(mutex);
+                    making.erase(entry.name);
+                    made_one.notify_all();
+                }
+                if (--shared->left)
+                    return;
+                for (const auto &entry : shared->entries)
+                    if (entry.settled)
+                        shared->index[entry.stem].settled = translator_version;
+                write_index(folder, shared->index);
                 work->finished = true;
-        }).detach();
+            }).detach();
+    }).detach();
     return work;
 }
 

@@ -4667,6 +4667,38 @@ HRESULT STDMETHODCALLTYPE create_committed_resource(
     }
     return result;
 }
+// CreateCommittedResourceX (76): CreateCommittedResource, with the console's description of
+// the resource. That is the desktop's D3D12_RESOURCE_DESC with fields of the console's own
+// after its flags, where the desktop's has padding, to 0x40 bytes: how the console's GPU is
+// to keep the texture's memory (AMD's upscaler asks 3 there for its targets on Xbox Series
+// S). The host's driver chooses that for its own resources, so the resource is made from the
+// desktop's part alone, as CreateCommittedResource makes it.
+HRESULT STDMETHODCALLTYPE create_committed_resource_x(
+    ID3D12Device *self, const D3D12_HEAP_PROPERTIES *heap, D3D12_HEAP_FLAGS flags, const void *desc,
+    D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, REFIID iid, void **resource) {
+    constexpr std::size_t desktop =
+        offsetof(D3D12_RESOURCE_DESC, Flags) + sizeof(D3D12_RESOURCE_FLAGS);
+    static_assert(desktop == 0x34 && sizeof(D3D12_RESOURCE_DESC) == 0x38);
+    D3D12_RESOURCE_DESC host{};
+    if (desc)
+        std::memcpy(&host, desc, desktop);
+    if (static std::atomic<int> shown{0}; desc && shown++ < 4) {
+        const auto *const bytes = static_cast<const std::uint8_t *>(desc);
+        std::uint32_t options = 0;
+        std::uint64_t more = 0;
+        std::memcpy(&options, bytes + desktop, sizeof options);
+        std::memcpy(&more, bytes + sizeof host, sizeof more);
+        std::fprintf(stderr,
+                     "[Runtime] CreateCommittedResourceX from %s: dimension %d %llux%u format %d "
+                     "layout 0x%x flags 0x%x, the console's own 0x%x 0x%llx\n",
+                     detail::guest_location(_ReturnAddress()).c_str(), host.Dimension,
+                     static_cast<unsigned long long>(host.Width), host.Height, host.Format,
+                     host.Layout, host.Flags, options, static_cast<unsigned long long>(more));
+        std::fflush(stderr);
+    }
+    return create_committed_resource(self, heap, flags, desc ? &host : nullptr, state, clear, iid,
+                                     resource);
+}
 // XV_D3D_DEBUG: the host's debug layer, whose messages go to the log when something the title
 // asked for is turned down
 std::atomic<ID3D12InfoQueue *> debug_messages{nullptr};
@@ -9375,6 +9407,7 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         overrides.push_back({57, reinterpret_cast<Slot>(&deserialize_pipeline<0>)});
         overrides.push_back({67, reinterpret_cast<Slot>(&deserialize_pipeline<1>)});
         overrides.push_back({71, reinterpret_cast<Slot>(&create_uav_at)});
+        overrides.push_back({76, reinterpret_cast<Slot>(&create_committed_resource_x)});
     }
     overrides.push_back({8, reinterpret_cast<Slot>(&create_command_queue)});
     overrides.push_back({62, reinterpret_cast<Slot>(&create_compute_pipeline_x)});

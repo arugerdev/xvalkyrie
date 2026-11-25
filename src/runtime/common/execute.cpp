@@ -813,7 +813,7 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
                 std::fprintf(stderr, "\n");
             }
             // XV_BREAK_MEM=<register>[-<back>]:<length>[,...]: the bytes at a register's value
-            // (rax rcx rdx rbx rsi rdi r8 r14 r15), from <back> bytes before it, in hexadecimal
+            // (rax rcx rdx rbx rsi rdi rbp rsp r8-r15), from <back> bytes before it, in hexadecimal
             if (const char *list = std::getenv("XV_BREAK_MEM"))
                 while (*list) {
                     static const struct {
@@ -822,8 +822,10 @@ LONG WINAPI at_breakpoint(EXCEPTION_POINTERS *info) {
                     } registers[] = {
                         {"rax", &CONTEXT::Rax}, {"rcx", &CONTEXT::Rcx}, {"rdx", &CONTEXT::Rdx},
                         {"rbx", &CONTEXT::Rbx}, {"rsi", &CONTEXT::Rsi}, {"rdi", &CONTEXT::Rdi},
-                        {"r8", &CONTEXT::R8},   {"r12", &CONTEXT::R12}, {"r13", &CONTEXT::R13},
-                        {"r14", &CONTEXT::R14}, {"r15", &CONTEXT::R15}};
+                        {"rbp", &CONTEXT::Rbp}, {"rsp", &CONTEXT::Rsp}, {"r8", &CONTEXT::R8},
+                        {"r9", &CONTEXT::R9},   {"r10", &CONTEXT::R10}, {"r11", &CONTEXT::R11},
+                        {"r12", &CONTEXT::R12}, {"r13", &CONTEXT::R13}, {"r14", &CONTEXT::R14},
+                        {"r15", &CONTEXT::R15}};
                     std::uint64_t base = 0;
                     const char *name = "?";
                     for (const auto &entry : registers)

@@ -96,8 +96,8 @@ project. That code follows AMD's addrlib (MIT), credited in `texture_layout.hpp`
 
 ## BCPack tables
 
-`src/runtime/modules/bcpack_tables.cpp` holds BCPack's constant tables (entropy models, index
+`src/runtime/modules/bcpack-tables.cpp` holds BCPack's constant tables (entropy models, index
 ranks, BC7 control codes and dictionaries, 77,982 bytes), which a BCPack stream cannot be
-decoded without. They are part of the format, not this project's work, and this project's
-license does not cover them. A `bcpack-tables.bin` beside the executable is used in their
-place.
+decoded without, recreated as C++ from `crates/victory-formats/src/bcpack-tables.bin` of the
+same project. They are part of the format, not this project's work, and this project's license
+does not cover them.

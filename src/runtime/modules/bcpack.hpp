@@ -9,12 +9,12 @@
 // BCPack, the console's lossless packing of BC1 and BC3 to BC7 block streams, which its
 // DirectStorage unpacks after zlib (DSTORAGE_BCPACK_MODE). Ported code: see THIRD-PARTY.md.
 // The format's constant tables (entropy models, index ranks, BC7 control codes and
-// dictionaries) are not part of this code: whoever decodes gives them.
+// dictionaries) are built in by bcpack-tables.cpp.
 namespace xv::runtime::modules::bcpack {
 struct Tables;
-// the tables' size, as bcpack-tables.bin lays them out
+// the tables' size in the binary layout they are recreated from
 constexpr std::size_t tables_size = 77982;
-// the tables the runtime was built with (see CMakeLists.txt), empty if it was built with none
+// the tables built into the runtime
 std::span<const std::uint8_t> builtin_tables();
 // the tables from those bytes; null, with the reason in `why`, if they are not tables
 std::shared_ptr<const Tables> parse_tables(std::span<const std::uint8_t> bytes, std::string *why);

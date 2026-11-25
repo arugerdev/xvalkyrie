@@ -1,5 +1,4 @@
 #include "runtime/modules/dstorage.hpp"
-#include "host/files.hpp"
 #include "runtime/common/runtime.hpp"
 #include "runtime/modules/bcpack.hpp"
 #include "runtime/modules/inflate.hpp"
@@ -12,11 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <initializer_list>
 #include <intrin.h>
-#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -268,9 +264,8 @@ HRESULT write_destination(const Request &request, const std::uint8_t *data, std:
     return S_OK;
 }
 
-// BCPack's tables are the format's constants: bcpack-tables.bin beside the executable where
-// there is one, else those the runtime was built with. With neither a BCPack request fails, as
-// one did before there was a decoder.
+// BCPack's tables are the format's constants, built into the runtime. Tests may replace them
+// through use_bcpack_tables.
 struct BcpackTables {
     std::mutex mutex;
     bool looked = false;
@@ -285,20 +280,12 @@ std::shared_ptr<const bcpack::Tables> bcpack_tables() {
     const std::lock_guard lock(state.mutex);
     if (!state.looked) {
         state.looked = true;
-        const auto path = host::executable_directory() / "bcpack-tables.bin";
-        std::ifstream file(path, std::ios::binary);
-        const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file),
-                                              std::istreambuf_iterator<char>()};
-        std::string why = "there is no such file";
-        if (file.is_open())
-            state.tables = bcpack::parse_tables(bytes, &why);
-        if (!state.tables && !bcpack::builtin_tables().empty())
-            state.tables = bcpack::parse_tables(bcpack::builtin_tables(), &why);
+        std::string why;
+        state.tables = bcpack::parse_tables(bcpack::builtin_tables(), &why);
         if (!state.tables)
             std::fprintf(stderr,
-                         "[Runtime] DirectStorage: BCPack requests fail until the format's "
-                         "tables (%zu bytes) are at %s: %s\n",
-                         bcpack::tables_size, path.string().c_str(), why.c_str());
+                         "[Runtime] DirectStorage: the built-in BCPack tables are invalid: %s\n",
+                         why.c_str());
     }
     return state.tables;
 }

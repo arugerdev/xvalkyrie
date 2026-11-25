@@ -430,11 +430,10 @@ TEST_CASE("BCPack tables are the format's size and tile each model") {
     CHECK_FALSE(parse_tables(bytes, &why));
 }
 
-TEST_CASE("the BCPack tables the runtime was built with, where it has them, are tables") {
+TEST_CASE("the BCPack tables built into the runtime are tables") {
     using namespace modules::bcpack;
-    if (builtin_tables().empty())
-        return;
     std::string why;
+    CHECK(builtin_tables().size() == tables_size);
     CHECK(parse_tables(builtin_tables(), &why));
     CHECK(why.empty());
 }

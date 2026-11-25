@@ -96,3 +96,32 @@ TEST_CASE("pages mapped from a pool into a heap show the pool's memory") {
     CHECK(free(pool, 0, MEM_RELEASE));
     CHECK(xmem<BOOL WINAPI(ULONG_PTR, ULONG_PTR *)>("XMemFreePhysicalPages")(count, pages));
 }
+
+// Page number 0 is none: no page is given out with it, and mapping it at an address unmaps
+// what is there, which a title does to clear addresses it lets go of.
+TEST_CASE("page number 0 unmaps an address") {
+    constexpr DWORD large_pages = 0x20000000;
+    constexpr std::size_t page = 1 << 16, count = 2;
+    ULONG_PTR pages[count]{}, got = count;
+    REQUIRE(xmem<BOOL WINAPI(ULONGLONG, ULONG_PTR *, ULONG_PTR *)>("XMemAllocatePhysicalPages")(
+        0, &got, pages));
+    for (const auto number : pages)
+        CHECK(number != 0);
+    auto *const base = static_cast<std::uint8_t *>(
+        xmem<void * WINAPI(void *, SIZE_T, DWORD, ULONGLONG, DWORD)>("XMemVirtualAlloc")(
+            nullptr, count * page, MEM_RESERVE | large_pages, 0, PAGE_READWRITE));
+    REQUIRE(base);
+    void *addresses[count] = {base, base + page};
+    const auto scatter =
+        xmem<BOOL WINAPI(void **, ULONG_PTR, ULONG_PTR *)>("XMemMapPhysicalPagesScatter");
+    REQUIRE(scatter(addresses, count, pages));
+    base[page] = 1;
+    ULONG_PTR cleared[count] = {pages[0], 0};
+    REQUIRE(scatter(addresses, count, cleared));
+    MEMORY_BASIC_INFORMATION info{};
+    REQUIRE(VirtualQuery(base + page, &info, sizeof info));
+    CHECK(info.State != MEM_COMMIT);
+    CHECK(scatter(addresses, count, nullptr));
+    CHECK(xmem<BOOL WINAPI(ULONG_PTR, ULONG_PTR *)>("XMemFreePhysicalPages")(count, pages));
+    CHECK(xmem<BOOL WINAPI(void *, SIZE_T, DWORD)>("VirtualFree")(base, 0, MEM_RELEASE));
+}

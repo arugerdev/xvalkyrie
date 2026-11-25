@@ -46,8 +46,13 @@ struct Physical {
     HANDLE section =
         CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_READ | FILE_MAP_WRITE,
                            PAGE_READWRITE, SEC_RESERVE, physical_size, nullptr, nullptr, 0);
-    std::vector<bool> used = std::vector<bool>(physical_size / page),
-                      dirty = std::vector<bool>(physical_size / page);
+    // the first page is never given out: its number, 0, is none to a title
+    std::vector<bool> used = [] {
+        std::vector<bool> taken(physical_size / page);
+        taken[0] = true;
+        return taken;
+    }();
+    std::vector<bool> dirty = std::vector<bool>(physical_size / page);
     std::map<std::uintptr_t, Reservation> reservations;
     // XV_MEM_CHECK: where each page is mapped, to tell of one that is at two addresses or
     // is given back while it is still mapped
@@ -341,7 +346,7 @@ BOOL WINAPI free_title_physical_pages(HANDLE, ULONG_PTR count, ULONG_PTR *pages)
     auto &state = physical();
     const std::lock_guard lock(state.mutex);
     for (ULONG_PTR i = 0; i < count; ++i)
-        if (pages[i] / frames < state.used.size())
+        if (pages[i] && pages[i] / frames < state.used.size())
             release_page(state, pages[i] / frames);
     return TRUE;
 }
@@ -365,8 +370,10 @@ void *WINAPI map_title_physical_pages(void *address, ULONG_PTR count, DWORD type
         return nullptr;
     }
     for (ULONG_PTR i = 0; i < count; ++i)
-        if (pages[i] / frames >= state.used.size() ||
-            !map(state, *reservation, start + i * page, pages[i] / frames, protect, false)) {
+        if (!pages[i])
+            unmap(state, *reservation, start + i * page);
+        else if (pages[i] / frames >= state.used.size() ||
+                 !map(state, *reservation, start + i * page, pages[i] / frames, protect, false)) {
             tell_short("a mapping of physical pages", count * page);
             SetLastError(ERROR_INVALID_PARAMETER);
             return nullptr;
@@ -492,7 +499,8 @@ BOOL WINAPI xmem_map_physical_pages_scatter(void **addresses, ULONG_PTR count, U
             SetLastError(ERROR_INVALID_ADDRESS);
             return FALSE;
         }
-        if (!pages)
+        // a page number 0 unmaps as well: a title clears the addresses it lets go of that way
+        if (!pages || !pages[i])
             unmap(state, *reservation, at);
         else if (pages[i] / frames >= state.used.size() ||
                  !map(state, *reservation, at, pages[i] / frames, PAGE_READWRITE, false)) {

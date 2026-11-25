@@ -579,6 +579,35 @@ void Settings::console(const Fonts &fonts, const Host &host, ConsoleSettings &se
             console_notice_ = std::string("Not saved: ") + e.what();
         }
     };
+    section(fonts, "Console model");
+    if (begin_settings("model")) {
+        // the models of one generation, as a row of choices
+        const auto choose = [&](const char *id, Target target, ConsoleModel &model) {
+            std::vector<ConsoleModel> models;
+            std::vector<std::string> names;
+            for (const auto each : console_models)
+                if (model_target(each) == target) {
+                    models.push_back(each);
+                    names.emplace_back(model_name(each));
+                }
+            std::vector<const char *> labels;
+            for (const auto &name : names)
+                labels.push_back(name.c_str());
+            int chosen =
+                static_cast<int>(std::find(models.begin(), models.end(), model) - models.begin());
+            if (segmented(id, labels, chosen) && models[chosen] != model) {
+                model = models[chosen];
+                changed();
+            }
+        };
+        setting(fonts, "Xbox Series X|S titles",
+                "The console they are told they run on, which some size their memory and "
+                "picture by.");
+        choose("series model", Target::scarlett, settings.series_model);
+        setting(fonts, "Xbox One titles", "The console they are told they run on.");
+        choose("one model", Target::durango, settings.one_model);
+        end_settings();
+    }
     section(fonts, "Language");
     if (begin_settings("language")) {
         setting(fonts, "Language and region",

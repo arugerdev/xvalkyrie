@@ -1,4 +1,5 @@
 #pragma once
+#include "core/target.hpp"
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -25,6 +26,9 @@ struct ConsoleSettings {
     // dashboard, its frameworks and the rest of the system's packages). Optional: with it,
     // an app finds the packages it depends on there, and the dashboard can be started.
     std::filesystem::path system_storage;
+    // the console a title is told it runs on: an Xbox Series X|S title, an Xbox One one
+    ConsoleModel series_model = default_model(Target::scarlett);
+    ConsoleModel one_model = default_model(Target::durango);
 };
 // The console's dashboard in the system storage: the folder of its package, empty if the
 // storage is not set or has none.
@@ -61,6 +65,14 @@ void show_folder(const std::filesystem::path &folder);
 // config.ini, logs/, profiles/ and cache/ live in the per-user configuration folder.
 std::filesystem::path config_directory();
 std::filesystem::path config_file();
+// For a process started with settings of its own (xvboot's command line): config.ini and the
+// profile are not read and nothing is saved, every setting is its default...
+void ignore_config();
+// ...and a setting is given another value than config.ini's, for this process alone. `key` is
+// as config.ini names it in `section` ("console", "graphics", "input"), or one of the
+// profile's in "profile" (gamertag, xbox_user_id, gamerscore, age_group); `value` as one
+// would type it, unquoted. Throws for a setting there is not or a value it does not take.
+void override_setting(const std::string &section, const std::string &key, const std::string &value);
 // what can be worked out again but takes a while, such as the game library
 std::filesystem::path cache_directory();
 std::filesystem::path library_cache_file();

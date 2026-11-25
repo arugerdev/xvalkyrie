@@ -1,4 +1,5 @@
 #pragma once
+#include "core/target.hpp"
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -67,6 +68,9 @@ struct ConsoleSettings {
     // The console's system apps, each unpacked in a folder of its own; empty if there are
     // none. The packages a title depends on are looked for there as well as next to it.
     std::filesystem::path system_storage{};
+    // the console a title is told it runs on, by its generation
+    ConsoleModel series_model = default_model(Target::scarlett);
+    ConsoleModel one_model = default_model(Target::durango);
 };
 struct ExecuteOptions {
     // start even if some imports can't be resolved; calling one of them ends the process
@@ -106,11 +110,21 @@ const std::filesystem::path &save_directory();
 // The folder of the shader cache, from ExecuteOptions; empty when none was given.
 const std::filesystem::path &shader_cache_directory();
 const ConsoleSettings &console_settings();
+// the console the running title is told it is: the model of its generation in the settings
+ConsoleModel console_model();
+// what a title has of the memory of each console: 13 of a Series X's 16 GiB (13.5 there,
+// rounded down), 8 of a Series S's 10, 9 of a One X's 12, 5 of the others' 8
+constexpr std::uint64_t title_memory(ConsoleModel model) {
+    constexpr std::uint64_t gib[]{5, 5, 9, 8, 13}; // as ConsoleModel
+    return gib[static_cast<int>(model)] << 30;
+}
 
 namespace detail {
 void set_save_directory(std::filesystem::path directory);
 void set_shader_cache_directory(std::filesystem::path directory);
 void set_console_settings(ConsoleSettings settings);
+// the generation the title is of, which its modules are installed for
+void set_console_target(Target target);
 struct Binding {
     void *function;     // null if missing
     const char *origin; // "own", "host" or "missing"

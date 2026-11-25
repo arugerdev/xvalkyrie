@@ -127,15 +127,93 @@ void adopt_profile(ConsoleSettings &console) {
     } catch (const std::exception &) {
     }
 }
-Settings read() {
-    Settings result;
-    std::ifstream file(config_file());
-    if (!file) {
-        adopt_profile(result.console);
-        return result;
+// For xvboot started with settings of its own: config.ini and the profile are not read and
+// nothing is saved (ignoring), and the settings given take the place of the file's
+struct Override {
+    std::string section, key, value;
+};
+bool ignoring = false;
+std::vector<Override> overrides;
+// One setting of config.ini into `result`; `plain` for a value as typed, which the file
+// writes quoted. False for a setting there is not or a value it does not take.
+bool apply(Settings &result, const std::string &section, const std::string &key,
+           const std::string &value, bool plain) {
+    const auto text = plain ? value : json_string(value);
+    if (section == "input") {
+        if (key == "capture" && (value == "direct" || value == "window"))
+            result.input.capture =
+                value == "direct" ? input::Capture::direct : input::Capture::window;
+        else if (key == "host_gamepad" && (value == "true" || value == "false"))
+            result.input.host_gamepad = value == "true";
+        else {
+            for (std::size_t i = 0; i < input::control_count; ++i)
+                if (key == input::control_id(static_cast<input::Control>(i))) {
+                    if (const auto code = number(value); code && *code < 256) {
+                        result.input.keys[i] = static_cast<int>(*code);
+                        return true;
+                    }
+                    return false;
+                }
+            return false;
+        }
+    } else if (section == "graphics") {
+        if (key == "backend" && graphics::parse_backend(value))
+            result.backend = graphics::parse_backend(value);
+        else if (key == "fullscreen" && graphics::parse_fullscreen(value))
+            result.fullscreen = *graphics::parse_fullscreen(value);
+        else
+            return false;
+    } else if (section == "console") {
+        auto &console = result.console;
+        const auto model = parse_model(value);
+        if (key == "profile" && valid_profile_name(text))
+            console.profile = text;
+        else if (key == "language" && (text.empty() || valid_language(text)))
+            console.language = text;
+        else if (key == "headset" && (value == "true" || value == "false"))
+            console.headset = value == "true";
+        else if (key == "keyboard" && (value == "dialog" || value == "default_text"))
+            console.keyboard_dialog = value != "default_text";
+        else if (key == "system_storage")
+            console.system_storage = std::u8string(text.begin(), text.end());
+        else if (key == "series_model" && model && model_target(*model) == Target::scarlett)
+            console.series_model = *model;
+        else if (key == "one_model" && model && model_target(*model) == Target::durango)
+            console.one_model = *model;
+        else
+            return false;
+    } else if (section == "profile" && plain) {
+        auto &console = result.console;
+        if (key == "gamertag" && valid_gamertag(value))
+            console.gamertag = value;
+        else if (key == "xbox_user_id" && valid_xbox_user_id(value))
+            console.xbox_user_id = value;
+        else if (key == "gamerscore" && number(value))
+            console.gamerscore = *number(value);
+        else if (key == "age_group" && number(value) && *number(value) <= 3)
+            console.age_group = *number(value);
+        else
+            return false;
+    } else if (section == "libraries") {
+        if (key == "view")
+            result.library.grid = value != "list";
+        else if (key == "path" && !text.empty())
+            result.library.directories.emplace_back(std::u8string(text.begin(), text.end()));
+        else
+            return false;
+    } else {
+        return false;
     }
+    return true;
+}
+// config.ini and the profile it names, as saved
+Settings read_saved() {
+    Settings result;
+    if (ignoring)
+        return result;
+    std::ifstream file(config_file());
     std::string line, section;
-    while (std::getline(file, line)) {
+    while (file && std::getline(file, line)) {
         line = trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';')
             continue;
@@ -144,64 +222,33 @@ Settings read() {
             continue;
         }
         const auto equal = line.find('=');
-        if (equal == std::string::npos)
-            continue;
-        const auto key = trim(line.substr(0, equal)), value = trim(line.substr(equal + 1));
-        if (section == "input") {
-            if (key == "capture")
-                result.input.capture =
-                    value == "direct" ? input::Capture::direct : input::Capture::window;
-            else if (key == "host_gamepad")
-                result.input.host_gamepad = value != "false";
-            else
-                for (std::size_t i = 0; i < input::control_count; ++i)
-                    if (key == input::control_id(static_cast<input::Control>(i))) {
-                        try {
-                            std::size_t used = 0;
-                            const auto code = std::stoi(value, &used);
-                            if (used == value.size() && code >= 0 && code < 256)
-                                result.input.keys[i] = code;
-                        } catch (const std::exception &) {
-                        }
-                        break;
-                    }
-        } else if (section == "graphics") {
-            if (key == "backend")
-                result.backend = graphics::parse_backend(value);
-            else if (key == "fullscreen")
-                result.fullscreen =
-                    graphics::parse_fullscreen(value).value_or(graphics::Fullscreen::borderless);
-        } else if (section == "console") {
-            auto &console = result.console;
-            if (key == "profile")
-                console.profile = json_string(value);
-            else if (key == "language" && valid_language(json_string(value)))
-                console.language = json_string(value);
-            else if (key == "headset")
-                console.headset = value == "true";
-            else if (key == "keyboard")
-                console.keyboard_dialog = value != "default_text";
-            else if (key == "system_storage") {
-                const auto path = json_string(value);
-                console.system_storage = std::u8string(path.begin(), path.end());
-            }
-        } else if (section == "libraries") {
-            if (key == "view")
-                result.library.grid = value != "list";
-            else if (key == "path") {
-                try {
-                    const auto path = nlohmann::json::parse(value).get<std::string>();
-                    result.library.directories.emplace_back(
-                        std::u8string(path.begin(), path.end()));
-                } catch (const std::exception &) {
-                }
-            }
-        }
+        if (equal != std::string::npos)
+            apply(result, section, trim(line.substr(0, equal)), trim(line.substr(equal + 1)),
+                  false);
     }
     adopt_profile(result.console);
     return result;
 }
+// what this process runs with: the saved settings with those given in their place
+Settings read() {
+    if (overrides.empty())
+        return read_saved();
+    auto result = read_saved();
+    const auto profile = result.console.profile;
+    for (const auto &[section, key, value] : overrides)
+        if (section != "profile")
+            apply(result, section, key, value, true);
+    // another profile is that profile, as it is saved
+    if (result.console.profile != profile && !read_profile(result.console.profile, result.console))
+        throw std::invalid_argument("There is no profile " + result.console.profile);
+    for (const auto &[section, key, value] : overrides)
+        if (section == "profile")
+            apply(result, section, key, value, true);
+    return result;
+}
 void write(const Settings &settings) {
+    if (ignoring)
+        return;
     const auto path = config_file();
     std::filesystem::create_directories(path.parent_path());
     const auto temp = path.string() + ".tmp";
@@ -226,6 +273,8 @@ void write(const Settings &settings) {
         if (!console.system_storage.empty())
             file << "system_storage = " << nlohmann::json(utf8(console.system_storage)).dump()
                  << '\n';
+        file << "series_model = " << model_id(console.series_model)
+             << "\none_model = " << model_id(console.one_model) << '\n';
         file << "\n[libraries]\nview = " << (settings.library.grid ? "grid" : "list") << '\n';
         for (const auto &directory : settings.library.directories)
             file << "path = " << nlohmann::json(utf8(directory)).dump() << '\n';
@@ -238,9 +287,17 @@ void write(const Settings &settings) {
 }
 } // namespace
 
+void ignore_config() { ignoring = true; }
+void override_setting(const std::string &section, const std::string &key,
+                      const std::string &value) {
+    Settings taken;
+    if (!apply(taken, section, key, value, true))
+        throw std::invalid_argument("No setting " + section + "." + key + " takes " + value);
+    overrides.push_back({section, key, value});
+}
 void load_input_settings() { input::configure(read().input); }
 void save_input_settings() {
-    auto settings = read();
+    auto settings = read_saved();
     settings.input = input::settings();
     write(settings);
 }
@@ -251,7 +308,7 @@ void load_graphics_settings() {
     graphics::select_fullscreen_mode(settings.fullscreen);
 }
 void save_graphics_settings() {
-    auto settings = read();
+    auto settings = read_saved();
     settings.input = input::settings();
     settings.backend = graphics::selected_backend();
     settings.fullscreen = graphics::fullscreen_mode();
@@ -279,9 +336,11 @@ std::filesystem::path system_menu(const ConsoleSettings &settings) {
                : std::filesystem::path{};
 }
 void save_console_settings(const ConsoleSettings &console) {
-    auto settings = read();
+    auto settings = read_saved();
     settings.input = input::settings();
     settings.console = console;
+    if (ignoring)
+        return;
     write_profile(console);
     write(settings);
 }
@@ -379,7 +438,7 @@ void delete_profile(const std::string &name) {
 }
 LibrarySettings load_library_settings() { return read().library; }
 void save_library_settings(const LibrarySettings &library) {
-    auto settings = read();
+    auto settings = read_saved();
     settings.input = input::settings();
     settings.library = library;
     write(settings);

@@ -561,7 +561,7 @@ BOOL WINAPI xmem_working_set_statistics(DWORD, WorkingSet *statistics) {
         return FALSE;
     // What is used is what the title has taken, not what the rest of the host has: a title
     // sizes its pools and what it streams in by what is left of its limit.
-    const SIZE_T limit = std::min<ULONGLONG>(13ull << 30, host.ullTotalPhys);
+    const SIZE_T limit = std::min<ULONGLONG>(title_memory(console_model()), host.ullTotalPhys);
     const SIZE_T used = std::min<ULONGLONG>(process.PrivateUsage, limit);
     *statistics = {limit, used, 0, 0, 0, 0, limit, used, 0, 0};
     return TRUE;

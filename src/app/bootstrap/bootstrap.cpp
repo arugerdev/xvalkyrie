@@ -29,7 +29,8 @@ runtime::ConsoleSettings console_settings() {
     const auto saved = load_console_settings();
     return {
         wide(saved.gamertag), wide(saved.xbox_user_id), saved.gamerscore,     saved.age_group,
-        saved.headset,        saved.keyboard_dialog,    wide(saved.language), saved.system_storage};
+        saved.headset,        saved.keyboard_dialog,    wide(saved.language), saved.system_storage,
+        saved.series_model,   saved.one_model};
 }
 // "<title> [<title ID>] | <video driver> | <n> FPS | XValkyrie <version> <commit>", with the frame
 // rate over the time since it was last asked for. The driver is what the title's device was made
@@ -169,6 +170,9 @@ std::uint32_t run(const std::filesystem::path &path, runtime::ExecuteOptions opt
     options.save_directory = title_save_directory(path);
     options.shader_cache_directory = cache_directory() / "shaders";
     options.console = console_settings();
+    std::cerr << "[Boot] a Series title is told it runs on an "
+              << model_name(options.console.series_model) << ", an Xbox One one on an "
+              << model_name(options.console.one_model) << std::endl;
     // the title by its name, and by its title ID where it has one
     const auto id = title_id(path);
     const auto name = title_name(path) + (id.empty() ? "" : " [" + id + "]");

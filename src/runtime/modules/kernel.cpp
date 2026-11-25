@@ -539,8 +539,9 @@ BOOL WINAPI free_library(HMODULE module) {
     return TRUE;
 }
 // Which console this is. The GDK's XSystemGetDeviceType reads it from the registry, the
-// ConsoleMode value of this key: 0x50 is an Xbox One X, 0x64 an Xbox Series X. Without the
-// key the title is told it runs on a PC, which a console build has no case for.
+// ConsoleMode value of this key, the console's hardware revision: 0x10 to 0x31 an Xbox One,
+// 0x40 a One S, 0x50 a One X, 0x60 a Series S, 0x64 a Series X. Without the key the title is
+// told it runs on a PC, which a console build has no case for.
 Target console = Target::durango;
 const HKEY console_key = reinterpret_cast<HKEY>(static_cast<std::uintptr_t>(0x58530001));
 constexpr wchar_t oem_key[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM";
@@ -561,7 +562,8 @@ LSTATUS WINAPI reg_query_value_ex_w(HKEY key, const wchar_t *name, DWORD *reserv
         return RegQueryValueExW(key, name, reserved, type, data, size);
     if (!name || _wcsicmp(name, L"ConsoleMode"))
         return ERROR_FILE_NOT_FOUND;
-    const DWORD mode = console == Target::scarlett ? 0x64 : 0x50;
+    constexpr DWORD modes[]{0x10, 0x40, 0x50, 0x60, 0x64}; // as ConsoleModel
+    const DWORD mode = modes[static_cast<int>(console_model())];
     if (type)
         *type = REG_DWORD;
     const bool fits = !data || (size && *size >= sizeof mode);
@@ -758,6 +760,7 @@ std::wstring console_file_path(const wchar_t *path) { return console_path(path);
 
 void install_kernel(Registry &registry, Target target) {
     console = target;
+    detail::set_console_target(target);
     for (const auto &[name, function] : functions)
         registry.add_api(name, function);
     install_locale(registry);

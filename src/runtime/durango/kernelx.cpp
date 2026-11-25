@@ -36,9 +36,18 @@ FARPROC WINAPI get_proc_address(HMODULE module, const char *name) {
         return reinterpret_cast<FARPROC>(&create_xaudio2);
     return modules::get_proc_address(module, name);
 }
-// CONSOLE_TYPE: unknown, Xbox One, One S, One X, One X devkit. The most capable retail one,
-// which is what titles with an Xbox One X mode look for.
-int WINAPI get_console_type() { return 3; }
+// CONSOLE_TYPE: unknown, Xbox One, One S, One X, One X devkit; the one of the settings, the
+// One X without a choice, which is what titles with an Xbox One X mode look for
+int WINAPI get_console_type() {
+    switch (model_for(Target::durango, console_model())) {
+    case ConsoleModel::xbox_one:
+        return 1;
+    case ConsoleModel::xbox_one_s:
+        return 2;
+    default:
+        return 3;
+    }
+}
 BOOL WINAPI set_thread_name(HANDLE thread, const wchar_t *name) {
     return SUCCEEDED(SetThreadDescription(thread, name));
 }
@@ -115,10 +124,10 @@ BOOL WINAPI title_memory_status(TitleMemory *status) {
                                  reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&process),
                                  sizeof process))
         return FALSE;
-    // What a title gets on an Xbox One X, or less if the host has less in all. How much of
-    // the host's is free at the moment does not count: a console's memory is the title's
-    // alone, and titles lay their heaps out by what is left of it.
-    const ULONGLONG budget = std::min<ULONGLONG>(9ull << 30, host.ullTotalPhys);
+    // What a title gets on the console it is told it runs on, or less if the host has less in
+    // all. How much of the host's is free at the moment does not count: a console's memory
+    // is the title's alone, and titles lay their heaps out by what is left of it.
+    const ULONGLONG budget = std::min<ULONGLONG>(title_memory(console_model()), host.ullTotalPhys);
     const ULONGLONG used = std::min<ULONGLONG>(process.PrivateUsage, budget);
     const ULONGLONG available = budget - used;
     *status = {sizeof *status, 0, budget, available, 0, 0, 0, used, available, 0, 0};

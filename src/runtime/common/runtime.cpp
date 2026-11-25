@@ -24,6 +24,7 @@ std::string lower(std::string_view text) {
 std::filesystem::path saves;
 std::filesystem::path shader_cache;
 ConsoleSettings console;
+Target target = Target::scarlett;
 } // namespace
 
 const std::filesystem::path &save_directory() { return saves; }
@@ -34,6 +35,10 @@ void detail::set_shader_cache_directory(std::filesystem::path directory) {
 }
 const ConsoleSettings &console_settings() { return console; }
 void detail::set_console_settings(ConsoleSettings settings) { console = std::move(settings); }
+void detail::set_console_target(Target generation) { target = generation; }
+ConsoleModel console_model() {
+    return model_for(target, target == Target::scarlett ? console.series_model : console.one_model);
+}
 
 void Registry::add(std::string_view module, std::string_view symbol, void *function) {
     if (module.empty() || symbol.empty() || !function)

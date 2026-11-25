@@ -92,6 +92,12 @@ project. That code follows AMD's addrlib (MIT), credited in `texture_layout.hpp`
 
 `src/runtime/modules/bcpack.cpp` and `bcpack.hpp` are a port to C++ of
 `crates/victory-formats/src/bcpack.rs` of the same project (commit
-`ffe310eb2098e52169f4c44db5ffdabf43a72622`). BCPack's constant tables (77,982 bytes) are not
-part of it, nor of this repository. A user who has them puts them beside the executable as
-`bcpack-tables.bin`; without them DirectStorage requests with BCPack fail.
+`ffe310eb2098e52169f4c44db5ffdabf43a72622`).
+
+## BCPack tables
+
+`src/runtime/modules/bcpack_tables.cpp` holds BCPack's constant tables (entropy models, index
+ranks, BC7 control codes and dictionaries, 77,982 bytes), which a BCPack stream cannot be
+decoded without. They are part of the format, not this project's work, and this project's
+license does not cover them. A `bcpack-tables.bin` beside the executable is used in their
+place.

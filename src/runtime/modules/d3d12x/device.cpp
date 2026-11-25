@@ -1815,6 +1815,59 @@ template <class View> bool fit_buffer_view(ID3D12Resource *resource, View &view)
         std::min<std::uint64_t>(view.Buffer.NumElements, elements - view.Buffer.FirstElement));
     return view.Buffer.NumElements != 0;
 }
+// The host takes a raw view only from a multiple of 16 bytes into its buffer (FirstElement a
+// multiple of 4), and drops the device over one from anywhere else; the console's starts at
+// any word.
+template <class View> bool raw_off_16(const View &view) {
+    return static_cast<UINT>(view.Buffer.Flags) & 1 && view.Buffer.FirstElement % 4;
+}
+std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
+                        std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
+                        std::uint64_t *offset = nullptr);
+// A raw view to read that the host cannot have where it is: what it is of is copied, as it
+// is now, to 16 bytes into the ring of copies, and the view is of the copy, as constants that
+// do not start on 256 bytes are (see create_cbv). `address` becomes the title's address of
+// its first word, from which the copy is made again when the view is (refresh_memory_view).
+// False when the CPU cannot read the buffer, or the view is larger than a copy made each time
+// it is made may be (as for views of memory in no buffer, see create_srv_at).
+bool copy_raw_view(ID3D12Resource *&resource, D3D12_SHADER_RESOURCE_VIEW_DESC &view,
+                   std::uint64_t &address) {
+    const auto start = view.Buffer.FirstElement * 4;
+    const auto bytes = std::uint64_t{view.Buffer.NumElements} * 4;
+    if (bytes > (16ull << 20))
+        return false;
+    // the buffer's memory as the CPU has it: where it is kept mapped, or mapped now
+    std::uint64_t kept = 0;
+    const bool mapped = mapped_address(resource, kept);
+    void *memory = reinterpret_cast<void *>(kept);
+    const D3D12_RANGE read{static_cast<SIZE_T>(start), static_cast<SIZE_T>(start + bytes)};
+    if (!mapped && (FAILED(resource->Map(0, &read, &memory)) || !memory))
+        return false;
+    ID3D12Resource *ring = nullptr;
+    std::uint64_t offset = 0;
+    const auto copy = ring_copy(static_cast<const std::uint8_t *>(memory) + start, bytes, bytes, 16,
+                                &ring, &offset);
+    if (!mapped) {
+        const D3D12_RANGE nothing_written{0, 0};
+        resource->Unmap(0, &nothing_written);
+    }
+    if (!copy)
+        return false;
+    address = (mapped ? kept : resource->GetGPUVirtualAddress()) + start;
+    resource = ring;
+    view.Buffer.FirstElement = offset / 4;
+    return true;
+}
+// what a raw view copied by copy_raw_view is of, kept to make the copy again
+void keep_raw_copy(D3D12_CPU_DESCRIPTOR_HANDLE handle, D3D12_SHADER_RESOURCE_VIEW_DESC view,
+                   std::uint64_t address) {
+    MemoryView kept;
+    kept.handle = handle;
+    view.Buffer.FirstElement = 0;
+    std::memcpy(kept.resource, &view, sizeof view);
+    std::memcpy(kept.resource + sizeof view, &address, sizeof address);
+    keep_memory_view(kept);
+}
 // A descriptor the title wrote, made on the host as what the table it is bound in says it is.
 // A buffer descriptor (V#) has a 48-bit address, the stride in bits 48-61 and the record
 // count in its third dword.
@@ -1907,6 +1960,11 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
     }
     const auto host = host_slot(heap, at);
     auto *const device = heap.device;
+    // the title wrote another descriptor here: a copy kept for what was here is not made again
+    {
+        const std::lock_guard lock(memory_view_mutex);
+        memory_views.erase(host.ptr);
+    }
     // a view of nothing, of a buffer or a texture
     const auto view_nothing = [&](bool buffer) {
         if (type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {
@@ -1983,12 +2041,16 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
             view.Buffer = {offset / element, static_cast<UINT>(size / element),
                            structured ? stride : 0,
                            structured ? D3D12_BUFFER_SRV_FLAG_NONE : D3D12_BUFFER_SRV_FLAG_RAW};
-            if (!fit_buffer_view(resource, view))
+            std::uint64_t copied = 0;
+            if (!fit_buffer_view(resource, view) ||
+                (raw_off_16(view) && !copy_raw_view(resource, view, copied)))
                 view_nothing(true);
             else
                 original<void(STDMETHODCALLTYPE *)(void *, void *, const void *,
                                                    D3D12_CPU_DESCRIPTOR_HANDLE)>(device, 18)(
                     device, resource, &view, host);
+            if (copied)
+                keep_raw_copy({at}, view, copied);
         } else {
             D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
             view.Format = structured ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
@@ -1996,7 +2058,8 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
             view.Buffer = {offset / element, static_cast<UINT>(size / element),
                            structured ? stride : 0, 0,
                            structured ? D3D12_BUFFER_UAV_FLAG_NONE : D3D12_BUFFER_UAV_FLAG_RAW};
-            if (!fit_buffer_view(resource, view))
+            // a raw view not on 16 bytes is of nothing: a copy would lose what the GPU writes
+            if (!fit_buffer_view(resource, view) || raw_off_16(view))
                 view_nothing(true);
             else
                 original<void(STDMETHODCALLTYPE *)(void *, void *, void *, const void *,
@@ -2089,9 +2152,6 @@ struct CopyingFor {
     CopyingFor(const CopyingFor &) = delete;
     CopyingFor &operator=(const CopyingFor &) = delete;
 };
-std::uint64_t ring_copy(const void *source, std::uint64_t bytes, std::uint64_t most = 64 << 10,
-                        std::uint64_t align = 0, ID3D12Resource **buffer = nullptr,
-                        std::uint64_t *offset = nullptr);
 // how much of `bytes` from `address` on is memory the process can read, over as many regions
 // of it as there are
 std::uint64_t readable_bytes(const void *address, std::uint64_t bytes) {
@@ -2272,6 +2332,7 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
                                   Handle handle) {
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     const auto of = resource ? resource->GetDesc() : D3D12_RESOURCE_DESC{};
+    std::uint64_t copied = 0; // the title's address of a raw view copied (copy_raw_view)
     if (desc) {
         std::memcpy(&view, desc, sizeof view);
         // the console's own formats as the host has them (see host_format): the stencil of its
@@ -2328,7 +2389,8 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
         }
         if (view.ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
             desc = &view;
-            if (!fit_buffer_view(resource, view)) {
+            if (!fit_buffer_view(resource, view) ||
+                (raw_off_16(view) && !copy_raw_view(resource, view, copied))) {
                 resource = nullptr;
                 desc = null_view(view, nullptr);
             }
@@ -2337,6 +2399,8 @@ void STDMETHODCALLTYPE create_srv(ID3D12Device *self, ID3D12Resource *resource, 
     original<void(STDMETHODCALLTYPE *)(void *, void *, const void *, Handle)>(self, 18)(
         self, resource, desc, host_handle(handle));
     mark_host(handle);
+    if (copied)
+        keep_raw_copy(handle, view, copied);
     if (resource && desc && console == Target::scarlett) {
         D3D12_SHADER_RESOURCE_VIEW_DESC made;
         std::memcpy(&made, desc, sizeof made);
@@ -2429,7 +2493,9 @@ void STDMETHODCALLTYPE create_uav(ID3D12Device *self, ID3D12Resource *resource,
     }
     if (resource && desc && view.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         desc = &view;
-        if (!fit_buffer_view(resource, view)) {
+        // a raw view not on 16 bytes (see raw_off_16) is of nothing: a copy would lose what
+        // the GPU writes
+        if (!fit_buffer_view(resource, view) || raw_off_16(view)) {
             resource = counter = nullptr;
             desc = null_view(view, nullptr);
         }
@@ -3152,7 +3218,8 @@ ID3D12Resource *texture_at(ID3D12Device *self, std::uint64_t address,
     return resource;
 }
 // A view of nothing, whose reads give 0, for memory no resource here holds (see gpu_address):
-// the host wants a format for it unless it is of structures
+// the host wants a format for it unless it is of structures, and a raw one to start on 16
+// bytes even then (see raw_off_16): it starts at the first
 template <class View> const View *null_view(View &view, const D3D12_RESOURCE_DESC *of) {
     // D3D12_SRV_DIMENSION_BUFFER and D3D12_UAV_DIMENSION_BUFFER
     const bool buffer = static_cast<int>(view.ViewDimension) == 1;
@@ -3160,6 +3227,8 @@ template <class View> const View *null_view(View &view, const D3D12_RESOURCE_DES
         const auto format = of && !buffer ? typed_format(of->Format) : DXGI_FORMAT_UNKNOWN;
         view.Format = format != DXGI_FORMAT_UNKNOWN ? format : DXGI_FORMAT_R32_UINT;
     }
+    if (buffer)
+        view.Buffer.FirstElement = 0;
     return &view;
 }
 void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DESC *of,
@@ -3205,19 +3274,22 @@ void STDMETHODCALLTYPE create_srv_at(ID3D12Device *self, const D3D12_RESOURCE_DE
         // Memory of the title's that is in no buffer here: what the view is of is copied,
         // as it is now, to where the host can have a view (the matrices a title draws its
         // first screens with may be in such views, made as it draws).
-        const auto bytes =
-            (view.Buffer.FirstElement + std::uint64_t{view.Buffer.NumElements}) * element;
+        // The copy is of the elements viewed, and starts on 256 bytes, which a raw view takes.
+        const auto skipped = view.Buffer.FirstElement * element;
+        const auto bytes = std::uint64_t{view.Buffer.NumElements} * element;
         MEMORY_BASIC_INFORMATION info{};
         if (console != Target::scarlett || !element || !bytes || bytes > (16ull << 20) ||
             !VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
             info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
-            reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - address < bytes ||
-            !ring_copy(reinterpret_cast<const void *>(address), bytes, bytes,
+            reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize - address <
+                skipped + bytes ||
+            !ring_copy(reinterpret_cast<const void *>(address + skipped), bytes, bytes,
                        256 % element ? element : 256, &resource, &offset)) {
             // nothing the host can have a view of: a view of nothing, whose reads give 0
             create_srv(self, nullptr, null_view(view, of), handle);
             return;
         }
+        view.Buffer.FirstElement = 0;
     }
     if (element)
         view.Buffer.FirstElement += offset / element;

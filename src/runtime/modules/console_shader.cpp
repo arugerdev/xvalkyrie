@@ -37,7 +37,7 @@
 namespace xv::runtime::modules {
 namespace {
 // Bumped whenever what is made for a shader changes: the cache keeps one file per version.
-constexpr int translator_version = 21;
+constexpr int translator_version = 23;
 
 using Bytes = std::span<const std::uint8_t>;
 std::uint32_t word(Bytes bytes, std::size_t at) {
@@ -384,6 +384,14 @@ std::string stand_in(ShaderStage stage, Bytes container) {
     if (stage == ShaderStage::compute)
         return "[numthreads(1, 1, 1)] void main() {}\n";
     const auto inputs = signature(container, "ISG1"), outputs = signature(container, "OSG1");
+    // a mesh shader that makes one vertex and no primitive, with the vertices its pipeline's
+    // pixel shader takes (the host's validator wants every output written)
+    if (stage == ShaderStage::mesh)
+        return (outputs.empty() ? std::string("struct Output { float4 f0 : SV_Position; };\n")
+                                : hlsl_struct("Output", outputs, false)) +
+               "[outputtopology(\"triangle\")] [numthreads(1, 1, 1)] void main(out vertices "
+               "Output v[1], out indices uint3 i[1]) { SetMeshOutputCounts(1, 0); v[0] = "
+               "(Output)0; }\n";
     // a geometry shader that draws nothing
     if (stage >= ShaderStage::geometry_points) {
         if (inputs.empty() || outputs.empty())
@@ -418,7 +426,7 @@ std::optional<std::string> translated_source(ShaderStage stage, Bytes container,
                                              std::uint32_t signed_inputs = 0,
                                              Bytes root_signature = {}) {
     if (stage != ShaderStage::vertex && stage != ShaderStage::pixel &&
-        stage != ShaderStage::compute)
+        stage != ShaderStage::compute && stage != ShaderStage::mesh)
         return std::nullopt;
     const auto file = code_container(container);
     rdna::Shader shader;
@@ -499,10 +507,12 @@ std::vector<std::uint8_t> compile_newer(ShaderStage stage, const std::string &so
                                       ? (stage == ShaderStage::vertex    ? L"vs_6_6"
                                          : stage == ShaderStage::pixel   ? L"ps_6_6"
                                          : stage == ShaderStage::compute ? L"cs_6_6"
+                                         : stage == ShaderStage::mesh    ? L"ms_6_6"
                                                                          : L"gs_6_6")
                                   : stage == ShaderStage::vertex  ? L"vs_6_0"
                                   : stage == ShaderStage::pixel   ? L"ps_6_0"
                                   : stage == ShaderStage::compute ? L"cs_6_0"
+                                  : stage == ShaderStage::mesh    ? L"ms_6_5"
                                                                   : L"gs_6_0",
                                   L"-HV", L"2018", source.size() > 200'000 ? L"-Od" : L"-O3"};
     const DxcBuffer text{source.data(), source.size(), DXC_CP_UTF8};
@@ -607,11 +617,16 @@ std::vector<std::uint8_t> compile_now(ShaderStage stage, const std::string &sour
 std::vector<std::uint8_t> compile_sm6(ShaderStage stage, const std::string &source) {
     using Microsoft::WRL::ComPtr;
     ComPtr<IDxcCompiler3> compiler;
-    if (FAILED(host_dxc_create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
+    // the newer one of a Windows SDK where there is one: the system's may not know the
+    // models of mesh shaders and of the heaps
+    if ((!newer_compiler() ||
+         FAILED(newer_compiler()(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler)))) &&
+        FAILED(host_dxc_create_instance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler))))
         return {};
     const bool heaps = source.find("DescriptorHeap[") != std::string::npos;
     const wchar_t *const profile = stage == ShaderStage::vertex    ? (heaps ? L"vs_6_6" : L"vs_6_0")
                                    : stage == ShaderStage::compute ? (heaps ? L"cs_6_6" : L"cs_6_0")
+                                   : stage == ShaderStage::mesh    ? (heaps ? L"ms_6_6" : L"ms_6_5")
                                    : stage == ShaderStage::pixel   ? L"ps_6_6"
                                                                    : L"gs_6_6";
     // as compile_newer: the largest are not optimized, which takes several times as long
@@ -1046,11 +1061,14 @@ HeapLayout shader_heap_layout(Bytes container) {
     if (!layouts || layouts >= 4096 || reads >= 4096 ||
         at + 20ull * (layouts + reads) > file.size())
         return layout;
+    // a mesh shader's (its record in the mesh slot) user register n is s(n + 8)
+    const std::uint32_t offset = at32(0x58) != 0xdeadbeef ? 8 : 0;
     for (std::uint32_t n = 0; n < layouts; ++n) {
         const auto entry = at + 20 * n;
         const auto type = at32(entry);
         if (type == 0 || type == 1 || type == 3)
-            layout.entries.push_back({type, file[entry + 16], at32(entry + 8), file[entry + 17]});
+            layout.entries.push_back(
+                {type, file[entry + 16] + offset, at32(entry + 8), file[entry + 17]});
     }
     for (std::uint32_t n = 0; n < reads; ++n) {
         const auto entry = at + 20 * (layouts + n);
@@ -1061,7 +1079,7 @@ HeapLayout shader_heap_layout(Bytes container) {
                           : kind == 2     ? 3u
                                           : ~0u;
         if (type != ~0u)
-            layout.reads.push_back({type, file[entry + 17], at32(entry + 4) / 8,
+            layout.reads.push_back({type, file[entry + 17] + offset, at32(entry + 4) / 8,
                                     file[entry + 16] == 4 ? at32(entry + 12) : 0});
     }
     return layout;
@@ -1262,7 +1280,8 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
         const bool done = !shader.empty();
         // a pipeline whose shaders read the heaps is of the newer model in every stage: a
         // stand-in for one of them is too
-        const bool stands_in = model != HostShaderModel::sm6 || heap_shaders;
+        const bool stands_in =
+            model != HostShaderModel::sm6 || heap_shaders || stage == ShaderStage::mesh;
         if (done || stands_in)
             ++(done ? translated : stood_in);
         const std::lock_guard lock(mutex);
@@ -1275,7 +1294,7 @@ std::span<const std::uint8_t> make_host_shader(ShaderStage stage, Bytes containe
             if (const auto *const dump = std::getenv("XV_SHADER_CODE"))
                 write_file(std::filesystem::path(dump) / (hash + "-" + letter + ".stand-in.hlsl"),
                            {reinterpret_cast<const std::uint8_t *>(text.data()), text.size()});
-            shader = compile(stage, text, {}, heap_shaders);
+            shader = compile(stage, text, {}, heap_shaders || stage == ShaderStage::mesh);
         } else if (done && kept) {
             // only what was translated is kept: a stand-in is made again, in case the next
             // version translates the shader
@@ -1424,8 +1443,11 @@ std::span<const std::uint8_t> host_shader(ShaderStage stage, Bytes container, Ho
                                           std::span<const PackedInput> packed,
                                           Bytes root_signature) {
     if (model != HostShaderModel::sm5 && stage != ShaderStage::vertex &&
-        stage != ShaderStage::pixel)
+        stage != ShaderStage::pixel && stage != ShaderStage::mesh)
         return {};
+    // a mesh shader is of the model that has them
+    if (stage == ShaderStage::mesh)
+        model = HostShaderModel::sm6;
     // a shader that reads the heaps is of the model that has them, whatever is asked
     if (heap_shaders)
         model = HostShaderModel::sm6;

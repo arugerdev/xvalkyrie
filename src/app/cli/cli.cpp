@@ -197,6 +197,7 @@ std::optional<int> run(int argc, wchar_t **argv) {
             const auto stage = name.back() == 'v'   ? runtime::modules::ShaderStage::vertex
                                : name.back() == 'p' ? runtime::modules::ShaderStage::pixel
                                : name.back() == 'c' ? runtime::modules::ShaderStage::compute
+                               : name.back() == 'm' ? runtime::modules::ShaderStage::mesh
                                                     : runtime::modules::ShaderStage(-1);
             if (stage == runtime::modules::ShaderStage(-1))
                 continue;
@@ -253,11 +254,31 @@ std::optional<int> run(int argc, wchar_t **argv) {
                   << '\n';
         return 0;
     }
+    if (argc == 3 && command == "shader-host") {
+        // <hash>-<stage>.dxbc: how many bytes the host's shader made for it has, translated or
+        // a stand-in, as a title's pipeline would get it
+        const std::filesystem::path file(argv[2]);
+        const auto name = file.stem().string();
+        const auto stage = name.ends_with('v')   ? runtime::modules::ShaderStage::vertex
+                           : name.ends_with('p') ? runtime::modules::ShaderStage::pixel
+                           : name.ends_with('m') ? runtime::modules::ShaderStage::mesh
+                                                 : runtime::modules::ShaderStage::compute;
+        const auto made = runtime::modules::host_shader(
+            stage, host::read_snapshot(file, 64 * 1024 * 1024),
+            stage == runtime::modules::ShaderStage::mesh ? runtime::modules::HostShaderModel::sm6
+                                                         : runtime::modules::HostShaderModel::sm5);
+        std::cout << made.size() << " bytes, "
+                  << runtime::modules::host_shader_note(stage,
+                                                        host::read_snapshot(file, 64 << 20))
+                  << '\n';
+        return made.empty() ? 1 : 0;
+    }
     if (argc == 3 && command == "shader-source") {
         const std::filesystem::path file(argv[2]);
         const auto name = file.stem().string();
         const auto stage = name.ends_with('v')   ? runtime::modules::ShaderStage::vertex
                            : name.ends_with('p') ? runtime::modules::ShaderStage::pixel
+                           : name.ends_with('m') ? runtime::modules::ShaderStage::mesh
                                                  : runtime::modules::ShaderStage::compute;
         std::string why;
         std::uint32_t at = ~0u;

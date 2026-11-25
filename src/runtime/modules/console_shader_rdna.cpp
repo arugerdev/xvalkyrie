@@ -330,7 +330,9 @@ class Translator {
     bool needs_sm6() const { return needs_sm6_; }
 
     std::string run() {
-        if (!read_root_signature(shader_.root_signature, parameters_))
+        // one that reads the heaps itself has what it needs in its own file
+        if (!read_root_signature(shader_.root_signature, parameters_) &&
+            !(shader_.heaps && shader_.root_signature.empty()))
             give_up("root signature");
         read_file();
         decode();
@@ -377,6 +379,9 @@ class Translator {
     // the first user register of a shader that reads the heaps itself, which is xv_ud0: a
     // compute shader's start at s0, the other stages' after the eight the hardware sets
     std::uint32_t user_first() const { return stage_ == Stage::compute ? 0u : 8u; }
+    // A mesh shader runs as the merged stages do, with eight registers of the hardware's
+    // first: what its file says is user register n is s(n + 8).
+    std::uint32_t user_offset() const { return stage_ == Stage::mesh ? 8u : 0u; }
     // An Xbox One shader: its size, 5 at 0x18, where its code is at 0x28; the program starts
     // 0x28 into the code and is as long as 0x1dc says.
     bool read_older_file() {
@@ -461,6 +466,35 @@ class Translator {
             header_[i] = word(file, header + 4 * i);
         for (std::uint32_t at = region + 0x28; at + 4 <= region + size; at += 4)
             code_.push_back(word(file, at));
+        // A mesh shader's record (at 0xc0, as the other stages') is followed by its stage
+        // data: from 0xc8 on its outputs, 6 bytes each {usage, row, parameter (bit 7: one of
+        // the primitive's), ...}, as many as 0x188 says; at 0x448 the lanes of its group, its
+        // most vertices and primitives, its user registers and its topology (2 triangles).
+        // The record's flags at 0x14 say wave32 by bit 5; its LDS bytes are at 0x4c.
+        if (stage_ == Stage::mesh) {
+            constexpr std::size_t record = 0xc0, data = record + 0x54;
+            if (data + 0x450 > file.size())
+                give_up("no mesh stage data");
+            const auto half = [&](std::size_t at) {
+                std::uint16_t value = 0;
+                std::memcpy(&value, file.data() + at, 2);
+                return std::uint32_t{value};
+            };
+            mesh_threads_ = half(data + 0x448);
+            mesh_vertices_ = half(data + 0x44a);
+            mesh_primitives_ = half(data + 0x44c);
+            mesh_wave_ = word(file, record + 0x14) >> 5 & 1 ? 32 : 64;
+            mesh_shared_ = word(file, record + 0x4c);
+            if (file[data + 0x44f] != 2)
+                give_up("a mesh shader not drawing triangles");
+            if (!mesh_threads_ || mesh_threads_ > 128 || mesh_vertices_ > 256 ||
+                mesh_primitives_ > 256 || !mesh_vertices_ || !mesh_primitives_)
+                give_up("a mesh shader beyond the host's limits");
+            for (std::uint32_t n = 0; n < std::min(word(file, data + 0x188), 32u); ++n) {
+                const auto at = data + 0xc8 + 6 * n;
+                mesh_outputs_.push_back({file[at + 2], file[at + 1]});
+            }
+        }
         // the records after the code: where the root parameters are
         std::size_t at = region + size;
         while (word(file, at) == 0xbf9f0000)
@@ -484,11 +518,11 @@ class Translator {
             for (std::uint32_t n = 0; n < layouts; ++n) {
                 const auto entry = at + 20 * n;
                 const auto type = word(file, entry), count = word(file, entry + 8);
-                const std::uint32_t reg = file[entry + 16], slot = file[entry + 17];
+                const std::uint32_t reg = file[entry + 16] + user_offset(), slot = file[entry + 17];
                 if (type == 4)
                     continue;
                 if (reg < user_first() ||
-                    reg + (type == 0 ? count : type == 1 ? 2 : 1) > user_first() + 16)
+                    reg + (type == 0 ? count : type == 1 ? 2 : 1) > user_first() + 24)
                     give_up("user registers the host's shader is not given");
                 if (type == 1) {
                     // A root view: the host's signature has one of each kind in space 201,
@@ -540,7 +574,8 @@ class Translator {
                                   : kind == 2     ? 3u
                                                   : ~0u;
                 if (type != ~0u)
-                    bound_.push_back({word(file, entry + 4) * 4, type, file[entry + 17]});
+                    bound_.push_back(
+                        {word(file, entry + 4) * 4, type, file[entry + 17] + user_offset()});
             }
             any = true;
             at = file.size();
@@ -549,7 +584,8 @@ class Translator {
             const auto kind = word(file, at);
             if (kind != 3 && kind != 1)
                 continue;
-            const auto where = word(file, at + 16), parameter = where >> 8, reg = where & 0xff;
+            const auto where = word(file, at + 16), parameter = (where >> 8) & 0xff,
+                       reg = (where & 0xff) + user_offset();
             if (parameter >= parameters_.size() || reg >= 105)
                 continue;
             if (kind == 3 && parameters_[parameter].type == 0)
@@ -1432,6 +1468,14 @@ class Translator {
                     prologue_ += "    " + s(reg++) + " = group." + "xyz"[c] + ";\n";
             for (int c = 0; c < 3; ++c)
                 prologue_ += "    " + v(c) + " = thread." + "xyz"[c] + ";\n";
+        } else if (stage_ == Stage::mesh) {
+            // the wave's place in the group in bits 24 to 27 of s3, and the group's number in
+            // v5, as many times the most of its lanes, vertices and primitives as it is
+            prologue_ += "    " + s(3) + " = (xv_flat / " + std::to_string(mesh_wave_) +
+                         "u) << 24;\n";
+            const auto stride =
+                std::max({mesh_threads_, mesh_vertices_, mesh_primitives_});
+            prologue_ += "    " + v(5) + " = xv_group.x * " + std::to_string(stride) + "u;\n";
         }
     }
 
@@ -2791,6 +2835,9 @@ class Translator {
     }
     // LDS_SIZE of COMPUTE_PGM_RSRC2, in units of 128 words; the host has 32 KiB at most
     std::uint32_t shared_words() const {
+        // a mesh shader's record has it in bytes
+        if (stage_ == Stage::mesh)
+            return mesh_shared_ ? std::min((mesh_shared_ + 3) / 4, 7168u) : 7168u;
         const auto units = (header_[0] >> 15) & 0x1ff;
         return units ? std::min(units * 128, 8192u) : 8192u;
     }
@@ -2799,7 +2846,8 @@ class Translator {
         auto name = ins.name;
         if (name == "ds_nop")
             return;
-        if (stage_ != Stage::compute)
+        // a mesh shader's group shares its memory as a compute shader's does
+        if (stage_ != Stage::compute && stage_ != Stage::mesh)
             give_up(std::string(name) + " outside a compute shader");
         if (ins.w0 >> 16 & 1)
             give_up(std::string(name) + " on global memory");
@@ -3729,7 +3777,16 @@ class Translator {
             value = u("ldexp(" + fx(0) + ", (float)(int)" + x[1] + ")");
         else if (name == "v_perm_b32")
             value = "perm_bytes(" + x[0] + ", " + x[1] + ", " + x[2] + ")";
-        else if (starts(name, "v_mbcnt_"))
+        else if (starts(name, "v_mbcnt_") && stage_ == Stage::mesh) {
+            // a mesh shader's lanes are the group's threads in order: the lanes of the mask
+            // in the half the instruction counts that come before this one
+            const auto lane = "(xv_flat & " + std::to_string(mesh_wave_ - 1) + "u)";
+            const auto below = name == "v_mbcnt_lo_u32_b32"
+                                   ? "(" + lane + " >= 32u ? 0xffffffffu : (1u << " + lane +
+                                         ") - 1u)"
+                                   : "(" + lane + " <= 32u ? 0u : (1u << (" + lane + " - 32u)) - 1u)";
+            value = "(" + x[1] + " + countbits(" + x[0] + " & " + below + "))";
+        } else if (starts(name, "v_mbcnt_"))
             value = x[1]; // no lane of the wave comes before this one
         else if (name == "v_readlane_b32") {
             set_s(destination & 0x7f, x[0]);
@@ -4603,8 +4660,15 @@ class Translator {
             const std::string type = element.type == 3   ? "float"
                                      : element.type == 2 ? "int"
                                                          : "uint";
-            line(std::string(exec_changes_ ? "if " + active() + " " : "") + "output.f" +
-                 std::to_string(field) + " = " +
+            // a mesh shader's lane writes its own vertex
+            const std::string to = stage_ == Stage::mesh ? "xv_verts[xv_flat].f" : "output.f";
+            const std::string guard =
+                stage_ == Stage::mesh ? "xv_flat < " + std::to_string(mesh_vertices_) + "u" : "";
+            line(std::string(exec_changes_ || !guard.empty()
+                                 ? "if (" + (exec_changes_ ? active() : std::string("true")) +
+                                       (guard.empty() ? "" : " && " + guard) + ") "
+                                 : "") +
+                 to + std::to_string(field) + " = " +
                  (element.width > 1 ? type + std::to_string(element.width) + "(" + value + ")"
                                     : "(" + type + ")(" + value + ")") +
                  ";");
@@ -4612,7 +4676,39 @@ class Translator {
         bool written = false;
         if (stage_ == Stage::pixel && valid_mask && exec_changes_)
             line("if (!" + active() + ") discard;");
-        if (stage_ == Stage::vertex && target == 12) {
+        if (stage_ == Stage::mesh && target == 20) {
+            // the lane's primitive: three vertex numbers of ten bits; bit 31 culls it
+            const auto value = v(ins.w1 & 0xff);
+            line("if (" + std::string(exec_changes_ ? active() + " && " : "") + "xv_flat < " +
+                 std::to_string(mesh_primitives_) + "u) xv_prims[xv_flat] = (" + value +
+                 " & 0x80000000u) != 0u ? uint3(0u, 0u, 0u) : uint3(" + value + " & 0x3ffu, (" +
+                 value + " >> 10) & 0x3ffu, (" + value + " >> 20) & 0x3ffu);");
+            exported_ = true;
+            return;
+        }
+        if (stage_ == Stage::mesh && target == 12) {
+            for (std::size_t i = 0; i < outputs.size(); ++i)
+                if (!_stricmp(outputs[i].name.c_str(), "SV_Position"))
+                    write(i, 0), written = true;
+        } else if (stage_ == Stage::mesh && target >= 32) {
+            // parameter n: the row the stage data gives it
+            for (const auto &[parameter, row] : mesh_outputs_)
+                if (parameter == target - 32)
+                    for (std::size_t i = 0; i < outputs.size(); ++i)
+                        if (outputs[i].reg == row &&
+                            _stricmp(outputs[i].name.c_str(), "SV_Position"))
+                            write(i, static_cast<std::uint32_t>(std::countr_zero(
+                                         static_cast<unsigned>(outputs[i].mask ? outputs[i].mask
+                                                                               : 1)))),
+                                written = true;
+            for (const auto &[parameter, row] : mesh_outputs_)
+                if ((parameter & 0x7f) == target - 32 && parameter & 0x80)
+                    give_up("a mesh shader's output of its primitives");
+            if (!written)
+                return;
+        } else if (stage_ == Stage::mesh && target == 13) {
+            return; // more of the position
+        } else if (stage_ == Stage::vertex && target == 12) {
             for (std::size_t i = 0; i < outputs.size(); ++i)
                 if (!_stricmp(outputs[i].name.c_str(), "SV_Position"))
                     write(i, 0), written = true;
@@ -4738,7 +4834,7 @@ class Translator {
         if (uses_heap_) {
             text += std::string("cbuffer xv_user : register(b") +
                     (stage_ == Stage::pixel ? "1" : "0") + ", space200) {";
-            for (int n = 0; n < 16; ++n)
+            for (int n = 0; n < 24; ++n)
                 text += " uint xv_ud" + std::to_string(n) + ";";
             text += " };\n";
         }
@@ -4758,6 +4854,25 @@ class Translator {
         registers += "    bool scc = false;\n    uint next = 0u;\n";
         if (!left_.empty())
             registers += "    bool back = false;\n";
+        if (stage_ == Stage::mesh) {
+            // One thread of the host's group for each lane of the console's, whose number is
+            // its vertex and its primitive. The counts are the most the shader makes, and
+            // what it leaves unexported is nothing: every primitive starts culled (its
+            // corners all the first vertex) and every vertex zero.
+            text += structure("Output", shader_.outputs, false, "");
+            text += "[outputtopology(\"triangle\")] [numthreads(" +
+                    std::to_string(mesh_threads_) +
+                    ", 1, 1)]\nvoid main(uint xv_flat : SV_GroupIndex, uint3 xv_group : "
+                    "SV_GroupID, out vertices Output xv_verts[" +
+                    std::to_string(mesh_vertices_) + "], out indices uint3 xv_prims[" +
+                    std::to_string(mesh_primitives_) + "]) {\n    SetMeshOutputCounts(" +
+                    std::to_string(mesh_vertices_) + "u, " + std::to_string(mesh_primitives_) +
+                    "u);\n    if (xv_flat < " + std::to_string(mesh_primitives_) +
+                    "u) xv_prims[xv_flat] = uint3(0u, 0u, 0u);\n    if (xv_flat < " +
+                    std::to_string(mesh_vertices_) + "u) xv_verts[xv_flat] = (Output)0;\n" +
+                    registers + prologue_ + body_ + "}\n";
+            return text;
+        }
         if (stage_ == Stage::compute) {
             text += "[numthreads(" + std::to_string(std::max(header_[1], 1u)) + ", " +
                     std::to_string(std::max(header_[2], 1u)) + ", " +
@@ -4906,6 +5021,10 @@ class Translator {
     bool needs_sm6_ = false, sopk_writes_exec_ = false;
     bool fetched_ = false, exported_ = false, vertex_id_ = false, instance_id_ = false;
     bool uses_heap_ = false;
+    // a mesh shader's group, outputs (parameter, row) and wave
+    std::uint32_t mesh_threads_ = 0, mesh_vertices_ = 0, mesh_primitives_ = 0, mesh_wave_ = 64,
+                  mesh_shared_ = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> mesh_outputs_;
     std::vector<Shader::Bound> bound_;                      // the caller's, or the file's own
     std::map<std::uint32_t, std::uint32_t> table_register_; // a table parameter's register
     std::map<std::uint32_t, std::uint32_t>
@@ -4917,7 +5036,8 @@ std::optional<std::string> translate(Stage stage, const Shader &shader, std::str
                                      std::uint32_t *at, bool *needs_sm6) {
     if (needs_sm6)
         *needs_sm6 = false;
-    if (stage != Stage::vertex && stage != Stage::pixel && stage != Stage::compute) {
+    if (stage != Stage::vertex && stage != Stage::pixel && stage != Stage::compute &&
+        stage != Stage::mesh) {
         if (why)
             *why = "stage";
         return std::nullopt;

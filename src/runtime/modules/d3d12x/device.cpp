@@ -6578,6 +6578,11 @@ void STDMETHODCALLTYPE dispatch(void *self, UINT x, UINT y, UINT z) {
     prepare_dispatch(static_cast<ListProxy *>(self));
     host_of(self)->Dispatch(x, y, z);
 }
+// DispatchX (78): Dispatch, with flags that only tune the console's GPU; what it dispatches
+// with is made ready as for Dispatch
+void STDMETHODCALLTYPE dispatch_x(void *self, UINT x, UINT y, UINT z, UINT) {
+    dispatch(self, x, y, z);
+}
 void STDMETHODCALLTYPE set_graphics_root_uav(void *self, UINT index, std::uint64_t address) {
     static_cast<ListProxy *>(self)->argument(index) = {4, address, {}};
     if (static_cast<ListProxy *>(self)->ours_bound)
@@ -6783,6 +6788,7 @@ std::array<Slot, list_slots> list_vtable_of(std::index_sequence<Index...>) {
     vtable[39] = reinterpret_cast<Slot>(&set_compute_root_constants);
     vtable[40] = reinterpret_cast<Slot>(&set_graphics_root_constants);
     vtable[14] = reinterpret_cast<Slot>(&dispatch);
+    vtable[78] = reinterpret_cast<Slot>(&dispatch_x);
     vtable[41] = reinterpret_cast<Slot>(&set_compute_root_cbv);
     vtable[42] = reinterpret_cast<Slot>(&set_graphics_root_cbv);
     vtable[43] = reinterpret_cast<Slot>(&set_compute_root_srv);
@@ -6871,13 +6877,26 @@ void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UI
     host->DispatchMesh(groups, 1, 1);
     host->Release();
 }
+std::uint32_t argument_kinds(const void *signature);
 // ExecuteIndirect (59): left out with the rest of what the list draws or computes while its
-// pipeline is not there, as the host turns down the list with another pipeline set
+// pipeline is not there, as the host turns down the list with another pipeline set. The draws
+// and dispatches its arguments ask for read what plain ones read: what they draw and dispatch
+// with is made ready as for those.
 void STDMETHODCALLTYPE execute_indirect(void *self, ID3D12CommandSignature *signature, UINT count,
                                         ID3D12Resource *arguments, UINT64 offset,
                                         ID3D12Resource *counts, UINT64 counts_offset) {
-    if (static_cast<ListProxy *>(self)->no_pipeline)
+    auto *const list = static_cast<ListProxy *>(self);
+    if (list->no_pipeline)
         return;
+    const auto kinds = argument_kinds(signature);
+    if (kinds & 1u << D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)
+        prepare_dispatch(list);
+    if (kinds &
+        (1u << D3D12_INDIRECT_ARGUMENT_TYPE_DRAW | 1u << D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED |
+         1u << D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)) {
+        count_draw(self);
+        prepare_draw(list);
+    }
     host_of(self)->ExecuteIndirect(signature, count, arguments, offset, counts, counts_offset);
 }
 // DispatchMesh (127), the desktop's: what it draws with is made ready as for a draw
@@ -8565,6 +8584,16 @@ HRESULT STDMETHODCALLTYPE create_heap(ID3D12Device *self, const D3D12_HEAP_DESC 
     }
     return result;
 }
+// What each command signature's arguments are, by the object (a bit for each
+// D3D12_INDIRECT_ARGUMENT_TYPE, the console's own dispatches as the desktop's): what
+// ExecuteIndirect makes ready before it
+std::mutex argument_kinds_mutex;
+std::map<const void *, std::uint32_t> argument_kinds_of;
+std::uint32_t argument_kinds(const void *signature) {
+    const std::lock_guard lock(argument_kinds_mutex);
+    const auto found = argument_kinds_of.find(signature);
+    return found == argument_kinds_of.end() ? 0 : found->second;
+}
 // CreateCommandSignature (41): which arguments the host turned down. The console has
 // argument types of its own from 100 on.
 HRESULT STDMETHODCALLTYPE create_command_signature(ID3D12Device *self,
@@ -8588,6 +8617,15 @@ HRESULT STDMETHODCALLTYPE create_command_signature(ID3D12Device *self,
         desc = &host;
     }
     const auto result = original<Create>(self, 41)(self, desc, root, iid, signature);
+    if (SUCCEEDED(result) && signature && *signature) {
+        std::uint32_t kinds = 0;
+        for (const auto &argument : arguments)
+            if (argument.Type < 32)
+                kinds |= 1u << argument.Type;
+        // a signature made where one was let go of is this one now
+        const std::lock_guard lock(argument_kinds_mutex);
+        argument_kinds_of[*signature] = kinds;
+    }
     if (FAILED(result) && desc) {
         std::string types;
         for (UINT i = 0; i < desc->NumArgumentDescs && desc->pArgumentDescs; ++i)

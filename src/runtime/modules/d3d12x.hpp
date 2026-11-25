@@ -26,6 +26,9 @@ void console_d3d12_resource(void *resource);
 // reference of its own to the host's. Without `enhanced_barriers` its Barrier is as on a host
 // that has none. Exposed for the tests.
 void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barriers = true);
+// Whether the host made its pipeline of one the title made, which is made the first time a
+// list is given it. Exposed for the tests.
+HRESULT made_pipeline(void *pipeline);
 // a command allocator or fence handed to the title: the console's methods past the desktop's
 void console_command_allocator(void *allocator);
 void console_fence(void *fence);

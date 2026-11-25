@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstddef>
@@ -3292,6 +3293,15 @@ ID3D12RootSignature *shader_root_signature(ID3D12Device *self, bool drawing,
     }
     return nullptr;
 }
+// The host's pipeline of a title's, made now if it was not yet (see DeferredPipeline); null
+// when the host turns it down
+ID3D12PipelineState *host_pipeline(ID3D12PipelineState *state);
+HRESULT STDMETHODCALLTYPE deferred_graphics_pipeline(ID3D12Device *self,
+                                                     const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+                                                     REFIID iid, void **state);
+HRESULT STDMETHODCALLTYPE deferred_compute_pipeline(ID3D12Device *self,
+                                                    const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
+                                                    REFIID iid, void **state);
 // What each graphics pipeline was made from, as the host was given it: the console derives
 // a pipeline from another with some of its state changed, and the host makes one whole.
 // Shaders are kept once each, however many pipelines use them.
@@ -3539,6 +3549,7 @@ HRESULT STDMETHODCALLTYPE create_derived_graphics_pipeline(ID3D12Device *self,
                                                 REFIID, void **);
     if (!source || !state || (count && !states))
         return E_INVALIDARG;
+    source = host_pipeline(source);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
     {
         const std::lock_guard lock(kept_mutex);
@@ -3597,12 +3608,60 @@ void report_half_rectangles() {
         std::fflush(stderr);
     }
 }
+// XV_PSO_TIME: how many pipelines of each kind the title has made, how long that took in
+// all and in the host's driver, said every five seconds with the frame it is at
+struct PipelineTime {
+    std::atomic<std::uint64_t> count{0}, total{0}, host{0};
+};
+PipelineTime pipeline_times[3]; // graphics, compute, stream
+std::uint64_t microseconds() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+}
+struct PipelineClock {
+    int kind;
+    std::uint64_t started = microseconds();
+    static thread_local int depth;
+    PipelineClock(int which) : kind(which) { ++depth; }
+    ~PipelineClock() {
+        if (--depth)
+            return;
+        static const bool timing = std::getenv("XV_PSO_TIME") != nullptr;
+        if (!timing)
+            return;
+        auto &time = pipeline_times[kind];
+        ++time.count;
+        time.total += microseconds() - started;
+        static std::atomic<std::uint64_t> said{0};
+        const auto now = microseconds();
+        if (auto last = said.load();
+            now - last > 5'000'000 && said.compare_exchange_strong(last, now)) {
+            std::fprintf(stderr, "[Runtime] pipelines at frame %llu:",
+                         static_cast<unsigned long long>(frames_shown()));
+            const char *const names[] = {"graphics", "compute", "stream"};
+            for (int i = 0; i < 3; ++i)
+                std::fprintf(stderr, " %s %llu in %.1f s (host %.1f s);", names[i],
+                             static_cast<unsigned long long>(pipeline_times[i].count.load()),
+                             pipeline_times[i].total / 1e6, pipeline_times[i].host / 1e6);
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+    }
+};
+thread_local int PipelineClock::depth = 0;
+struct HostClock {
+    int kind;
+    std::uint64_t started = microseconds();
+    ~HostClock() { pipeline_times[kind].host += microseconds() - started; }
+};
 // CreateGraphicsPipelineState (10): the console's flags, as for compute pipelines
 HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
                                                    const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                                                    REFIID iid, void **state) {
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *,
                                                 REFIID, void **);
+    const PipelineClock clock{0};
     D3D12_GRAPHICS_PIPELINE_STATE_DESC host{};
     ID3D12RootSignature *from_shader = nullptr;
     std::shared_ptr<const HeapUses> uses;
@@ -3670,7 +3729,11 @@ HRESULT STDMETHODCALLTYPE create_graphics_pipeline(ID3D12Device *self,
     const bool rectangles = desc && desc->PrimitiveTopologyType == rectangle_type;
     const auto cull = host.RasterizerState.CullMode;
     const bool cornered = rectangles && rectangle_pipeline(host);
-    auto result = original<Create>(self, 10)(self, desc ? &host : nullptr, iid, state);
+    HRESULT result;
+    {
+        const HostClock timed{0};
+        result = original<Create>(self, 10)(self, desc ? &host : nullptr, iid, state);
+    }
     // the host's compiler may lay the shader's inputs out another way than the title's
     // vertex shader its outputs: the pipeline is then made without it
     if (FAILED(result) && cornered) {
@@ -3767,6 +3830,7 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
                                                   REFIID iid, void **state) {
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_COMPUTE_PIPELINE_STATE_DESC *,
                                                 REFIID, void **);
+    const PipelineClock clock{1};
     // the console's pipeline flags mean nothing to the host, which takes none of them
     D3D12_COMPUTE_PIPELINE_STATE_DESC host{};
     ID3D12RootSignature *from_shader = nullptr;
@@ -3800,7 +3864,11 @@ HRESULT STDMETHODCALLTYPE create_compute_pipeline(ID3D12Device *self,
     };
     if (desc && ends_host_driver(desc->CS))
         empty();
-    auto result = original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state);
+    HRESULT result;
+    {
+        const HostClock timed{1};
+        result = original<Create>(self, 11)(self, desc ? &host : nullptr, iid, state);
+    }
     if (retry_without_heaps(result, heaps)) {
         heap_shaders_refused = true;
         result = create_compute_pipeline(self, desc, iid, state);
@@ -3904,7 +3972,7 @@ std::vector<std::pair<std::size_t, Slot>> unknown_queue_methods(std::index_seque
 HRESULT STDMETHODCALLTYPE create_compute_pipeline_x(ID3D12Device *self,
                                                     const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
                                                     void *, void *, REFIID iid, void **state) {
-    return create_compute_pipeline(self, desc, iid, state);
+    return deferred_compute_pipeline(self, desc, iid, state);
 }
 // The title's command queue: a proxy of the host's, which the host's runtime and DXGI keep as
 // their own. The console's queue has the desktop's methods to Wait (15), then PIX captures,
@@ -4259,7 +4327,9 @@ struct ListProxy {
     ID3D12DescriptorHeap *heaps[2]{};        // the host's, as bound: views, then samplers
     UINT topology = 0;                       // as the title set it, the console's own included
     D3D12_INDEX_BUFFER_VIEW indices{};       // the title's, to put back after a quad draw
-    ID3D12PipelineState *pipeline = nullptr; // set last
+    ID3D12PipelineState *pipeline = nullptr; // set last, the host's
+    // the title's pipeline set last has none of the host's: what it draws or computes is left out
+    bool no_pipeline = false;
     // The title's root arguments for drawing, by parameter, kept so that they can be set
     // again: a draw with a pipeline that reads the heap itself (HeapUses) puts a root
     // signature of ours on the host's list, which takes none of them.
@@ -5088,6 +5158,7 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     list->heaps[0] = list->heaps[1] = nullptr;
     list->topology = 0;
     list->indices = {};
+    list->no_pipeline = state && !(state = host_pipeline(state));
     list->pipeline = state;
     list->heap_uses = state ? heap_uses(state) : nullptr;
     list->graphics_arguments.clear();
@@ -5565,9 +5636,12 @@ D3D12_INDEX_BUFFER_VIEW quad_indices(UINT quads) {
 // gives three corners of each rectangle and the GPU makes the fourth: here the pipeline's
 // geometry shader does (see rectangle_pipeline).
 void STDMETHODCALLTYPE set_pipeline_state(void *self, ID3D12PipelineState *state) {
-    static_cast<ListProxy *>(self)->pipeline = state;
-    static_cast<ListProxy *>(self)->heap_uses = state ? heap_uses(state) : nullptr;
-    host_of(self)->SetPipelineState(state);
+    auto *const list = static_cast<ListProxy *>(self);
+    list->no_pipeline = state && !(state = host_pipeline(state));
+    list->pipeline = state;
+    list->heap_uses = state ? heap_uses(state) : nullptr;
+    if (state)
+        list->host->SetPipelineState(state);
 }
 // XV_D3D_LOST: what the first draws are made with
 void lost_draw(void *self, const char *method, UINT count) {
@@ -5641,6 +5715,8 @@ void lost_draw(void *self, const char *method, UINT count) {
 }
 void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances, UINT first,
                                       UINT first_instance) {
+    if (static_cast<ListProxy *>(self)->no_pipeline)
+        return;
     count_draw(self);
     lost_draw(self, "DrawInstanced", vertices);
     auto *const list = static_cast<ListProxy *>(self);
@@ -5682,6 +5758,8 @@ void STDMETHODCALLTYPE draw_instanced(void *self, UINT vertices, UINT instances,
 }
 void STDMETHODCALLTYPE draw_indexed_instanced(void *self, UINT indices, UINT instances, UINT first,
                                               INT base, UINT first_instance) {
+    if (static_cast<ListProxy *>(self)->no_pipeline)
+        return;
     count_draw(self);
     lost_draw(self, "DrawIndexedInstanced", indices);
     prepare_draw(static_cast<ListProxy *>(self));
@@ -5972,6 +6050,8 @@ void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_
         host_of(self)->SetComputeRootUnorderedAccessView(index, root_uav_address(address));
 }
 void STDMETHODCALLTYPE dispatch(void *self, UINT x, UINT y, UINT z) {
+    if (static_cast<ListProxy *>(self)->no_pipeline)
+        return;
     prepare_dispatch(static_cast<ListProxy *>(self));
     host_of(self)->Dispatch(x, y, z);
 }
@@ -6247,6 +6327,8 @@ void STDMETHODCALLTYPE begin_render_pass(void *self, UINT count,
 // a count and nothing else, has a host method
 void STDMETHODCALLTYPE dispatch_mesh_x(void *self, UINT groups, UINT64 flags, UINT64 arguments,
                                        UINT64 payload) {
+    if (static_cast<ListProxy *>(self)->no_pipeline)
+        return;
     ID3D12GraphicsCommandList6 *host = nullptr;
     if (flags || arguments || payload ||
         FAILED(host_of(self)->QueryInterface(IID_PPV_ARGS(&host)))) {
@@ -6606,7 +6688,7 @@ HRESULT STDMETHODCALLTYPE create_command_list(ID3D12Device *self, const UINT *de
     List *host = nullptr;
     const auto result =
         self->CreateCommandList(desc[2], static_cast<D3D12_COMMAND_LIST_TYPE>(desc[0]), allocator,
-                                state, IID_PPV_ARGS(&host));
+                                host_pipeline(state), IID_PPV_ARGS(&host));
     *list = SUCCEEDED(result) ? make_list_proxy(host) : nullptr;
     if (FAILED(result)) {
         std::fprintf(stderr,
@@ -7140,8 +7222,8 @@ HRESULT STDMETHODCALLTYPE create_command_list_desktop(ID3D12Device *self, UINT n
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, D3D12_COMMAND_LIST_TYPE,
                                                 ID3D12CommandAllocator *, ID3D12PipelineState *,
                                                 REFIID, void **);
-    const auto result =
-        original<Create>(self, 12)(self, node, type, allocator, state, IID_PPV_ARGS(&host));
+    const auto result = original<Create>(self, 12)(self, node, type, allocator,
+                                                   host_pipeline(state), IID_PPV_ARGS(&host));
     *list = SUCCEEDED(result) ? make_list_proxy(host) : nullptr;
     return result;
 }
@@ -7211,7 +7293,7 @@ HRESULT STDMETHODCALLTYPE create_reserved_resource(ID3D12Device *self,
 HRESULT STDMETHODCALLTYPE create_graphics_pipeline_x(ID3D12Device *self,
                                                      const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
                                                      UINT, const void *, REFIID iid, void **state) {
-    return create_graphics_pipeline(self, desc, iid, state);
+    return deferred_graphics_pipeline(self, desc, iid, state);
 }
 // what only the console's driver and debugger have a use for: driver hints, hang and debug
 // callbacks, debug flags, memory priority, UnregisterPagePoolX
@@ -7827,6 +7909,12 @@ HRESULT STDMETHODCALLTYPE create_command_signature(ID3D12Device *self,
     }
     return result;
 }
+// A pipeline's stream is subobjects one after another, each a type and its description,
+// aligned to 8 bytes; their sizes by type. The Series kit numbers the amplification and mesh
+// shaders 23 and 24, where the desktop has them at 24 and 25, and has subobjects of its own
+// from 25 on.
+constexpr std::size_t subobject_sizes[] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8,  48, 56, 24,
+                                           8,  8,  40, 8,  16, 8,  24, 8,  64,  32, 24, 24};
 // ID3D12Device2::CreatePipelineState, from a stream of subobjects: the host's (47), and why
 // when it turns the pipeline down
 HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
@@ -7835,11 +7923,8 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
     using Create = HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_PIPELINE_STATE_STREAM_DESC *,
                                                 REFIID, void **);
     const auto *const title_desc = desc;
-    // The stream is subobjects one after another, each a type and its description, aligned
-    // to 8 bytes. The Series kit numbers the amplification and mesh shaders 23 and 24, where
-    // the desktop has them at 24 and 25, and has subobjects of its own from 25 on.
-    static constexpr std::size_t sizes[] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8,  48, 56, 24,
-                                            8,  8,  40, 8,  16, 8,  24, 8,  64,  32, 24, 24};
+    const PipelineClock clock{2};
+    const auto &sizes = subobject_sizes;
     std::vector<std::uint8_t> stream;
     D3D12_PIPELINE_STATE_STREAM_DESC host{};
     // the title's vertex, pixel and compute shaders, and whether any had to be made for the
@@ -8104,7 +8189,11 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
             }
         at += size;
     }
-    const auto result = original<Create>(self, 47)(self, desc, iid, state);
+    HRESULT result;
+    {
+        const HostClock timed{2};
+        result = original<Create>(self, 47)(self, desc, iid, state);
+    }
     if (retry_without_heaps(result, tried_heaps)) {
         if (from_shader)
             from_shader->Release();
@@ -8154,6 +8243,290 @@ HRESULT STDMETHODCALLTYPE create_pipeline_state(ID3D12Device *self,
         report_messages();
     }
     return result;
+}
+
+// A title makes far more pipelines than it draws with, and makes them as it starts: a Series
+// title tens of thousands in its first seconds, on worker threads it waits for before it
+// shows anything, of which a few dozen draw its first screens. Making each for the host
+// there (translating its shaders, the host's driver compiling them) holds the title at its
+// start for minutes. So the title gets a pipeline of ours with what it was made of, and the
+// host's pipeline is made the first time a list is given it. What it is made of may be the
+// title's memory only for the call: the description is copied, the shaders kept once each
+// for as long as a pipeline not made yet has them. A description with what is not copied
+// here (stream output, a cached blob, view instancing, subobjects of unknown size) is made
+// at once, as before. XV_PSO_DEFER=0 makes every pipeline at once.
+struct DeferredPipeline {
+    Slot *vtable;
+    // the title's SetPipelineState copies 32 bytes from +0x10 of the pipeline into the list
+    std::uint8_t packet[0x38]{};
+    std::atomic<ULONG> references{1};
+    ID3D12Device *device = nullptr;
+    int kind = 0; // 0 graphics, 1 compute, 2 a stream
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+    std::vector<std::uint8_t> stream;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+    std::deque<std::string> names;
+    std::vector<ID3D12RootSignature *> signatures;                         // held until made
+    std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> shaders; // likewise
+    std::wstring name;
+    std::once_flag once;
+    ID3D12PipelineState *host = nullptr;
+};
+// for a title that asks for an interface a pipeline of ours has
+bool deferrable(REFIID iid) {
+    static const bool on = [] {
+        const auto *const text = std::getenv("XV_PSO_DEFER");
+        return !text || *text != '0';
+    }();
+    return on &&
+           is_any<IUnknown, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12PipelineState>(
+               iid);
+}
+// the shaders of pipelines not made yet, by where the title had them: a title passes the
+// same shader for many pipelines, and what is at an address is compared before it is shared
+std::mutex held_mutex;
+std::map<std::pair<const void *, SIZE_T>, std::weak_ptr<const std::vector<std::uint8_t>>>
+    held_shaders;
+D3D12_SHADER_BYTECODE hold_shader(DeferredPipeline &pipeline, const D3D12_SHADER_BYTECODE &code) {
+    if (!code.pShaderBytecode || !code.BytecodeLength)
+        return {};
+    const auto *const bytes = static_cast<const std::uint8_t *>(code.pShaderBytecode);
+    const std::pair key{code.pShaderBytecode, code.BytecodeLength};
+    std::shared_ptr<const std::vector<std::uint8_t>> held;
+    {
+        const std::lock_guard lock(held_mutex);
+        if (const auto found = held_shaders.find(key); found != held_shaders.end())
+            held = found->second.lock();
+    }
+    if (!held || std::memcmp(held->data(), bytes, code.BytecodeLength)) {
+        held =
+            std::make_shared<const std::vector<std::uint8_t>>(bytes, bytes + code.BytecodeLength);
+        const std::lock_guard lock(held_mutex);
+        held_shaders[key] = held;
+    }
+    pipeline.shaders.push_back(held);
+    return {held->data(), held->size()};
+}
+void hold_signature(DeferredPipeline &pipeline, ID3D12RootSignature *signature) {
+    if (!signature)
+        return;
+    signature->AddRef();
+    pipeline.signatures.push_back(signature);
+}
+D3D12_INPUT_LAYOUT_DESC hold_layout(DeferredPipeline &pipeline,
+                                    const D3D12_INPUT_LAYOUT_DESC &layout) {
+    if (!layout.pInputElementDescs || !layout.NumElements)
+        return {};
+    for (UINT i = 0; i < layout.NumElements; ++i) {
+        auto element = layout.pInputElementDescs[i];
+        if (element.SemanticName)
+            element.SemanticName = pipeline.names.emplace_back(element.SemanticName).c_str();
+        pipeline.elements.push_back(element);
+    }
+    return {pipeline.elements.data(), layout.NumElements};
+}
+void let_go(DeferredPipeline &pipeline) {
+    for (auto *const signature : pipeline.signatures)
+        signature->Release();
+    pipeline.signatures.clear();
+    pipeline.shaders.clear();
+}
+DeferredPipeline *deferred_of(const void *pipeline);
+// the host's pipeline of one of ours, made now if it was not; null if the host turns it down
+ID3D12PipelineState *made_pipeline(DeferredPipeline &pipeline) {
+    std::call_once(pipeline.once, [&] {
+        void *made = nullptr;
+        const auto iid = __uuidof(ID3D12PipelineState);
+        const D3D12_PIPELINE_STATE_STREAM_DESC stream{pipeline.stream.size(),
+                                                      pipeline.stream.data()};
+        const auto result =
+            pipeline.kind == 0
+                ? create_graphics_pipeline(pipeline.device, &pipeline.graphics, iid, &made)
+            : pipeline.kind == 1
+                ? create_compute_pipeline(pipeline.device, &pipeline.compute, iid, &made)
+                : create_pipeline_state(pipeline.device, &stream, iid, &made);
+        pipeline.host = SUCCEEDED(result) ? static_cast<ID3D12PipelineState *>(made) : nullptr;
+        if (pipeline.host && !pipeline.name.empty())
+            pipeline.host->SetName(pipeline.name.c_str());
+        if (static std::atomic<int> told{0}; !pipeline.host && told++ < 8) {
+            std::fprintf(stderr,
+                         "[Runtime] a pipeline the title made earlier is turned down by the host "
+                         "when a list is first given it (0x%08lx): what is drawn or computed "
+                         "with it is left out\n",
+                         static_cast<unsigned long>(result));
+            std::fflush(stderr);
+        }
+        let_go(pipeline);
+    });
+    return pipeline.host;
+}
+ID3D12PipelineState *host_pipeline(ID3D12PipelineState *state) {
+    auto *const deferred = deferred_of(state);
+    return deferred ? made_pipeline(*deferred) : state;
+}
+HRESULT STDMETHODCALLTYPE deferred_query(void *self, REFIID iid, void **object) {
+    if (!object)
+        return E_POINTER;
+    *object = nullptr;
+    if (!is_any<IUnknown, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12PipelineState>(
+            iid))
+        return E_NOINTERFACE;
+    ++static_cast<DeferredPipeline *>(self)->references;
+    *object = self;
+    return S_OK;
+}
+ULONG STDMETHODCALLTYPE deferred_add_ref(void *self) {
+    return ++static_cast<DeferredPipeline *>(self)->references;
+}
+ULONG STDMETHODCALLTYPE deferred_release(void *self) {
+    auto *const pipeline = static_cast<DeferredPipeline *>(self);
+    const auto left = --pipeline->references;
+    if (left == 0) {
+        let_go(*pipeline);
+        if (pipeline->host)
+            pipeline->host->Release();
+        delete pipeline;
+    }
+    return left;
+}
+// private data: what the host's pipeline would keep, which nothing here reads back
+HRESULT STDMETHODCALLTYPE deferred_get_data(void *, REFGUID, UINT *size, void *) {
+    if (size)
+        *size = 0;
+    return DXGI_ERROR_NOT_FOUND;
+}
+HRESULT STDMETHODCALLTYPE deferred_set_data(void *, REFGUID, UINT, const void *) { return S_OK; }
+HRESULT STDMETHODCALLTYPE deferred_set_name(void *self, const wchar_t *name) {
+    auto *const pipeline = static_cast<DeferredPipeline *>(self);
+    pipeline->name = name ? name : L"";
+    if (pipeline->host)
+        pipeline->host->SetName(pipeline->name.c_str());
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE deferred_get_device(void *self, REFIID iid, void **device) {
+    return static_cast<DeferredPipeline *>(self)->device->QueryInterface(iid, device);
+}
+HRESULT STDMETHODCALLTYPE deferred_cached_blob(void *self, ID3DBlob **blob) {
+    auto *const host = made_pipeline(*static_cast<DeferredPipeline *>(self));
+    return host ? host->GetCachedBlob(blob) : E_FAIL;
+}
+template <std::size_t Index> HRESULT STDMETHODCALLTYPE unknown_deferred_method(void *) {
+    if (static std::atomic<bool> shown{false}; !shown.exchange(true)) {
+        std::fprintf(stderr,
+                     "[Runtime] unimplemented Direct3D 12 call: pipeline slot %zu from %s\n", Index,
+                     detail::guest_location(_ReturnAddress()).c_str());
+        std::fflush(stderr);
+    }
+    return E_NOTIMPL;
+}
+template <std::size_t... Index>
+std::array<Slot, 24> deferred_vtable_of(std::index_sequence<Index...>) {
+    std::array<Slot, 24> vtable{reinterpret_cast<Slot>(&unknown_deferred_method<Index>)...};
+    vtable[0] = reinterpret_cast<Slot>(&deferred_query);
+    vtable[1] = reinterpret_cast<Slot>(&deferred_add_ref);
+    vtable[2] = reinterpret_cast<Slot>(&deferred_release);
+    vtable[3] = reinterpret_cast<Slot>(&deferred_get_data);
+    vtable[4] = vtable[5] = reinterpret_cast<Slot>(&deferred_set_data);
+    vtable[6] = reinterpret_cast<Slot>(&deferred_set_name);
+    vtable[7] = reinterpret_cast<Slot>(&deferred_get_device);
+    vtable[8] = reinterpret_cast<Slot>(&deferred_cached_blob);
+    return vtable;
+}
+std::array<Slot, 24> deferred_vtable = deferred_vtable_of(std::make_index_sequence<24>{});
+DeferredPipeline *deferred_of(const void *pipeline) {
+    return pipeline && *static_cast<Slot *const *>(pipeline) == deferred_vtable.data()
+               ? static_cast<DeferredPipeline *>(const_cast<void *>(pipeline))
+               : nullptr;
+}
+HRESULT hand_out_deferred(std::unique_ptr<DeferredPipeline> pipeline, REFIID iid, void **state) {
+    pipeline->vtable = deferred_vtable.data();
+    auto *const made = pipeline.release();
+    const auto result = deferred_query(made, iid, state);
+    deferred_release(made);
+    return result;
+}
+HRESULT STDMETHODCALLTYPE deferred_graphics_pipeline(ID3D12Device *self,
+                                                     const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+                                                     REFIID iid, void **state) {
+    if (!desc || !state || !deferrable(iid) || desc->StreamOutput.NumEntries ||
+        desc->CachedPSO.pCachedBlob)
+        return create_graphics_pipeline(self, desc, iid, state);
+    auto pipeline = std::make_unique<DeferredPipeline>();
+    pipeline->device = self;
+    auto &kept = pipeline->graphics;
+    kept = *desc;
+    for (auto *const shader : {&kept.VS, &kept.PS, &kept.DS, &kept.HS, &kept.GS})
+        *shader = hold_shader(*pipeline, *shader);
+    kept.StreamOutput = {};
+    kept.InputLayout = hold_layout(*pipeline, desc->InputLayout);
+    hold_signature(*pipeline, desc->pRootSignature);
+    return hand_out_deferred(std::move(pipeline), iid, state);
+}
+HRESULT STDMETHODCALLTYPE deferred_compute_pipeline(ID3D12Device *self,
+                                                    const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
+                                                    REFIID iid, void **state) {
+    if (!desc || !state || !deferrable(iid) || desc->CachedPSO.pCachedBlob)
+        return create_compute_pipeline(self, desc, iid, state);
+    auto pipeline = std::make_unique<DeferredPipeline>();
+    pipeline->device = self;
+    pipeline->kind = 1;
+    pipeline->compute = *desc;
+    pipeline->compute.CS = hold_shader(*pipeline, desc->CS);
+    hold_signature(*pipeline, desc->pRootSignature);
+    return hand_out_deferred(std::move(pipeline), iid, state);
+}
+HRESULT STDMETHODCALLTYPE deferred_pipeline_state(ID3D12Device *self,
+                                                  const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+                                                  REFIID iid, void **state) {
+    if (!desc || !state || !deferrable(iid) || !desc->pPipelineStateSubobjectStream)
+        return create_pipeline_state(self, desc, iid, state);
+    auto pipeline = std::make_unique<DeferredPipeline>();
+    pipeline->device = self;
+    pipeline->kind = 2;
+    const auto *const bytes =
+        static_cast<const std::uint8_t *>(desc->pPipelineStateSubobjectStream);
+    auto &stream = pipeline->stream;
+    stream.assign(bytes, bytes + desc->SizeInBytes);
+    // what each subobject points to, copied: shaders (amplification and mesh at the Series
+    // kit's 23 and 24), the root signature and the input layout
+    for (std::size_t at = 0; at + 8 <= stream.size();) {
+        std::uint32_t type;
+        std::memcpy(&type, stream.data() + at, 4);
+        if (type >= std::size(subobject_sizes) || at + subobject_sizes[type] > stream.size())
+            return create_pipeline_state(self, desc, iid, state);
+        auto *const value = stream.data() + at + 8;
+        if ((type >= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS &&
+             type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) ||
+            type == 23 || type == 24) {
+            D3D12_SHADER_BYTECODE code;
+            std::memcpy(&code, value, sizeof code);
+            code = hold_shader(*pipeline, code);
+            std::memcpy(value, &code, sizeof code);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+            ID3D12RootSignature *signature;
+            std::memcpy(&signature, value, sizeof signature);
+            hold_signature(*pipeline, signature);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+            D3D12_INPUT_LAYOUT_DESC layout;
+            std::memcpy(&layout, value, sizeof layout);
+            layout = hold_layout(*pipeline, layout);
+            std::memcpy(value, &layout, sizeof layout);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT ||
+                   type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO ||
+                   type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING) {
+            // what is not copied here: the declarations, the blob or the views' places, the
+            // first of each a pointer to them or (view instancing) how many there are
+            std::uint64_t first;
+            std::memcpy(&first, value, sizeof first);
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING)
+                first &= 0xffffffffu;
+            if (first)
+                return create_pipeline_state(self, desc, iid, state);
+        }
+        at += subobject_sizes[type];
+    }
+    return hand_out_deferred(std::move(pipeline), iid, state);
 }
 // the host's method `Index` after its first 44, at whatever slot the console has it
 template <std::size_t... Index>
@@ -8283,8 +8656,8 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     overrides.push_back({8, reinterpret_cast<Slot>(&create_command_queue)});
     overrides.push_back({62, reinterpret_cast<Slot>(&create_compute_pipeline_x)});
     overrides.push_back({74, reinterpret_cast<Slot>(&register_page_pool)});
-    overrides.push_back({10, reinterpret_cast<Slot>(&create_graphics_pipeline)});
-    overrides.push_back({11, reinterpret_cast<Slot>(&create_compute_pipeline)});
+    overrides.push_back({10, reinterpret_cast<Slot>(&deferred_graphics_pipeline)});
+    overrides.push_back({11, reinterpret_cast<Slot>(&deferred_compute_pipeline)});
     overrides.push_back({48, reinterpret_cast<Slot>(&create_command_queue_x)});
     overrides.push_back({73, reinterpret_cast<Slot>(&create_command_list)});
     overrides.push_back({12, reinterpret_cast<Slot>(&create_command_list_desktop)});
@@ -8308,7 +8681,7 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     if (console == Target::durango) {
         for (std::size_t slot = 87; slot <= 92; ++slot)
             overrides.push_back({slot, later[slot - 87]});
-        overrides.push_back({90, reinterpret_cast<Slot>(&create_pipeline_state)});
+        overrides.push_back({90, reinterpret_cast<Slot>(&deferred_pipeline_state)});
         overrides.push_back({46, reinterpret_cast<Slot>(&create_placed_srv)});
         overrides.push_back({47, reinterpret_cast<Slot>(&create_placed_uav)});
         overrides.push_back({59, reinterpret_cast<Slot>(&default_msaa_parameters)});
@@ -8317,7 +8690,7 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
             overrides.push_back({slot, later[slot - 83]});
         for (std::size_t slot = 105; slot <= 112; ++slot)
             overrides.push_back({slot, later[slot - 84]});
-        overrides.push_back({86, reinterpret_cast<Slot>(&create_pipeline_state)});
+        overrides.push_back({86, reinterpret_cast<Slot>(&deferred_pipeline_state)});
         overrides.push_back({108, reinterpret_cast<Slot>(&resource_allocation_info_2)});
         overrides.push_back({109, reinterpret_cast<Slot>(&create_committed_resource_2)});
         overrides.push_back({111, reinterpret_cast<Slot>(&create_feedback_view)});
@@ -8332,6 +8705,12 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
 } // namespace
 
 void console_d3d12_resource(void *resource) { console_resource(resource); }
+HRESULT made_pipeline(void *pipeline) {
+    return !pipeline                                                     ? E_POINTER
+           : host_pipeline(static_cast<ID3D12PipelineState *>(pipeline)) ? S_OK
+                                                                         : E_FAIL;
+}
+
 void *console_command_list(ID3D12GraphicsCommandList *host, bool enhanced_barriers) {
     static const bool configured = [] {
         configure_lists();

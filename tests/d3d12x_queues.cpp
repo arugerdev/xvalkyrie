@@ -1,6 +1,8 @@
 #include "d3d12x_title.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 // What orders the GPU's work on the console without a fence: FlushPipelineX in a list, and
 // Wait32BitValueX / Wait64BitValueX, a wait for a value another queue's work writes in memory.
@@ -140,6 +142,55 @@ TEST_CASE("FlushPipelineX orders a list's work as a barrier does") {
     CHECK(removed_reason() == S_OK);
     CHECK(words(output)[0] == 4);
     add->Release();
+    signature->Release();
+    results->Release();
+}
+
+TEST_CASE("a pipeline is made for the host when a list is first given it, of what it was made of") {
+    if (!device())
+        return;
+    later_layout();
+    std::uint64_t output = 0;
+    auto *const results = buffer(4096, output);
+    const D3D12_ROOT_PARAMETER parameters[]{root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)};
+    auto *const signature = root_signature({1, parameters});
+    auto *const code = compile(R"(
+        RWByteAddressBuffer output : register(u0);
+        [numthreads(1, 1, 1)] void main() { output.Store(0, 42u); })",
+                               "cs_5_0");
+    // the title's memory, which it may reuse once the pipeline is made
+    std::vector<std::uint8_t> shader(static_cast<const std::uint8_t *>(code->GetBufferPointer()),
+                                     static_cast<const std::uint8_t *>(code->GetBufferPointer()) +
+                                         code->GetBufferSize());
+    code->Release();
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = signature;
+    desc.CS = {shader.data(), shader.size()};
+    ID3D12PipelineState *pipeline = nullptr;
+    REQUIRE(title().call(device(), 11, &desc, &__uuidof(ID3D12PipelineState),
+                         reinterpret_cast<void **>(&pipeline)) == S_OK);
+    std::fill(shader.begin(), shader.end(), std::uint8_t{0});
+    // what a title asks of it before it draws with it
+    void *same = nullptr;
+    CHECK(title().call(pipeline, 0, &__uuidof(ID3D12Pageable), &same) == S_OK);
+    CHECK(same == pipeline);
+    title().call<ULONG>(pipeline, 2);
+    ID3D12Device *parent = nullptr;
+    CHECK(title().call(pipeline, 7, &__uuidof(ID3D12Device), reinterpret_cast<void **>(&parent)) ==
+          S_OK);
+    CHECK(parent);
+    if (parent)
+        parent->Release();
+    Work work;
+    work.record(33, signature);
+    work.record(25, pipeline);
+    work.record(45, 0u, output);
+    work.record(14, 1u, 1u, 1u);
+    work.run();
+    CHECK(removed_reason() == S_OK);
+    CHECK(words(output)[0] == 42);
+    CHECK(xv::runtime::modules::d3d12x::made_pipeline(pipeline) == S_OK);
+    pipeline->Release();
     signature->Release();
     results->Release();
 }

@@ -112,10 +112,13 @@ HRESULT pipeline(ID3D12RootSignature *signature, DXGI_FORMAT target, DXGI_FORMAT
     desc.DSVFormat = depth;
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState *state = nullptr;
-    const auto result = title().call(device(), 10, &desc, &__uuidof(ID3D12PipelineState),
-                                     reinterpret_cast<void **>(&state));
-    if (state)
+    auto result = title().call(device(), 10, &desc, &__uuidof(ID3D12PipelineState),
+                               reinterpret_cast<void **>(&state));
+    // the host makes its pipeline when a list is first given it
+    if (state) {
+        result = xv::runtime::modules::d3d12x::made_pipeline(state);
         state->Release();
+    }
     vertex->Release();
     pixel->Release();
     return result;
@@ -162,10 +165,12 @@ HRESULT stream_pipeline(ID3D12RootSignature *signature, DXGI_FORMAT target, DXGI
     stream.depth.value = depth;
     const D3D12_PIPELINE_STATE_STREAM_DESC desc{sizeof stream, &stream};
     ID3D12PipelineState *state = nullptr;
-    const auto result = title().call(device(), 86, &desc, &__uuidof(ID3D12PipelineState),
-                                     reinterpret_cast<void **>(&state));
-    if (state)
+    auto result = title().call(device(), 86, &desc, &__uuidof(ID3D12PipelineState),
+                               reinterpret_cast<void **>(&state));
+    if (state) {
+        result = xv::runtime::modules::d3d12x::made_pipeline(state);
         state->Release();
+    }
     vertex->Release();
     pixel->Release();
     return result;

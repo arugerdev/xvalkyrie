@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <wrl/implements.h>
@@ -1750,6 +1751,15 @@ void read_root_signature(const void *signature, const void *blob, SIZE_T size) {
 // A buffer descriptor (V#) has a 48-bit address, the stride in bits 48-61 and the record
 // count in its third dword.
 std::atomic<std::uint64_t> decoded[4];
+// What decode_as made a view of nothing of, by where it is: its words and the type it was
+// read as, so that a table bound again does not have it made again while it is the same
+struct Unmarked {
+    std::array<std::uint32_t, 4> words;
+    D3D12_DESCRIPTOR_RANGE_TYPE type;
+    bool operator==(const Unmarked &) const = default;
+};
+std::mutex unmarked_mutex;
+std::unordered_map<std::uintptr_t, Unmarked> unmarked;
 void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE_TYPE type) {
     std::uint32_t words[4];
     std::memcpy(words, reinterpret_cast<const void *>(at), sizeof words);
@@ -1759,6 +1769,19 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
         resolve(heap, at);
         return;
     }
+    // what was decoded to nothing here before and is still the same is that still
+    const Unmarked seen{{words[0], words[1], words[2], words[3]}, type};
+    {
+        const std::lock_guard lock(unmarked_mutex);
+        if (const auto found = unmarked.find(at); found != unmarked.end() && found->second == seen)
+            return;
+    }
+    const auto left_unmarked = [&] {
+        const std::lock_guard lock(unmarked_mutex);
+        if (unmarked.size() > 1'000'000)
+            unmarked.clear();
+        unmarked[at] = seen;
+    };
     ++decoded[type & 3];
     if (static std::atomic<std::uint32_t> shown{0};
         std::getenv("XV_D3D_TRACE") && first != 0 && !(shown.fetch_or(1u << type) & (1u << type))) {
@@ -1850,6 +1873,7 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
     // table), which the mark would overwrite. It is decoded again when it is read again.
     if ((first == 0 && words[2] == 0 && words[3] == 0) || null_buffer(words)) {
         view_nothing(false);
+        left_unmarked();
         return;
     }
     const std::uint64_t address = first & 0xffff'ffff'ffffull;
@@ -1863,6 +1887,7 @@ void decode_as(const ShadowHeap &heap, std::uintptr_t at, D3D12_DESCRIPTOR_RANGE
         if (type != D3D12_DESCRIPTOR_RANGE_TYPE_CBV && words[3] >> 28 != 0)
             return;
         view_nothing(true);
+        left_unmarked();
         return;
     }
     if (type == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) {

@@ -159,13 +159,23 @@ bool map(Physical &state, Reservation &reservation, std::uintptr_t address, ULON
     state.mapped_at.emplace(number, address);
     return true;
 }
+// The console's addresses have 40 bits, and a title may count on it: its GPU takes no more (a
+// library of the console's turns down an acceleration structure above them). What a title is
+// given where it names no address is below 1 TiB, as there.
+MEM_ADDRESS_REQUIREMENTS console_range(const void *address, std::uintptr_t alignment = 0) {
+    MEM_ADDRESS_REQUIREMENTS requirements{};
+    if (!address) {
+        requirements.Alignment = alignment;
+        requirements.HighestEndingAddress = reinterpret_cast<void *>((1ull << 40) - 1);
+    }
+    return requirements;
+}
 void *reserve(void *address, std::uintptr_t size, DWORD type) {
     auto &state = physical();
     if (!state.section)
         return nullptr;
     size = (size + page - 1) & ~(page - 1);
-    MEM_ADDRESS_REQUIREMENTS requirements{};
-    requirements.Alignment = type & mem_4mb_pages && !address ? 4u << 20 : 0;
+    auto requirements = console_range(address, type & mem_4mb_pages ? 4u << 20 : 0);
     MEM_EXTENDED_PARAMETER parameter{};
     parameter.Type = MemExtendedParameterAddressRequirements;
     parameter.Pointer = &requirements;
@@ -185,6 +195,17 @@ void *reserve(void *address, std::uintptr_t size, DWORD type) {
     state.reservations[start] = {size, {}};
     return base;
 }
+// memory the title asked for and is not given, the first few times: a title that does not
+// get it often stops at a check of its own far from the call
+void tell_short(const char *what, std::uintptr_t bytes) {
+    if (static std::atomic<int> told{0}; told++ < 8) {
+        const auto error = GetLastError();
+        std::fprintf(stderr, "[Runtime] %s of %llu bytes failed: %lu\n", what,
+                     static_cast<unsigned long long>(bytes), error);
+        std::fflush(stderr);
+        SetLastError(error);
+    }
+}
 bool commit(std::uintptr_t address, std::uintptr_t size, DWORD protect) {
     auto &state = physical();
     const std::lock_guard lock(state.mutex);
@@ -202,6 +223,7 @@ bool commit(std::uintptr_t address, std::uintptr_t size, DWORD protect) {
         ULONG_PTR number;
         if (!take_pages(state, 1, 1, &number) ||
             !map(state, *reservation, at, number, protect, true)) {
+            tell_short("a commit of physical pages", size);
             SetLastError(ERROR_NOT_ENOUGH_MEMORY);
             return false;
         }
@@ -217,7 +239,12 @@ void *WINAPI virtual_alloc_ex(HANDLE process, void *address, SIZE_T size, DWORD 
                      address, static_cast<std::size_t>(size), type, protect);
         std::fflush(stderr);
     }
-    if (GetProcessId(process) == GetCurrentProcessId()) {
+    const bool own = GetProcessId(process) == GetCurrentProcessId();
+    auto requirements = console_range(address);
+    MEM_EXTENDED_PARAMETER parameter{};
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &requirements;
+    if (own) {
         if (type & MEM_RESERVE && type & page_sizes) {
             auto *const base = reserve(address, size, type);
             if (base && type & MEM_COMMIT &&
@@ -230,10 +257,16 @@ void *WINAPI virtual_alloc_ex(HANDLE process, void *address, SIZE_T size, DWORD 
         // a placeholder, which the title splits with VirtualFree and reserves piece by piece
         if (type & MEM_RESERVE_PLACEHOLDER)
             return VirtualAlloc2(process, address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                 PAGE_NOACCESS, nullptr, 0);
+                                 PAGE_NOACCESS, &parameter, 1);
     }
-    const auto result =
-        VirtualAllocEx(process, address, size, type & allocation_types, protect & protections);
+    auto *result = own && !address ? VirtualAlloc2(process, nullptr, size, type & allocation_types,
+                                                   protect & protections, &parameter, 1)
+                                   : nullptr;
+    if (!result)
+        result =
+            VirtualAllocEx(process, address, size, type & allocation_types, protect & protections);
+    if (!result && type & MEM_COMMIT && GetLastError() == ERROR_COMMITMENT_LIMIT)
+        tell_short("VirtualAlloc", size);
     if (!result && (type & ~(allocation_types | page_sizes) || protect & ~protections)) {
         const auto error = GetLastError();
         std::fprintf(stderr,
@@ -291,6 +324,7 @@ BOOL WINAPI allocate_title_physical_pages(HANDLE, DWORD type, ULONG_PTR *count, 
     auto &state = physical();
     const std::lock_guard lock(state.mutex);
     if (!state.section || !take_pages(state, *count, type & mem_4mb_pages ? 64 : 1, pages)) {
+        tell_short("an allocation of physical pages", *count * page);
         *count = 0;
         SetLastError(ERROR_OUTOFMEMORY);
         return FALSE;
@@ -333,6 +367,7 @@ void *WINAPI map_title_physical_pages(void *address, ULONG_PTR count, DWORD type
     for (ULONG_PTR i = 0; i < count; ++i)
         if (pages[i] / frames >= state.used.size() ||
             !map(state, *reservation, start + i * page, pages[i] / frames, protect, false)) {
+            tell_short("a mapping of physical pages", count * page);
             SetLastError(ERROR_INVALID_PARAMETER);
             return nullptr;
         }
@@ -355,7 +390,11 @@ BOOL WINAPI tooling_memory_status(ToolingMemory *status) {
 
 // a fresh 64K-aligned region satisfies any attributes
 void *WINAPI xmem_alloc_default(SIZE_T size, ULONGLONG) {
-    return VirtualAlloc(nullptr, size ? size : 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    auto *const memory =
+        virtual_alloc(nullptr, size ? size : 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!memory)
+        tell_short("XMemAlloc", size);
+    return memory;
 }
 void WINAPI xmem_free_default(void *address, ULONGLONG) {
     if (address)
@@ -397,13 +436,15 @@ void *commit_title_memory(void *address, std::size_t size) {
 }
 
 void *allocate_aligned(std::size_t size, std::uint64_t alignment, void *address) {
-    MEM_ADDRESS_REQUIREMENTS requirements{};
-    requirements.Alignment = address || alignment <= page ? 0 : alignment;
+    auto requirements = console_range(address, alignment <= page ? 0 : alignment);
     MEM_EXTENDED_PARAMETER parameter{};
     parameter.Type = MemExtendedParameterAddressRequirements;
     parameter.Pointer = &requirements;
-    return VirtualAlloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_COMMIT,
-                         PAGE_READWRITE, &parameter, 1);
+    auto *const memory = VirtualAlloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_READWRITE, &parameter, 1);
+    if (!memory)
+        tell_short("an allocation of graphics memory", size);
+    return memory;
 }
 
 namespace {

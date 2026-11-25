@@ -430,6 +430,13 @@ std::array<Slot, max_slots> by_caller_slots(std::index_sequence<Index...>) {
 }
 template <Family Kind>
 const auto dispatchers = by_caller_slots<Kind>(std::make_index_sequence<max_slots>{});
+// the console vtables made below, which are memory of ours and not of an image
+std::mutex console_vtables_mutex;
+std::set<const void *> console_vtables;
+bool console_vtable_at(const void *vtable) {
+    const std::lock_guard lock(console_vtables_mutex);
+    return console_vtables.contains(vtable);
+}
 // One console vtable per host vtable (one per class of the host's runtime); an object that
 // has one already keeps it
 template <Family Kind>
@@ -464,6 +471,8 @@ void console_vtable(void *object, std::size_t host_slots, std::size_t slots,
             memory[1 + index] = dispatchers<Kind>[index];
         }
         block = memory + 1;
+        const std::lock_guard known(console_vtables_mutex);
+        console_vtables.insert(block);
     }
     *static_cast<Slot **>(object) = block;
 }
@@ -4143,8 +4152,9 @@ bool is_object(std::uint64_t address) {
         region.State != MEM_COMMIT || (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
         return false;
     const auto vtable = *reinterpret_cast<const void *const *>(address);
+    // a host object, or one whose vtable is a console one of ours (a fence's: see console_fence)
     return vtable && VirtualQuery(vtable, &region, sizeof region) && region.State == MEM_COMMIT &&
-           region.Type == MEM_IMAGE;
+           (region.Type == MEM_IMAGE || console_vtable_at(vtable));
 }
 template <std::size_t Index>
 std::uint64_t STDMETHODCALLTYPE queue_by_layout(void *self, std::uint64_t a, std::uint64_t b,

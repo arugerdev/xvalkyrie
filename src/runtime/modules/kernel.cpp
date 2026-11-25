@@ -60,10 +60,54 @@ HMODULE WINAPI load_library_ex_a(const char *name, HANDLE file, DWORD flags) {
     return load_library(wide.c_str(), file, flags);
 }
 HMODULE WINAPI load_library_a(const char *name) { return load_library_ex_a(name, nullptr, 0); }
+// A file opened without buffering is read on the host only at offsets, sizes and buffers its
+// sectors align, and turned down otherwise (ERROR_INVALID_PARAMETER); the console reads it
+// anyway, and at its end gives what is left, even nothing (7952987A reads the rest of
+// appdata0.rpf's header from past its end). Such a read is made again through a handle of
+// the same file with buffering, and ends as the title's would have.
+BOOL read_buffered(HANDLE file, void *buffer, DWORD bytes, DWORD *read, OVERLAPPED *overlapped) {
+    auto *const again =
+        ReOpenFile(file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+    if (again == INVALID_HANDLE_VALUE)
+        return FALSE;
+    OVERLAPPED at{};
+    if (overlapped)
+        at.Offset = overlapped->Offset, at.OffsetHigh = overlapped->OffsetHigh;
+    DWORD done = 0;
+    const auto result = ReadFile(again, buffer, bytes, &done, overlapped ? &at : nullptr);
+    const auto error = GetLastError();
+    CloseHandle(again);
+    if (!result && error != ERROR_HANDLE_EOF) {
+        SetLastError(error);
+        return FALSE;
+    }
+    if (read)
+        *read = done;
+    if (overlapped) {
+        overlapped->Internal = 0; // STATUS_SUCCESS
+        overlapped->InternalHigh = done;
+        if (overlapped->hEvent)
+            SetEvent(overlapped->hEvent);
+    }
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
 // reads into memory placement resources live in
 BOOL WINAPI read_file(HANDLE file, void *buffer, DWORD bytes, DWORD *read, OVERLAPPED *overlapped) {
     prepare_title_write(buffer, bytes);
-    const auto result = ReadFile(file, buffer, bytes, read, overlapped);
+    auto result = ReadFile(file, buffer, bytes, read, overlapped);
+    if (!result && GetLastError() == ERROR_INVALID_PARAMETER) {
+        if (static std::atomic<int> shown{0}; shown++ < 4) {
+            std::fprintf(stderr,
+                         "[Runtime] a read of a file without buffering the host turns down (%lu "
+                         "bytes at %llx) is made with buffering\n",
+                         bytes,
+                         overlapped ? ULONGLONG{overlapped->OffsetHigh} << 32 | overlapped->Offset
+                                    : 0);
+            std::fflush(stderr);
+        }
+        result = read_buffered(file, buffer, bytes, read, overlapped);
+    }
     // XV_FILE_TRACE: the reads at an offset and those the host turns down, with what came of
     // each. A read that goes well leaves the last error as it was, so only one that fails has
     // an error to show; one of a handle opened for overlapped reads may still be pending.

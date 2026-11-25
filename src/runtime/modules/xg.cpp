@@ -603,14 +603,40 @@ void *const series_computer_vtable[] = {
     reinterpret_cast<void *>(&series_unknown<11>),
     reinterpret_cast<void *>(&series_unknown<12>),
 };
+// The swizzle mode xg_xs.dll picks for a description: rows for a 1D texture, the 64 KiB
+// XOR depth and render modes for what is drawn to, the 4 KiB standard one for the rest. This
+// is the rule of the library's older optimal-mode function, which the archives' textures
+// without a mode of their own are laid out by.
+constexpr std::uint32_t allow_render_target = 1, row_major = 1;
+std::uint32_t suggested_mode(const ResourceDescription &d) {
+    return d.dimension == 2                ? gfx10::sw_linear
+           : d.flags & allow_depth_stencil ? gfx10::sw_64kb_z_x
+           : d.flags & allow_render_target ? gfx10::sw_64kb_r_x
+                                           : gfx10::sw_4kb_s;
+}
+// XGSuggestSwizzleMode(description, flags, layout) of xg_xs.dll: the layout field a title then
+// gives XGCreateTextureComputer for a texture that names no mode itself
+std::int32_t suggest_series_swizzle_mode(const ResourceDescription *description, std::uint32_t,
+                                         std::uint32_t *layout) {
+    if (!description || !layout)
+        return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
+    *layout = swizzled | suggested_mode(*description);
+    return 0;
+}
 // XGCreateTextureComputer of xg_xs.dll: the console's layout where the description names a
-// swizzle mode GFX10 has and its format has a layout here; the plain one otherwise, as before
+// swizzle mode GFX10 has and its format has a layout here, or names none (the library picks
+// one) or rows; the plain one otherwise, as before
 std::int32_t create_series_texture_computer(const ResourceDescription *description,
                                             void **computer) {
     if (!description || !computer)
         return static_cast<std::int32_t>(0x80070057); // E_INVALIDARG
-    if (auto texture = series_texture(*description); texture.valid) {
-        *computer = new SeriesComputer{series_computer_vtable, 1, *description, std::move(texture)};
+    auto d = *description;
+    if (d.layout == 0)
+        d.layout = swizzled | suggested_mode(d);
+    else if (d.layout == row_major)
+        d.layout = swizzled | gfx10::sw_linear;
+    if (auto texture = series_texture(d); texture.valid) {
+        *computer = new SeriesComputer{series_computer_vtable, 1, d, std::move(texture)};
         return 0;
     }
     return create_texture_computer(description, reinterpret_cast<Computer **>(computer));
@@ -630,8 +656,8 @@ std::uint32_t optimal_tile_mode(std::uint32_t, std::uint32_t, std::uint32_t, std
                                 std::uint32_t, std::uint32_t, std::uint32_t) {
     return 0;
 }
-// XGSuggestSwizzleMode of later kits' xg_xs.dll, whose arguments are in no header here: a
-// title takes an XG_SWIZZLE_MODE from it, and the one layout there is is the linear one
+// XGSuggestSwizzleMode of the other modules, which have no swizzle modes: the one layout
+// there is is the linear one
 std::uint32_t suggest_swizzle_mode() { return 0; }
 // format, width, height, depth or layers, samples, then whether it is compressed, a tiled
 // resource, and read as a texture
@@ -654,7 +680,9 @@ void install_xg(Registry &registry, std::string_view module) {
     registry.add(module, "XGComputeTexture2DLayout", reinterpret_cast<void *>(&texture2d_layout));
     registry.add(module, "XGComputeTexture3DLayout", reinterpret_cast<void *>(&texture3d_layout));
     registry.add(module, "XGComputeOptimalTileMode", reinterpret_cast<void *>(&optimal_tile_mode));
-    registry.add(module, "XGSuggestSwizzleMode", reinterpret_cast<void *>(&suggest_swizzle_mode));
+    registry.add(module, "XGSuggestSwizzleMode",
+                 module == "xg_xs.dll" ? reinterpret_cast<void *>(&suggest_series_swizzle_mode)
+                                       : reinterpret_cast<void *>(&suggest_swizzle_mode));
     registry.add(module, "XGComputeOptimalDepthStencilTileModes",
                  reinterpret_cast<void *>(&optimal_depth_stencil_tile_modes));
 }

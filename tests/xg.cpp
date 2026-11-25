@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "runtime/modules/xg.hpp"
+#include "runtime/common/runtime.hpp"
 #include "runtime/modules/texture_layout.hpp"
 #include <catch2/catch.hpp>
 #include <cstdint>
@@ -515,4 +516,45 @@ TEST_CASE("xg_xs.dll's texture computer, called as a title calls it") {
     d = resource(256, 256, 1, DXGI_FORMAT_R32G32B32_FLOAT, 0x105);
     CHECK_FALSE(series_texture_computer(&d));
     CHECK_FALSE(series_texture_computer(nullptr));
+}
+
+TEST_CASE("xg_xs.dll picks a texture's mode where its description names none") {
+    xv::runtime::Registry registry;
+    install_xg(registry, "xg_xs.dll");
+    using Suggest = std::int32_t(WINAPI *)(const D3D12_RESOURCE_DESC *, UINT, UINT *);
+    using Create = std::int32_t(WINAPI *)(const D3D12_RESOURCE_DESC *, void **);
+    const auto suggest =
+        reinterpret_cast<Suggest>(registry.find("xg_xs.dll", "XGSuggestSwizzleMode"));
+    const auto create =
+        reinterpret_cast<Create>(registry.find("xg_xs.dll", "XGCreateTextureComputer"));
+    REQUIRE(suggest);
+    REQUIRE(create);
+    // as a title calls it: the mode goes to the description's own layout field
+    auto d = resource(256, 256, 0, DXGI_FORMAT_BC7_UNORM, 0);
+    UINT layout = 0;
+    REQUIRE(suggest(&d, 0, &layout) == 0);
+    CHECK(layout == (0x100 | gfx10::sw_4kb_s));
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    REQUIRE(suggest(&d, 0, &layout) == 0);
+    CHECK(layout == (0x100 | gfx10::sw_64kb_r_x));
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    REQUIRE(suggest(&d, 0, &layout) == 0);
+    CHECK(layout == (0x100 | gfx10::sw_64kb_z_x));
+    auto line =
+        resource(256, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1, D3D12_RESOURCE_DIMENSION_TEXTURE1D);
+    REQUIRE(suggest(&line, 0, &layout) == 0);
+    CHECK(layout == 0x100);
+    // a description with no mode is laid out as with the one picked for it
+    using Bytes = std::uint64_t(WINAPI *)(void *);
+    const auto bytes = [&](UINT mode) {
+        auto texture = resource(256, 256, 0, DXGI_FORMAT_BC7_UNORM, mode);
+        void *computer = nullptr;
+        REQUIRE(create(&texture, &computer) == 0);
+        REQUIRE(computer);
+        const auto size = slot<Bytes>(computer, 3)(computer);
+        CHECK(slot<Release>(computer, 1)(computer) == 0);
+        return size;
+    };
+    CHECK(bytes(0) == bytes(0x100 | gfx10::sw_4kb_s));
+    CHECK(bytes(1) == bytes(0x100 | gfx10::sw_linear));
 }

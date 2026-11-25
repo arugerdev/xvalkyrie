@@ -1062,6 +1062,11 @@ struct Twin {
     D3D12_CPU_DESCRIPTOR_HANDLE visible, start;
     D3D12_DESCRIPTOR_HEAP_TYPE type;
     UINT count, step;
+    // The title's slots under `limit` are the same ones of the heap shaders see. One the host
+    // makes shorter than the title's has a ring of `ring_count` slots from `ring_first` instead
+    // for the rest (visible_slot).
+    UINT limit, ring_first = 0, ring_count = 0;
+    std::atomic<UINT> ring_next{0};
     // a bit for each slot written, and a bit for each word of those that may have one
     std::unique_ptr<std::atomic<std::uint64_t>[]> written, words;
     std::atomic<bool> any{false};
@@ -1069,7 +1074,7 @@ struct Twin {
          D3D12_DESCRIPTOR_HEAP_TYPE type, UINT count, UINT step)
         : device(device), heap(heap), visible(visible),
           start(heap->GetCPUDescriptorHandleForHeapStart()), type(type), count(count), step(step),
-          written(new std::atomic<std::uint64_t>[(count + 63) / 64] {}),
+          limit(count), written(new std::atomic<std::uint64_t>[(count + 63) / 64] {}),
           words(new std::atomic<std::uint64_t>[(count + 4095) / 4096] {}) {}
     ~Twin() { heap->Release(); }
     void wrote(std::size_t index, std::size_t slots = 1) {
@@ -1126,10 +1131,11 @@ const ShadowHeap *shadow_heap(std::uintptr_t address) {
     return address < found->second.end ? &found->second : nullptr;
 }
 // A descriptor the host's heap is too short for lands on its last one, which is given up
-// for that: the host drops the device over a handle outside its heap.
+// for that: the host drops the device over a handle outside its heap. A heap shaders see has
+// a twin as long as the title's, where every one has its place.
 D3D12_CPU_DESCRIPTOR_HANDLE host_slot(const ShadowHeap &heap, std::uintptr_t at) {
-    const auto index =
-        std::min<std::uintptr_t>((at - heap.base) / heap.stride, heap.host_count - 1);
+    const auto index = std::min<std::uintptr_t>(
+        (at - heap.base) / heap.stride, (heap.twin ? heap.twin->count : heap.host_count) - 1);
     return {heap.host.ptr + index * heap.host_stride};
 }
 // the host's handle for a console one; others are the host's already
@@ -1166,8 +1172,7 @@ std::map<std::uint64_t, std::string> lost_views; // under memory_view_mutex
 // shaders see before the next submission
 void wrote(const ShadowHeap &heap, std::uintptr_t at, std::size_t slots = 1) {
     if (heap.twin)
-        heap.twin->wrote(
-            std::min<std::uintptr_t>((at - heap.base) / heap.stride, heap.host_count - 1), slots);
+        heap.twin->wrote((at - heap.base) / heap.stride, slots);
 }
 void wrote(D3D12_CPU_DESCRIPTOR_HANDLE handle, std::size_t slots = 1) {
     const std::lock_guard lock(shadow_mutex);
@@ -1208,8 +1213,12 @@ void copy_twins() {
                     const auto first = static_cast<unsigned>(std::countr_zero(bits));
                     const auto run = static_cast<unsigned>(std::countr_one(bits >> first));
                     const auto index = word * 64 + first;
-                    copy(twin->device, run, {twin->visible.ptr + index * twin->step},
-                         {twin->start.ptr + index * twin->step}, twin->type);
+                    // past `limit` the slots go to the ring as lists read them
+                    if (index < twin->limit)
+                        copy(twin->device,
+                             static_cast<UINT>(std::min<std::size_t>(run, twin->limit - index)),
+                             {twin->visible.ptr + index * twin->step},
+                             {twin->start.ptr + index * twin->step}, twin->type);
                     bits = run + first >= 64 ? 0 : bits & ~(((1ull << run) - 1) << first);
                 }
             }
@@ -1423,7 +1432,6 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
     if (visible) {
         D3D12_DESCRIPTOR_HEAP_DESC twin_desc = desc;
         twin_desc.Flags &= ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        twin_desc.NumDescriptors = std::min(desc.NumDescriptors, host_count);
         void *made = nullptr;
         using Create = HRESULT(STDMETHODCALLTYPE *)(void *, const D3D12_DESCRIPTOR_HEAP_DESC *,
                                                     REFIID, void **);
@@ -1433,6 +1441,12 @@ void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HE
             twin = std::make_shared<Twin>(device, static_cast<ID3D12DescriptorHeap *>(made), host,
                                           desc.Type, twin_desc.NumDescriptors, host_stride);
             host = twin->start;
+            // an eighth of the host's heap, 128 Ki slots at most, for the ring: a title that
+            // goes round all of its heap in turn uses a few tables of the far part a frame
+            if (host_count < desc.NumDescriptors) {
+                twin->ring_count = std::min(host_count / 8, 131072u);
+                twin->limit = twin->ring_first = host_count - twin->ring_count;
+            }
         }
     }
     const std::lock_guard lock(shadow_mutex);
@@ -5241,14 +5255,59 @@ HRESULT STDMETHODCALLTYPE reset_list(void *self, ID3D12CommandAllocator *allocat
     }
     return result;
 }
-// the host's GPU handle for a console one, which is the descriptor's address in the shadow
-D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(D3D12_GPU_DESCRIPTOR_HANDLE handle) {
-    const std::lock_guard lock(shadow_mutex);
-    if (const auto *heap = shadow_heap(handle.ptr); heap && heap->shader_visible)
-        return {heap->gpu + std::min<std::uint64_t>((handle.ptr - heap->base) / heap->stride,
-                                                    heap->host_count - 1) *
-                                heap->host_stride};
-    return handle;
+// The host's slot in a heap shaders see for `span` descriptors from the title's slot `index`.
+// Those in the part of the host's heap that is the title's are where the title has them. A
+// heap the host makes shorter than the title's keeps a ring at its end instead: what lies
+// past the title's part is copied there from the twin, which has all of it, when the list
+// runs, after what the title wrote for that submission is in the twin.
+UINT visible_slot(ListProxy *list, const ShadowHeap &heap, std::uint64_t index, UINT span) {
+    auto *const twin = heap.twin.get();
+    span = std::max(span, 1u);
+    if (!twin || !twin->ring_count || index + span <= twin->limit || index >= twin->count)
+        return static_cast<UINT>(std::min<std::uint64_t>(index, heap.host_count - 1));
+    span =
+        static_cast<UINT>(std::min<std::uint64_t>({span, twin->ring_count, twin->count - index}));
+    UINT start = twin->ring_next.load(std::memory_order_relaxed), next;
+    do {
+        next = start + span <= twin->ring_count ? start : 0;
+    } while (!twin->ring_next.compare_exchange_weak(start, next + span, std::memory_order_relaxed));
+    const auto slot = twin->ring_first + next;
+    list->on_memory.push_back([shared = heap.twin, slot, index, span] {
+        using Copy =
+            void(STDMETHODCALLTYPE *)(void *, UINT, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                      D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DESCRIPTOR_HEAP_TYPE);
+        original<Copy>(shared->device,
+                       24)(shared->device, span, {shared->visible.ptr + slot * shared->step},
+                           {shared->start.ptr + index * shared->step}, shared->type);
+    });
+    return slot;
+}
+// the host's GPU handle for a console one of `span` descriptors, which is the descriptor's
+// address in the shadow
+D3D12_GPU_DESCRIPTOR_HANDLE host_gpu(ListProxy *list, D3D12_GPU_DESCRIPTOR_HANDLE handle,
+                                     UINT span = 1) {
+    ShadowHeap heap{};
+    {
+        const std::lock_guard lock(shadow_mutex);
+        const auto *const found = shadow_heap(handle.ptr);
+        if (!found || !found->shader_visible)
+            return handle;
+        heap = *found;
+    }
+    return {heap.gpu +
+            std::uint64_t{visible_slot(list, heap, (handle.ptr - heap.base) / heap.stride, span)} *
+                heap.host_stride};
+}
+// how many descriptors a table of a root signature's parameter takes, by its ranges
+UINT table_span(const void *signature, UINT parameter) {
+    const std::lock_guard lock(signature_mutex);
+    const auto found = tables_of.find(signature);
+    if (found == tables_of.end() || parameter >= found->second.size())
+        return 1;
+    UINT span = 1;
+    for (const auto &range : found->second[parameter])
+        span = std::max(span, range.offset + range.count);
+    return span;
 }
 // The root signatures and descriptor tables: the title's own descriptors in a table are read
 // as the table says, once bound
@@ -5273,7 +5332,8 @@ void STDMETHODCALLTYPE set_compute_root_table(void *self, UINT parameter,
     decode_table(list->compute_root, parameter, table.ptr);
     bind_heap_of(self, table.ptr);
     if (!list->compute_ours_bound)
-        host_of(self)->SetComputeRootDescriptorTable(parameter, host_gpu(table));
+        host_of(self)->SetComputeRootDescriptorTable(
+            parameter, host_gpu(list, table, table_span(list->compute_root, parameter)));
 }
 void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
                                                D3D12_GPU_DESCRIPTOR_HANDLE table) {
@@ -5282,7 +5342,8 @@ void STDMETHODCALLTYPE set_graphics_root_table(void *self, UINT parameter,
     decode_table(list->graphics_root, parameter, table.ptr);
     bind_heap_of(self, table.ptr);
     if (!list->ours_bound)
-        host_of(self)->SetGraphicsRootDescriptorTable(parameter, host_gpu(table));
+        host_of(self)->SetGraphicsRootDescriptorTable(
+            parameter, host_gpu(list, table, table_span(list->graphics_root, parameter)));
 }
 // SetGraphicsRoot32BitConstant (38) and SetGraphicsRoot32BitConstants (40), and the compute
 // ones before each (37, 39)
@@ -5336,8 +5397,9 @@ void STDMETHODCALLTYPE set_compute_root_uav(void *self, UINT index, std::uint64_
 // with `view` (2 shader resource, 3 constant buffer, 4 unordered access: the root
 // parameter of heap_signature, and the host's address)
 template <class View>
-void fill_user(const HeapUses::Stage &stage, const std::vector<ListProxy::RootArgument> &arguments,
-               std::uint32_t first, std::uint32_t (&user)[24], View view) {
+void fill_user(ListProxy *list, const HeapUses::Stage &stage,
+               const std::vector<ListProxy::RootArgument> &arguments, std::uint32_t first,
+               std::uint32_t (&user)[24], View view) {
     std::uintptr_t tables[24]{};
     ShadowHeap heaps[24]{};
     std::memset(user, 0, sizeof user);
@@ -5348,11 +5410,21 @@ void fill_user(const HeapUses::Stage &stage, const std::vector<ListProxy::RootAr
         if (entry.reg < first || at >= 24 || !argument)
             continue;
         if (entry.kind == 1 && argument->kind == 1) {
-            const std::lock_guard lock(shadow_mutex);
-            if (const auto *const in = shadow_heap(argument->value); in && in->shader_visible) {
-                heaps[at] = *in;
-                tables[at] = argument->value;
-                user[at] = static_cast<std::uint32_t>((argument->value - in->base) / in->stride);
+            {
+                const std::lock_guard lock(shadow_mutex);
+                if (const auto *const in = shadow_heap(argument->value); in && in->shader_visible) {
+                    heaps[at] = *in;
+                    tables[at] = argument->value;
+                }
+            }
+            // the table's first descriptor in the host's heap, for as many as the shader reads
+            if (tables[at]) {
+                UINT span = 1;
+                for (const auto &use : stage.uses)
+                    if (use.reg == entry.reg)
+                        span = std::max(span, use.place + 1);
+                user[at] = visible_slot(list, heaps[at],
+                                        (tables[at] - heaps[at].base) / heaps[at].stride, span);
             }
         } else if (entry.kind == 5 && argument->kind == 5) {
             for (UINT n = 0; n < entry.count && at + n < 24; ++n)
@@ -5433,7 +5505,7 @@ void prepare_dispatch(ListProxy *list) {
         list->compute_ours_bound = true;
     }
     std::uint32_t user[24];
-    fill_user(list->heap_uses->stages[0], list->compute_arguments, 0, user,
+    fill_user(list, list->heap_uses->stages[0], list->compute_arguments, 0, user,
               [&](UINT parameter, std::uint64_t address) {
                   if (parameter == 2)
                       list->host->SetComputeRootShaderResourceView(parameter, address);
@@ -5485,7 +5557,7 @@ void prepare_draw(ListProxy *list) {
     std::uint32_t user[24]{};
     const auto &arguments = list->graphics_arguments;
     for (UINT index = 0; index < 2; ++index) {
-        fill_user(list->heap_uses->stages[index], arguments, 8, user,
+        fill_user(list, list->heap_uses->stages[index], arguments, 8, user,
                   [&](UINT parameter, std::uint64_t address) {
                       if (parameter == 2)
                           list->host->SetGraphicsRootShaderResourceView(parameter, address);
@@ -6280,15 +6352,16 @@ void STDMETHODCALLTYPE clear_uav_uint(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gp
                                       const D3D12_RECT *rects) {
     bind_heap_of(self, gpu.ptr);
     host_of(self)->ClearUnorderedAccessViewUint(
-        host_gpu(gpu), feedback_clear_view(host_of(self), host_view(cpu), resource), resource,
-        values, count, rects);
+        host_gpu(static_cast<ListProxy *>(self), gpu),
+        feedback_clear_view(host_of(self), host_view(cpu), resource), resource, values, count,
+        rects);
 }
 void STDMETHODCALLTYPE clear_uav_float(void *self, D3D12_GPU_DESCRIPTOR_HANDLE gpu, Handle cpu,
                                        ID3D12Resource *resource, const FLOAT *values, UINT count,
                                        const D3D12_RECT *rects) {
     bind_heap_of(self, gpu.ptr);
-    host_of(self)->ClearUnorderedAccessViewFloat(host_gpu(gpu), host_view(cpu), resource, values,
-                                                 count, rects);
+    host_of(self)->ClearUnorderedAccessViewFloat(host_gpu(static_cast<ListProxy *>(self), gpu),
+                                                 host_view(cpu), resource, values, count, rects);
 }
 void STDMETHODCALLTYPE ignored_list_method(void *) {}
 void STDMETHODCALLTYPE flush_pipeline_x(void *self, UINT, std::uint64_t, std::uint64_t);

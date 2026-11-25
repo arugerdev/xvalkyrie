@@ -2,11 +2,53 @@
 #include "core/settings.hpp"
 #include "formats/pe/inspect.hpp"
 #include <catch2/catch.hpp>
+#include <windows.h>
+
+#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <vector>
+
+namespace {
+// Catch2's own handler of faults goes first at each test and ends the run at any access
+// violation, also one the code that made it catches itself: the Direct3D runtime, its debug
+// layer and WARP may read memory that is not there and catch the fault, and the module makes
+// the title's memory read-only to see its writes. It is off (CATCH_CONFIG_NO_WINDOWS_SEH, in
+// CMakeLists.txt). A fault that nothing catches still ends the run, and says in which test.
+char running[256]; // the test that runs
+struct Running : Catch::TestEventListenerBase {
+    using TestEventListenerBase::TestEventListenerBase;
+    void testCaseStarting(const Catch::TestCaseInfo &test) override {
+        strncpy_s(running, test.name.c_str(), _TRUNCATE);
+    }
+};
+LPTOP_LEVEL_EXCEPTION_FILTER earlier_filter = nullptr;
+LONG WINAPI uncaught(EXCEPTION_POINTERS *exception) {
+    const auto *const record = exception->ExceptionRecord;
+    const auto address = reinterpret_cast<std::uintptr_t>(record->ExceptionAddress);
+    HMODULE module = nullptr;
+    wchar_t name[MAX_PATH] = L"?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCWSTR>(record->ExceptionAddress), &module))
+        GetModuleFileNameW(module, name, MAX_PATH);
+    std::fprintf(
+        stderr, "\nexception 0x%08lx at %ls+0x%llx (data %llx) in the test \"%s\"\n",
+        record->ExceptionCode, name,
+        static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)),
+        static_cast<unsigned long long>(
+            record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0),
+        running);
+    std::fflush(stderr);
+    return earlier_filter ? earlier_filter(exception) : EXCEPTION_CONTINUE_SEARCH;
+}
+const struct Uncaught {
+    Uncaught() { earlier_filter = SetUnhandledExceptionFilter(&uncaught); }
+} uncaught_filter;
+} // namespace
+CATCH_REGISTER_LISTENER(Running)
 
 TEST_CASE("pe headers") {
     std::ifstream f("synthetic.pe", std::ios::binary);
